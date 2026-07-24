@@ -1,10 +1,12 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import ensure_data_dirs
+from app.db import init_db
 
 
 def create_app() -> FastAPI:
     ensure_data_dirs()
+    init_db()
     app = FastAPI(title="CaseGen API", version="0.1.0")
     app.add_middleware(
         CORSMiddleware,
