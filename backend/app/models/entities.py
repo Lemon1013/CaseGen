@@ -5,7 +5,8 @@ from sqlmodel import Field, SQLModel
 
 
 def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    # Naive UTC so SQLite round-trips stay comparable without tzinfo.
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 class ModelConfig(SQLModel, table=True):
@@ -18,7 +19,7 @@ class ModelConfig(SQLModel, table=True):
     model_name: str
     is_default: bool = False
     created_at: datetime = Field(default_factory=_utcnow)
-    updated_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow, sa_column_kwargs={"onupdate": _utcnow})
 
 
 class PromptTemplate(SQLModel, table=True):
@@ -31,7 +32,7 @@ class PromptTemplate(SQLModel, table=True):
     version: int = 1
     is_active: bool = True
     created_at: datetime = Field(default_factory=_utcnow)
-    updated_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow, sa_column_kwargs={"onupdate": _utcnow})
 
 
 class Document(SQLModel, table=True):
@@ -46,7 +47,7 @@ class Document(SQLModel, table=True):
     char_count: int = 0
     error_message: Optional[str] = None
     created_at: datetime = Field(default_factory=_utcnow)
-    updated_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow, sa_column_kwargs={"onupdate": _utcnow})
 
 
 class IngestJob(SQLModel, table=True):
@@ -58,7 +59,7 @@ class IngestJob(SQLModel, table=True):
     step_log_json: str = "[]"
     error_message: Optional[str] = None
     created_at: datetime = Field(default_factory=_utcnow)
-    updated_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow, sa_column_kwargs={"onupdate": _utcnow})
 
 
 class WikiPageRow(SQLModel, table=True):
@@ -71,7 +72,7 @@ class WikiPageRow(SQLModel, table=True):
     source_document_id: Optional[int] = None
     tags_json: str = "[]"
     created_at: datetime = Field(default_factory=_utcnow)
-    updated_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow, sa_column_kwargs={"onupdate": _utcnow})
 
 
 class Requirement(SQLModel, table=True):
@@ -82,7 +83,7 @@ class Requirement(SQLModel, table=True):
     description: str
     focus_tags_json: str = "[]"
     created_at: datetime = Field(default_factory=_utcnow)
-    updated_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow, sa_column_kwargs={"onupdate": _utcnow})
 
 
 class GenerationTask(SQLModel, table=True):
@@ -97,7 +98,7 @@ class GenerationTask(SQLModel, table=True):
     temp_prompt_content: Optional[str] = None
     error_message: Optional[str] = None
     created_at: datetime = Field(default_factory=_utcnow)
-    updated_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow, sa_column_kwargs={"onupdate": _utcnow})
 
 
 class TaskCitation(SQLModel, table=True):
