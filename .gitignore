@@ -1,3 +1,6 @@
+# git worktrees
+.worktrees/
+
 # CaseGen project-specific
 data/
 *.db
