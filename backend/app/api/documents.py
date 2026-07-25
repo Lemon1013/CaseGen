@@ -9,10 +9,15 @@ from app.config import ALLOWED_EXTENSIONS, MAX_UPLOAD_BYTES, ensure_data_dirs
 from app.db import get_session
 from app.models.entities import Document
 from app.schemas.documents import DocumentOut
+from app.schemas.wiki import IngestJobOut
 from app.services.parse_document import parse_file
 from app.services.paths import make_raw_filename, raw_path_for, relative_raw_stored_path
+from app.services.wiki_ingest import ingest_document
 
 router = APIRouter(prefix="/api/documents", tags=["documents"])
+
+# Optional injectable chat_fn for tests: set via monkeypatch on this module attr.
+_INGEST_CHAT_FN = None
 
 
 @router.post("", response_model=DocumentOut)
@@ -84,3 +89,15 @@ def get_document(
     if doc is None:
         raise HTTPException(status_code=404, detail="Document not found")
     return doc
+
+
+@router.post("/{document_id}/ingest", response_model=IngestJobOut)
+def start_ingest(
+    document_id: int,
+    session: Session = Depends(get_session),
+) -> IngestJobOut:
+    doc = session.get(Document, document_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    job = ingest_document(session, document_id, chat_fn=_INGEST_CHAT_FN)
+    return job
