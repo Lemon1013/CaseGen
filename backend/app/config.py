@@ -13,7 +13,7 @@ RETRIEVE_TOP_K = int(os.getenv("RETRIEVE_TOP_K", "6"))
 MAX_WIKI_CONTEXT_CHARS = int(os.getenv("MAX_WIKI_CONTEXT_CHARS", "12000"))
 FINAL_SCORE_THRESHOLD = int(os.getenv("FINAL_SCORE_THRESHOLD", "80"))
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
-ALLOWED_EXTENSIONS = {".md", ".txt", ".pdf"}
+ALLOWED_EXTENSIONS = {".md", ".txt", ".pdf", ".docx"}
 
 
 def ensure_data_dirs() -> None:
