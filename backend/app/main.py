@@ -5,6 +5,8 @@ from sqlmodel import Session
 from app.api.documents import router as documents_router
 from app.api.models_cfg import router as models_router
 from app.api.prompts import router as prompts_router
+from app.api.requirements import router as requirements_router
+from app.api.tasks import router as tasks_router
 from app.api.wiki import router as wiki_router
 from app.config import ensure_data_dirs
 from app.db import get_engine, init_db
@@ -33,6 +35,8 @@ def create_app() -> FastAPI:
     app.include_router(documents_router)
     app.include_router(models_router)
     app.include_router(prompts_router)
+    app.include_router(requirements_router)
+    app.include_router(tasks_router)
     app.include_router(wiki_router)
 
     return app

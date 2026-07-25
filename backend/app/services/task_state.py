@@ -8,7 +8,7 @@ ALLOWED = {
     "reviewing": {"reviewed", "failed"},
     "reviewed": {"optimizing", "regenerating", "finalized", "failed"},
     "optimizing": {"reviewed", "failed"},
-    "regenerating": {"generating", "failed"},
+    "regenerating": {"retrieving", "generating", "failed"},
     "finalized": set(),
     "failed": {"retrieving", "generating", "reviewing", "optimizing", "regenerating"},
 }
