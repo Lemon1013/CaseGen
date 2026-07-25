@@ -2,6 +2,7 @@
 import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
+import { Plus, Refresh } from '@element-plus/icons-vue'
 import {
   listTasks,
   statusLabel,
@@ -39,10 +40,13 @@ onMounted(load)
 <template>
   <div class="page">
     <div class="page-header">
-      <h1>任务列表</h1>
-      <div class="actions">
-        <el-button type="primary" @click="router.push('/')">新建任务</el-button>
-        <el-button @click="load">刷新</el-button>
+      <div>
+        <h1 class="page-title">任务列表</h1>
+        <p class="page-subtitle">跟踪生成进度、草稿版本与最新评审分数</p>
+      </div>
+      <div class="page-actions">
+        <el-button type="primary" :icon="Plus" @click="router.push('/')">新建任务</el-button>
+        <el-button :icon="Refresh" @click="load">刷新</el-button>
       </div>
     </div>
 
@@ -50,15 +54,15 @@ onMounted(load)
       v-loading="loading"
       :data="tasks"
       stripe
-      empty-text="暂无任务"
-      @row-click="openDetail"
+      empty-text="暂无任务，去工作台创建第一条"
       class="task-table"
+      @row-click="openDetail"
     >
       <el-table-column prop="id" label="ID" width="70" />
       <el-table-column prop="title" label="标题" min-width="180" show-overflow-tooltip />
       <el-table-column label="状态" width="120">
         <template #default="{ row }">
-          <el-tag :type="statusTagType(row.status)" size="small">
+          <el-tag :type="statusTagType(row.status)" size="small" effect="light">
             {{ statusLabel(row.status) }}
           </el-tag>
         </template>
@@ -81,7 +85,7 @@ onMounted(load)
           >
             {{ row.latest_review.score }}
           </span>
-          <span v-else>-</span>
+          <span v-else class="muted">-</span>
         </template>
       </el-table-column>
       <el-table-column label="摘要" min-width="200" show-overflow-tooltip>
@@ -104,28 +108,11 @@ onMounted(load)
 </template>
 
 <style scoped>
-.page-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 16px;
-}
-
-.page-header h1 {
-  margin: 0;
-}
-
-.actions {
-  display: flex;
-  gap: 8px;
-}
-
 .task-table :deep(.el-table__row) {
   cursor: pointer;
 }
 
-.good {
-  color: #67c23a;
-  font-weight: 600;
+.muted {
+  color: var(--cg-text-muted);
 }
 </style>

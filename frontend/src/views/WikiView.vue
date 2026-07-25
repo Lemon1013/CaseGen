@@ -120,13 +120,16 @@ onMounted(async () => {
 <template>
   <div class="page">
     <div class="page-header">
-      <h1>Wiki 浏览</h1>
-      <div class="header-actions">
+      <div>
+        <h1 class="page-title">Wiki 浏览</h1>
+        <p class="page-subtitle">检索知识页与索引，确认生成可用的业务上下文</p>
+      </div>
+      <div class="page-actions">
         <el-input
           v-model="query"
           clearable
           placeholder="输入关键词检索 Wiki"
-          style="width: 280px"
+          style="width: 260px"
           @keyup.enter="search"
         />
         <el-button type="primary" :loading="searching" @click="search">检索</el-button>
@@ -137,7 +140,7 @@ onMounted(async () => {
     </div>
 
     <div class="layout">
-      <div class="list-panel" v-loading="loading">
+      <div class="list-panel panel" v-loading="loading">
         <div class="list-title">
           {{ hits ? `检索结果（${displayList.length}）` : `页面列表（${displayList.length}）` }}
         </div>
@@ -151,7 +154,7 @@ onMounted(async () => {
           >
             <div class="item-title">{{ item.title || item.path }}</div>
             <div class="item-meta">
-              <el-tag size="small" type="info">{{ item.page_type || 'page' }}</el-tag>
+              <el-tag size="small" type="info" effect="plain">{{ item.page_type || 'page' }}</el-tag>
               <span v-if="item.score != null" class="score">score {{ item.score.toFixed(2) }}</span>
             </div>
             <div class="item-path">{{ item.path }}</div>
@@ -172,7 +175,7 @@ onMounted(async () => {
         </el-scrollbar>
       </div>
 
-      <div class="preview-panel" v-loading="previewLoading">
+      <div class="preview-panel panel panel-surface" v-loading="previewLoading">
         <div class="preview-title">{{ previewTitle }}</div>
         <el-scrollbar height="560px">
           <MarkdownView :content="previewContent" />
@@ -183,69 +186,56 @@ onMounted(async () => {
 </template>
 
 <style scoped>
-.page-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 16px;
-  gap: 12px;
-  flex-wrap: wrap;
-}
-
-.page-header h1 {
-  margin: 0;
-}
-
-.header-actions {
-  display: flex;
-  gap: 8px;
-  flex-wrap: wrap;
-  align-items: center;
-}
-
 .layout {
   display: grid;
   grid-template-columns: minmax(280px, 1fr) minmax(360px, 1.5fr);
   gap: 16px;
 }
 
-.list-panel,
-.preview-panel {
-  border: 1px solid #ebeef5;
-  border-radius: 8px;
-  background: #fafafa;
-  padding: 12px;
-}
-
-.preview-panel {
-  background: #fff;
-}
-
 .list-title,
 .preview-title {
-  font-weight: 600;
-  margin-bottom: 10px;
+  font-weight: 700;
+  margin-bottom: 12px;
+  color: var(--cg-text);
 }
 
 .page-item {
-  padding: 10px 12px;
-  border-radius: 8px;
+  position: relative;
+  padding: 12px 12px 12px 14px;
+  border-radius: var(--cg-radius-sm);
   background: #fff;
-  border: 1px solid #ebeef5;
+  border: 1px solid var(--cg-border);
   margin-bottom: 8px;
   cursor: pointer;
-  transition: border-color 0.15s, box-shadow 0.15s;
+  transition: border-color 0.15s, box-shadow 0.15s, transform 0.15s;
 }
 
-.page-item:hover,
+.page-item:hover {
+  border-color: rgba(79, 124, 255, 0.35);
+  box-shadow: var(--cg-shadow);
+}
+
 .page-item.active {
-  border-color: #409eff;
-  box-shadow: 0 0 0 1px rgba(64, 158, 255, 0.15);
+  border-color: var(--cg-border-strong);
+  box-shadow: 0 0 0 1px rgba(79, 124, 255, 0.12), var(--cg-shadow);
+  background: linear-gradient(90deg, rgba(79, 124, 255, 0.06), #fff 40%);
+}
+
+.page-item.active::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 10px;
+  bottom: 10px;
+  width: 3px;
+  border-radius: 0 3px 3px 0;
+  background: var(--cg-gradient-brand);
 }
 
 .item-title {
   font-weight: 600;
   margin-bottom: 4px;
+  color: var(--cg-text);
 }
 
 .item-meta {
@@ -257,18 +247,18 @@ onMounted(async () => {
 
 .score {
   font-size: 12px;
-  color: #909399;
+  color: var(--cg-text-muted);
 }
 
 .item-path,
 .item-snippet {
   font-size: 12px;
-  color: #909399;
+  color: var(--cg-text-muted);
   margin-top: 2px;
 }
 
 .item-snippet {
-  color: #606266;
+  color: var(--cg-text-secondary);
   display: -webkit-box;
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;

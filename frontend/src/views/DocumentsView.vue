@@ -2,6 +2,7 @@
 import { onMounted, onUnmounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import type { UploadRequestOptions } from 'element-plus'
+import { Refresh, UploadFilled } from '@element-plus/icons-vue'
 import {
   getIngestJob,
   ingestDocument,
@@ -154,8 +155,13 @@ onUnmounted(() => {
 <template>
   <div class="page">
     <div class="page-header">
-      <h1>文档管理</h1>
-      <el-button @click="load">刷新</el-button>
+      <div>
+        <h1 class="page-title">文档管理</h1>
+        <p class="page-subtitle">上传源文档，编译写入 Wiki 供生成检索使用</p>
+      </div>
+      <div class="page-actions">
+        <el-button :icon="Refresh" @click="load">刷新</el-button>
+      </div>
     </div>
 
     <el-upload
@@ -166,8 +172,9 @@ onUnmounted(() => {
       accept=".md,.txt,.pdf,.docx,.doc"
     >
       <div class="upload-inner">
+        <el-icon class="upload-icon" :size="36"><UploadFilled /></el-icon>
         <div class="upload-title">拖拽文件到此处，或点击上传</div>
-        <div class="upload-hint">支持 md / txt / pdf / docx，上传后可点击「编译」写入 Wiki</div>
+        <div class="upload-hint">支持 md / txt / pdf / docx · 上传后点击「编译」写入 Wiki</div>
       </div>
     </el-upload>
 
@@ -175,14 +182,14 @@ onUnmounted(() => {
       v-loading="loading"
       :data="documents"
       stripe
-      empty-text="暂无文档"
-      style="margin-top: 16px"
+      empty-text="暂无文档，先上传一份业务规则吧"
+      style="margin-top: 18px"
     >
       <el-table-column prop="id" label="ID" width="70" />
       <el-table-column prop="filename" label="文件名" min-width="180" show-overflow-tooltip />
       <el-table-column label="状态" width="110">
         <template #default="{ row }">
-          <el-tag :type="statusTagType(row.status)" size="small">
+          <el-tag :type="statusTagType(row.status)" size="small" effect="light">
             {{ statusLabel(row.status) }}
           </el-tag>
         </template>
@@ -190,9 +197,16 @@ onUnmounted(() => {
       <el-table-column prop="char_count" label="字符数" width="100" />
       <el-table-column label="错误信息" min-width="200">
         <template #default="{ row }">
-          <span class="error-text">
-            {{ jobErrors[row.id] || row.error_message || '-' }}
-          </span>
+          <el-tooltip
+            v-if="jobErrors[row.id] || row.error_message"
+            :content="jobErrors[row.id] || row.error_message || ''"
+            placement="top"
+          >
+            <span class="error-text truncate">
+              {{ jobErrors[row.id] || row.error_message }}
+            </span>
+          </el-tooltip>
+          <span v-else class="muted">-</span>
         </template>
       </el-table-column>
       <el-table-column label="更新时间" width="170">
@@ -218,17 +232,6 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
-.page-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 16px;
-}
-
-.page-header h1 {
-  margin: 0;
-}
-
 .uploader {
   width: 100%;
 }
@@ -236,25 +239,52 @@ onUnmounted(() => {
 .uploader :deep(.el-upload),
 .uploader :deep(.el-upload-dragger) {
   width: 100%;
+  border-radius: var(--cg-radius);
+  border: 1.5px dashed rgba(79, 124, 255, 0.35);
+  background: linear-gradient(
+    135deg,
+    rgba(79, 124, 255, 0.06),
+    rgba(139, 92, 246, 0.05)
+  );
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
+}
+
+.uploader :deep(.el-upload-dragger:hover) {
+  border-color: var(--cg-primary);
+  box-shadow: 0 0 0 3px rgba(79, 124, 255, 0.1);
 }
 
 .upload-inner {
-  padding: 12px 0;
+  padding: 18px 0 10px;
+}
+
+.upload-icon {
+  color: var(--cg-primary);
+  margin-bottom: 8px;
 }
 
 .upload-title {
   font-size: 15px;
-  color: #303133;
+  font-weight: 600;
+  color: var(--cg-text);
 }
 
 .upload-hint {
   margin-top: 6px;
   font-size: 13px;
-  color: #909399;
+  color: var(--cg-text-muted);
 }
 
-.error-text {
-  color: #f56c6c;
-  font-size: 13px;
+.truncate {
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+}
+
+.muted {
+  color: var(--cg-text-muted);
 }
 </style>

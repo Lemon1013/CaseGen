@@ -269,17 +269,18 @@ onUnmounted(stopPolling)
 </script>
 
 <template>
-  <div class="page" v-loading="loading">
+  <div class="page detail-page" v-loading="loading">
     <div class="page-header">
       <div>
         <div class="back">
           <el-button link type="primary" @click="router.push('/tasks')">← 返回列表</el-button>
         </div>
-        <h1>
+        <h1 class="page-title">
           任务 #{{ task?.id ?? taskId }}
           <el-tag
             v-if="task"
             :type="statusTagType(task.status)"
+            effect="light"
             style="margin-left: 8px; vertical-align: middle"
           >
             {{ statusLabel(task.status) }}
@@ -295,7 +296,9 @@ onUnmounted(stopPolling)
         </h1>
         <p class="title-line">{{ task?.title || '（无标题）' }}</p>
       </div>
-      <el-button @click="refreshLight">刷新</el-button>
+      <div class="page-actions">
+        <el-button @click="refreshLight">刷新</el-button>
+      </div>
     </div>
 
     <el-alert
@@ -317,7 +320,7 @@ onUnmounted(stopPolling)
       style="margin-bottom: 16px"
     />
 
-    <div class="actions" v-if="task">
+    <div class="actions action-bar" v-if="task">
       <template v-if="task.status === 'draft'">
         <el-button type="primary" :loading="acting" @click="onGenerate">生成</el-button>
       </template>
@@ -335,10 +338,10 @@ onUnmounted(stopPolling)
         <el-button :loading="acting" @click="onGenerate">重新生成</el-button>
       </template>
       <template v-else-if="task.status === 'finalized'">
-        <el-tag type="success">已终版（只读）</el-tag>
+        <el-tag type="success" effect="dark">已终版（只读）</el-tag>
       </template>
       <template v-else-if="isBusy">
-        <el-tag type="warning">处理中，每 2 秒自动刷新…</el-tag>
+        <el-tag type="warning" effect="light">处理中，每 2 秒自动刷新…</el-tag>
       </template>
 
       <el-button
@@ -466,32 +469,29 @@ onUnmounted(stopPolling)
 </template>
 
 <style scoped>
-.page-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-start;
-  gap: 12px;
-  margin-bottom: 12px;
-}
-
-.page-header h1 {
-  margin: 0;
-}
-
 .back {
   margin-bottom: 4px;
 }
 
 .title-line {
   margin: 6px 0 0;
-  color: #606266;
+  color: var(--cg-text-secondary);
+  font-size: 14px;
 }
 
-.actions {
+.action-bar {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
-  margin-bottom: 16px;
+  margin-bottom: 18px;
+  padding: 12px 14px;
+  border-radius: var(--cg-radius);
+  border: 1px solid var(--cg-border);
+  background: linear-gradient(
+    135deg,
+    rgba(79, 124, 255, 0.06),
+    rgba(139, 92, 246, 0.05)
+  );
 }
 
 .main-grid {
@@ -500,6 +500,12 @@ onUnmounted(stopPolling)
 
 .block {
   margin-bottom: 16px;
+  border-radius: var(--cg-radius) !important;
+}
+
+.block :deep(.el-card__header) {
+  font-weight: 700;
+  border-bottom-color: var(--cg-border);
 }
 
 .card-head {
@@ -511,14 +517,14 @@ onUnmounted(stopPolling)
 .meta,
 .draft-meta,
 .apply-meta {
-  color: #909399;
+  color: var(--cg-text-muted);
   font-size: 12px;
 }
 
 .req-desc {
   white-space: pre-wrap;
   line-height: 1.6;
-  color: #303133;
+  color: var(--cg-text);
 }
 
 .tags {
@@ -526,11 +532,11 @@ onUnmounted(stopPolling)
 }
 
 .rev-item {
-  border: 1px solid #ebeef5;
-  border-radius: 6px;
+  border: 1px solid var(--cg-border);
+  border-radius: var(--cg-radius-sm);
   padding: 8px 10px;
   margin-bottom: 8px;
-  background: #fafafa;
+  background: var(--cg-surface-muted);
 }
 
 .rev-head {
@@ -543,7 +549,7 @@ onUnmounted(stopPolling)
 .rev-preview {
   margin-top: 6px;
   font-size: 12px;
-  color: #606266;
+  color: var(--cg-text-secondary);
   white-space: pre-wrap;
 }
 

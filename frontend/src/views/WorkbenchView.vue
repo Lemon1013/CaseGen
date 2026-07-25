@@ -58,7 +58,6 @@ async function submit() {
       run_generate: false,
     })
     ElMessage.success(`任务 #${task.id} 已创建，开始生成…`)
-    // Backend generate is synchronous; await so detail shows results when possible.
     try {
       const generated = await generateTask(task.id)
       ElMessage.success('生成完成')
@@ -81,93 +80,116 @@ onMounted(loadOptions)
 </script>
 
 <template>
-  <div class="page">
+  <div class="page workbench-page">
     <div class="page-header">
       <div>
-        <h1>工作台</h1>
-        <p class="subtitle">填写需求，创建任务并生成测试用例草稿</p>
+        <h1 class="page-title">创建生成任务</h1>
+        <p class="page-subtitle">描述业务场景，系统将结合 Wiki 知识生成可评审的测试用例</p>
       </div>
     </div>
 
-    <el-form label-width="110px" class="workbench-form" @submit.prevent>
-      <el-form-item label="标题" required>
-        <el-input v-model="form.title" placeholder="例如：现货限价单余额不足" maxlength="120" show-word-limit />
-      </el-form-item>
-      <el-form-item label="需求描述" required>
-        <el-input
-          v-model="form.description"
-          type="textarea"
-          :rows="8"
-          placeholder="描述业务场景、前置条件、关注规则等"
-        />
-      </el-form-item>
-      <el-form-item label="关注点">
-        <el-input
-          v-model="form.focusText"
-          placeholder="多个标签用逗号或空格分隔，如：余额校验, 限价单"
-        />
-      </el-form-item>
-      <el-form-item label="模型">
-        <el-select v-model="form.model_id" clearable placeholder="使用默认模型" style="width: 100%">
-          <el-option
-            v-for="m in models"
-            :key="m.id"
-            :label="`${m.name} (${m.model_name})${m.is_default ? ' · 默认' : ''}`"
-            :value="m.id"
+    <div class="step-rail">
+      <div class="step-item">
+        <div class="step-index">STEP 01</div>
+        <div class="step-label">需求填写</div>
+        <div class="step-desc">标题、场景与关注点</div>
+      </div>
+      <div class="step-item">
+        <div class="step-index">STEP 02</div>
+        <div class="step-label">AI 生成</div>
+        <div class="step-desc">检索 Wiki 并输出草稿</div>
+      </div>
+      <div class="step-item">
+        <div class="step-index">STEP 03</div>
+        <div class="step-label">AI 评审</div>
+        <div class="step-desc">打分、缺口与 Prompt 迭代</div>
+      </div>
+    </div>
+
+    <div class="form-shell">
+      <el-form label-width="110px" class="workbench-form" @submit.prevent>
+        <el-form-item label="标题" required>
+          <el-input
+            v-model="form.title"
+            placeholder="例如：现货限价单余额不足"
+            maxlength="120"
+            show-word-limit
           />
-        </el-select>
-      </el-form-item>
-      <el-form-item label="生成 Prompt">
-        <el-select
-          v-model="form.prompt_template_id"
-          clearable
-          placeholder="使用启用中的 generate 模板"
-          style="width: 100%"
-        >
-          <el-option
-            v-for="p in prompts"
-            :key="p.id"
-            :label="`${p.name} (v${p.version})${p.is_active ? ' · 启用' : ''}`"
-            :value="p.id"
+        </el-form-item>
+        <el-form-item label="需求描述" required>
+          <el-input
+            v-model="form.description"
+            type="textarea"
+            :rows="8"
+            placeholder="描述业务场景、前置条件、关注规则等"
           />
-        </el-select>
-      </el-form-item>
-      <el-form-item label="自动评审">
-        <el-switch v-model="form.auto_review" />
-        <span class="hint">生成完成后是否自动进入评审（当前在详情页可手动触发）</span>
-      </el-form-item>
-      <el-form-item>
-        <el-button type="primary" size="large" :loading="submitting" @click="submit">
-          创建并生成
-        </el-button>
-        <el-button size="large" @click="router.push('/tasks')">查看任务列表</el-button>
-      </el-form-item>
-    </el-form>
+        </el-form-item>
+        <el-form-item label="关注点">
+          <el-input
+            v-model="form.focusText"
+            placeholder="多个标签用逗号或空格分隔，如：余额校验, 限价单"
+          />
+        </el-form-item>
+        <el-form-item label="模型">
+          <el-select v-model="form.model_id" clearable placeholder="使用默认模型" style="width: 100%">
+            <el-option
+              v-for="m in models"
+              :key="m.id"
+              :label="`${m.name} (${m.model_name})${m.is_default ? ' · 默认' : ''}`"
+              :value="m.id"
+            />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="生成 Prompt">
+          <el-select
+            v-model="form.prompt_template_id"
+            clearable
+            placeholder="使用启用中的 generate 模板"
+            style="width: 100%"
+          >
+            <el-option
+              v-for="p in prompts"
+              :key="p.id"
+              :label="`${p.name} (v${p.version})${p.is_active ? ' · 启用' : ''}`"
+              :value="p.id"
+            />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="自动评审">
+          <div class="switch-row">
+            <el-switch v-model="form.auto_review" />
+            <span class="hint">生成完成后自动进入评审</span>
+          </div>
+        </el-form-item>
+        <el-form-item>
+          <el-button type="primary" size="large" :loading="submitting" @click="submit">
+            创建并生成
+          </el-button>
+          <el-button size="large" @click="router.push('/tasks')">查看任务列表</el-button>
+        </el-form-item>
+      </el-form>
+    </div>
   </div>
 </template>
 
 <style scoped>
-.page-header {
-  margin-bottom: 8px;
-}
-
-.page-header h1 {
-  margin: 0 0 6px;
-}
-
-.subtitle {
-  margin: 0 0 20px;
-  color: #909399;
-  font-size: 14px;
+.form-shell {
+  max-width: 820px;
+  padding: 8px 4px 0;
 }
 
 .workbench-form {
   max-width: 760px;
 }
 
+.switch-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
 .hint {
-  margin-left: 12px;
-  color: #909399;
+  color: var(--cg-text-muted);
   font-size: 13px;
 }
 </style>

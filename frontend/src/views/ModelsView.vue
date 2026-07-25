@@ -135,20 +135,25 @@ onMounted(load)
 <template>
   <div class="page">
     <div class="page-header">
-      <h1>模型配置</h1>
-      <el-button type="primary" @click="openCreate">新建模型</el-button>
+      <div>
+        <h1 class="page-title">模型配置</h1>
+        <p class="page-subtitle">管理 OpenAI 兼容网关与默认推理模型</p>
+      </div>
+      <div class="page-actions">
+        <el-button type="primary" @click="openCreate">新建模型</el-button>
+      </div>
     </div>
 
-    <el-table v-loading="loading" :data="models" stripe empty-text="暂无模型">
+    <el-table v-loading="loading" :data="models" stripe empty-text="暂无模型，先添加一个网关">
       <el-table-column prop="id" label="ID" width="70" />
       <el-table-column prop="name" label="名称" min-width="120" />
       <el-table-column prop="model_name" label="模型名" min-width="140" />
       <el-table-column prop="base_url" label="Base URL" min-width="200" show-overflow-tooltip />
       <el-table-column prop="api_key" label="API Key" width="120" />
-      <el-table-column label="默认" width="80">
+      <el-table-column label="默认" width="90">
         <template #default="{ row }">
-          <el-tag v-if="row.is_default" type="success" size="small">是</el-tag>
-          <span v-else>否</span>
+          <el-tag v-if="row.is_default" type="success" size="small" effect="dark">默认</el-tag>
+          <span v-else class="muted">否</span>
         </template>
       </el-table-column>
       <el-table-column label="操作" width="260" fixed="right">
@@ -204,14 +209,7 @@ onMounted(load)
 </template>
 
 <style scoped>
-.page-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 16px;
-}
-
-.page-header h1 {
-  margin: 0;
+.muted {
+  color: var(--cg-text-muted);
 }
 </style>

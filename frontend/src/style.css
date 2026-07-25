@@ -1,3 +1,5 @@
+@import "./styles/theme.css";
+
 * {
   box-sizing: border-box;
 }
@@ -8,21 +10,39 @@ body,
   margin: 0;
   padding: 0;
   min-height: 100%;
-  font-family: "Helvetica Neue", Helvetica, "PingFang SC", "Hiragino Sans GB",
-    "Microsoft YaHei", Arial, sans-serif;
-  color: #303133;
-  background: #f5f7fa;
+  font-family: var(--el-font-family);
+  color: var(--cg-text);
+  background: var(--cg-bg);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
 
-h1 {
-  margin: 0 0 16px;
-  font-size: 24px;
-  font-weight: 600;
+a {
+  color: var(--cg-primary);
+  text-decoration: none;
 }
 
-.page {
-  background: #fff;
-  border-radius: 8px;
-  padding: 24px;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
+a:hover {
+  color: var(--cg-primary-2);
+}
+
+h1,
+h2,
+h3 {
+  color: var(--cg-text);
+}
+
+/* Scrollbar polish */
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: rgba(100, 116, 139, 0.35);
+  border-radius: 999px;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: rgba(100, 116, 139, 0.55);
 }

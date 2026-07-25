@@ -129,8 +129,11 @@ onMounted(load)
 <template>
   <div class="page">
     <div class="page-header">
-      <h1>提示词管理</h1>
-      <div class="header-actions">
+      <div>
+        <h1 class="page-title">提示词管理</h1>
+        <p class="page-subtitle">维护生成、评审与 Wiki 编译相关模板</p>
+      </div>
+      <div class="page-actions">
         <el-select
           v-model="filterType"
           clearable
@@ -149,7 +152,7 @@ onMounted(load)
     </div>
 
     <div class="layout" v-loading="loading">
-      <div class="list-panel">
+      <div class="list-panel panel">
         <el-table
           :data="prompts"
           highlight-current-row
@@ -166,14 +169,14 @@ onMounted(load)
           <el-table-column label="版本" prop="version" width="70" />
           <el-table-column label="状态" width="80">
             <template #default="{ row }">
-              <el-tag v-if="row.is_active" type="success" size="small">启用</el-tag>
-              <el-tag v-else type="info" size="small">停用</el-tag>
+              <el-tag v-if="row.is_active" type="success" size="small" effect="light">启用</el-tag>
+              <el-tag v-else type="info" size="small" effect="plain">停用</el-tag>
             </template>
           </el-table-column>
         </el-table>
       </div>
 
-      <div class="editor-panel">
+      <div class="editor-panel panel panel-surface">
         <template v-if="isCreateMode || selected">
           <div class="editor-title">
             <span>{{ isCreateMode ? '新建提示词' : `编辑：${selected?.name}` }}</span>
@@ -225,25 +228,6 @@ onMounted(load)
 </template>
 
 <style scoped>
-.page-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 16px;
-  gap: 12px;
-  flex-wrap: wrap;
-}
-
-.page-header h1 {
-  margin: 0;
-}
-
-.header-actions {
-  display: flex;
-  gap: 12px;
-  align-items: center;
-}
-
 .layout {
   display: grid;
   grid-template-columns: minmax(280px, 1fr) minmax(360px, 1.4fr);
@@ -253,15 +237,7 @@ onMounted(load)
 
 .list-panel,
 .editor-panel {
-  border: 1px solid #ebeef5;
-  border-radius: 8px;
-  padding: 12px;
-  background: #fafafa;
   min-height: 480px;
-}
-
-.editor-panel {
-  background: #fff;
 }
 
 .editor-title {
@@ -269,11 +245,11 @@ onMounted(load)
   justify-content: space-between;
   align-items: center;
   margin-bottom: 12px;
-  font-weight: 600;
+  font-weight: 700;
 }
 
 .meta {
-  color: #909399;
+  color: var(--cg-text-muted);
   font-size: 13px;
   font-weight: 400;
 }

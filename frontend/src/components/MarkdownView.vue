@@ -26,8 +26,8 @@ const html = computed(() => md.render(props.content || ''))
 
 <style scoped>
 .markdown-view {
-  line-height: 1.65;
-  color: #303133;
+  line-height: 1.7;
+  color: var(--cg-text);
   word-break: break-word;
 }
 
@@ -63,19 +63,21 @@ const html = computed(() => md.render(props.content || ''))
 }
 
 .markdown-view :deep(code) {
-  background: #f4f4f5;
+  background: #eef2ff;
   padding: 0.1em 0.35em;
   border-radius: 4px;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 0.92em;
+  color: #4338ca;
 }
 
 .markdown-view :deep(pre) {
-  background: #1e1e1e;
+  background: #0b1220;
   color: #e5e5e5;
   padding: 12px 14px;
-  border-radius: 8px;
+  border-radius: 10px;
   overflow: auto;
+  border: 1px solid rgba(255, 255, 255, 0.06);
 }
 
 .markdown-view :deep(pre code) {
@@ -87,9 +89,9 @@ const html = computed(() => md.render(props.content || ''))
 .markdown-view :deep(blockquote) {
   margin: 0.8em 0;
   padding: 0.2em 0.8em;
-  border-left: 4px solid #dcdfe6;
-  color: #606266;
-  background: #fafafa;
+  border-left: 4px solid var(--cg-primary);
+  color: var(--cg-text-secondary);
+  background: rgba(79, 124, 255, 0.05);
 }
 
 .markdown-view :deep(table) {
@@ -106,10 +108,10 @@ const html = computed(() => md.render(props.content || ''))
 }
 
 .markdown-view :deep(th) {
-  background: #f5f7fa;
+  background: #f5f7ff;
 }
 
 .markdown-view :deep(a) {
-  color: #409eff;
+  color: var(--cg-primary);
 }
 </style>

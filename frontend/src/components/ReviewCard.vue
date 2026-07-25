@@ -62,16 +62,16 @@ const highScore = computed(() => score.value != null && score.value >= 80)
 
 <style scoped>
 .review-card {
-  border: 1px solid #ebeef5;
-  border-radius: 8px;
-  padding: 12px;
+  border: 1px solid var(--cg-border);
+  border-radius: var(--cg-radius);
+  padding: 14px;
   background: #fff;
 }
 
 .review-card.highlight {
-  border-color: #67c23a;
-  box-shadow: 0 0 0 1px rgba(103, 194, 58, 0.2);
-  background: linear-gradient(180deg, #f0f9eb 0%, #fff 48%);
+  border-color: rgba(18, 184, 134, 0.45);
+  box-shadow: 0 0 0 1px rgba(18, 184, 134, 0.15);
+  background: linear-gradient(180deg, rgba(18, 184, 134, 0.08) 0%, #fff 48%);
 }
 
 .header {
@@ -98,26 +98,28 @@ const highScore = computed(() => score.value != null && score.value >= 80)
 }
 
 .score {
-  width: 72px;
-  height: 72px;
-  border-radius: 12px;
-  background: #f5f7fa;
+  width: 76px;
+  height: 76px;
+  border-radius: 16px;
+  background: linear-gradient(135deg, #eef2ff, #f5f3ff);
   display: flex;
   align-items: center;
   justify-content: center;
   font-size: 28px;
-  font-weight: 700;
-  color: #606266;
+  font-weight: 800;
+  color: var(--cg-text-secondary);
+  border: 1px solid var(--cg-border);
 }
 
 .score.good {
-  background: #e1f3d8;
-  color: #67c23a;
+  background: linear-gradient(135deg, rgba(18, 184, 134, 0.16), rgba(79, 124, 255, 0.1));
+  color: var(--cg-accent);
+  border-color: rgba(18, 184, 134, 0.3);
 }
 
 .verdict .label {
   font-size: 12px;
-  color: #909399;
+  color: var(--cg-text-muted);
 }
 
 .verdict .value {

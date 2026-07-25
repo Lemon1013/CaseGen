@@ -48,10 +48,11 @@ function stepType(step: string): '' | 'success' | 'warning' | 'info' | 'danger' 
   font-size: 13px;
   margin-bottom: 2px;
   text-transform: uppercase;
+  color: var(--cg-text);
 }
 
 .ev-msg {
-  color: #606266;
+  color: var(--cg-text-secondary);
   font-size: 13px;
 }
 </style>
