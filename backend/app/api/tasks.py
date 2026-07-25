@@ -10,17 +10,50 @@ from app.db import get_session
 from app.models.entities import (
     CaseDraft,
     GenerationTask,
+    PromptRevision,
     Requirement,
+    ReviewResult,
     TaskCitation,
     TaskEvent,
 )
-from app.schemas.tasks import CaseDraftOut, TaskCreate, TaskEventOut, TaskOut
-from app.services.task_pipeline import run_generate
+from app.schemas.tasks import (
+    ApplyPromptBody,
+    CaseDraftOut,
+    PromptRevisionOut,
+    ReviewResultOut,
+    TaskCreate,
+    TaskEventOut,
+    TaskOut,
+)
+from app.services.task_pipeline import (
+    apply_prompt,
+    finalize_task,
+    run_generate,
+    run_optimize_prompt,
+    run_regenerate,
+    run_review,
+)
 
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
 
-# Optional injectable chat_fn for tests: monkeypatch this module attr.
+# Optional injectable chat hooks for tests: monkeypatch these module attrs.
+_PIPELINE_CHAT_FN = None
 _GENERATE_CHAT_FN = None
+_REVIEW_CHAT_FN = None
+_OPTIMIZE_CHAT_FN = None
+
+
+def _chat_for(stage: str = "generate"):
+    """Resolve chat hook for a pipeline stage."""
+    if stage == "review" and _REVIEW_CHAT_FN is not None:
+        return _REVIEW_CHAT_FN
+    if stage == "optimize" and _OPTIMIZE_CHAT_FN is not None:
+        return _OPTIMIZE_CHAT_FN
+    if stage == "generate" and _GENERATE_CHAT_FN is not None:
+        return _GENERATE_CHAT_FN
+    if _PIPELINE_CHAT_FN is not None:
+        return _PIPELINE_CHAT_FN
+    return _GENERATE_CHAT_FN
 
 
 def _tags_list(requirement: Optional[Requirement]) -> list[str]:
@@ -43,9 +76,35 @@ def _latest_draft(session: Session, task_id: int) -> Optional[CaseDraft]:
     ).first()
 
 
+def _latest_review_row(session: Session, task_id: int) -> Optional[ReviewResult]:
+    return session.exec(
+        select(ReviewResult)
+        .where(ReviewResult.task_id == task_id)
+        .order_by(col(ReviewResult.id).desc())
+    ).first()
+
+
 def _citation_count(session: Session, task_id: int) -> int:
     rows = session.exec(select(TaskCitation).where(TaskCitation.task_id == task_id)).all()
     return len(rows)
+
+
+def _review_to_out(row: ReviewResult) -> ReviewResultOut:
+    try:
+        payload = json.loads(row.payload_json or "{}")
+    except json.JSONDecodeError:
+        payload = {"raw": row.payload_json}
+    if not isinstance(payload, dict):
+        payload = {"raw": row.payload_json}
+    return ReviewResultOut(
+        id=row.id,
+        task_id=row.task_id,
+        draft_id=row.draft_id,
+        score=row.score,
+        verdict=row.verdict,
+        payload=payload,
+        created_at=row.created_at,
+    )
 
 
 def to_task_out(session: Session, task: GenerationTask) -> TaskOut:
@@ -57,6 +116,9 @@ def to_task_out(session: Session, task: GenerationTask) -> TaskOut:
         version = draft.version
         text = draft.content_md or ""
         snippet = text[:240]
+
+    review_row = _latest_review_row(session, task.id)
+    latest_review = _review_to_out(review_row) if review_row is not None else None
 
     return TaskOut(
         id=task.id,
@@ -71,6 +133,7 @@ def to_task_out(session: Session, task: GenerationTask) -> TaskOut:
         citation_count=_citation_count(session, task.id),
         latest_draft_snippet=snippet,
         latest_draft_version=version,
+        latest_review=latest_review,
         created_at=task.created_at,
         updated_at=task.updated_at,
     )
@@ -101,8 +164,11 @@ def create_task(
     session.refresh(task)
 
     if body.run_generate:
-        run_generate(session, task.id, chat_fn=_GENERATE_CHAT_FN)
+        run_generate(session, task.id, chat_fn=_chat_for("generate"))
         session.refresh(task)
+        if body.auto_review and task.status == "generated":
+            run_review(session, task.id, chat_fn=_chat_for("review"))
+            session.refresh(task)
 
     return to_task_out(session, task)
 
@@ -127,11 +193,76 @@ def generate_task(task_id: int, session: Session = Depends(get_session)) -> Task
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    task = run_generate(session, task_id, chat_fn=_GENERATE_CHAT_FN)
-    if task.status == "failed":
-        # Still return 200 with failed status so clients can inspect error_message/events;
-        # raise 400 only when the task itself is missing (handled above).
-        pass
+    task = run_generate(session, task_id, chat_fn=_chat_for("generate"))
+    return to_task_out(session, task)
+
+
+@router.post("/{task_id}/review", response_model=TaskOut)
+def review_task(task_id: int, session: Session = Depends(get_session)) -> TaskOut:
+    task = session.get(GenerationTask, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    task = run_review(session, task_id, chat_fn=_chat_for("review"))
+    return to_task_out(session, task)
+
+
+@router.post("/{task_id}/optimize-prompt", response_model=TaskOut)
+def optimize_prompt_task(
+    task_id: int, session: Session = Depends(get_session)
+) -> TaskOut:
+    task = session.get(GenerationTask, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    task = run_optimize_prompt(session, task_id, chat_fn=_chat_for("optimize"))
+    return to_task_out(session, task)
+
+
+@router.post("/{task_id}/apply-prompt", response_model=TaskOut)
+def apply_prompt_task(
+    task_id: int,
+    body: ApplyPromptBody,
+    session: Session = Depends(get_session),
+) -> TaskOut:
+    task = session.get(GenerationTask, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    try:
+        task = apply_prompt(
+            session,
+            task_id,
+            revision_id=body.revision_id,
+            mode=body.mode,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return to_task_out(session, task)
+
+
+@router.post("/{task_id}/regenerate", response_model=TaskOut)
+def regenerate_task(task_id: int, session: Session = Depends(get_session)) -> TaskOut:
+    task = session.get(GenerationTask, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    task = run_regenerate(session, task_id, chat_fn=_chat_for("generate"))
+    return to_task_out(session, task)
+
+
+@router.post("/{task_id}/finalize", response_model=TaskOut)
+def finalize_task_route(
+    task_id: int, session: Session = Depends(get_session)
+) -> TaskOut:
+    task = session.get(GenerationTask, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    try:
+        task = finalize_task(session, task_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return to_task_out(session, task)
 
 
@@ -157,5 +288,35 @@ def list_events(task_id: int, session: Session = Depends(get_session)) -> list[T
         select(TaskEvent)
         .where(TaskEvent.task_id == task_id)
         .order_by(col(TaskEvent.id).asc())
+    ).all()
+    return list(rows)
+
+
+@router.get("/{task_id}/reviews", response_model=List[ReviewResultOut])
+def list_reviews(
+    task_id: int, session: Session = Depends(get_session)
+) -> list[ReviewResultOut]:
+    task = session.get(GenerationTask, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    rows = session.exec(
+        select(ReviewResult)
+        .where(ReviewResult.task_id == task_id)
+        .order_by(col(ReviewResult.id).desc())
+    ).all()
+    return [_review_to_out(r) for r in rows]
+
+
+@router.get("/{task_id}/revisions", response_model=List[PromptRevisionOut])
+def list_revisions(
+    task_id: int, session: Session = Depends(get_session)
+) -> list[PromptRevision]:
+    task = session.get(GenerationTask, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    rows = session.exec(
+        select(PromptRevision)
+        .where(PromptRevision.task_id == task_id)
+        .order_by(col(PromptRevision.id).desc())
     ).all()
     return list(rows)

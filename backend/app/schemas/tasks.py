@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -14,6 +14,18 @@ class TaskCreate(BaseModel):
     prompt_template_id: Optional[int] = None
     auto_review: bool = False
     run_generate: bool = False
+
+
+class ReviewResultOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    task_id: int
+    draft_id: int
+    score: int
+    verdict: str
+    payload: Dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
 
 
 class TaskOut(BaseModel):
@@ -31,6 +43,7 @@ class TaskOut(BaseModel):
     citation_count: int = 0
     latest_draft_snippet: Optional[str] = None
     latest_draft_version: Optional[int] = None
+    latest_review: Optional[ReviewResultOut] = None
     created_at: datetime
     updated_at: datetime
 
@@ -54,4 +67,20 @@ class TaskEventOut(BaseModel):
     step: str
     message: str
     detail_json: Optional[str] = None
+    created_at: datetime
+
+
+class ApplyPromptBody(BaseModel):
+    revision_id: int
+    mode: Literal["global", "task_temp"]
+
+
+class PromptRevisionOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    task_id: int
+    base_prompt_id: Optional[int] = None
+    new_content: str
+    status: str
     created_at: datetime
