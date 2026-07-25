@@ -1,4 +1,4 @@
-"""Long-source wiki analyze: window split (merge/orchestration in later tasks)."""
+"""Long-source wiki analyze: window split + partial merge (orchestration later)."""
 
 from __future__ import annotations
 
@@ -200,3 +200,126 @@ def _overlap_suffix(text: str, max_chars: int) -> str:
         if idx != -1 and idx + len(sep) < len(slice_) - 20:
             return slice_[idx + len(sep) :]
     return slice_
+
+
+def _as_str_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        s = value.strip()
+        return [s] if s else []
+    if isinstance(value, list):
+        out: list[str] = []
+        for item in value:
+            if item is None:
+                continue
+            if isinstance(item, dict):
+                for key in ("name", "title", "rule", "text", "point", "hint"):
+                    if item.get(key):
+                        out.append(str(item[key]).strip())
+                        break
+                else:
+                    t = str(item).strip()
+                    if t:
+                        out.append(t)
+            else:
+                t = str(item).strip()
+                if t:
+                    out.append(t)
+        return [x for x in out if x]
+    t = str(value).strip()
+    return [t] if t else []
+
+
+def _dedupe(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in items:
+        key = re.sub(r"\s+", " ", raw).strip()
+        if not key:
+            continue
+        fold = key.casefold()
+        if fold in seen:
+            continue
+        seen.add(fold)
+        out.append(key)
+    return out
+
+
+def merge_analysis_partials(
+    partials: list[dict[str, Any]],
+    *,
+    digest: str = "",
+    source_chars: int = 0,
+    max_rules: int = 80,
+    max_other: int = 40,
+) -> dict[str, Any]:
+    if not partials:
+        return {
+            "summary_title": "",
+            "key_rules": [],
+            "api_points": [],
+            "test_hints": [],
+            "entities": [],
+            "suggested_page_types": ["source_summary"],
+            "global_digest": digest or "",
+            "window_count": 0,
+            "coverage": {"chars": source_chars, "windows": 0},
+        }
+
+    summary = ""
+    for p in partials:
+        t = str(p.get("summary_title") or "").strip()
+        if t:
+            summary = t
+            break
+
+    key_rules = _dedupe([r for p in partials for r in _as_str_list(p.get("key_rules"))])[
+        :max_rules
+    ]
+    api_points = _dedupe(
+        [r for p in partials for r in _as_str_list(p.get("api_points"))]
+    )[:max_other]
+    test_hints = _dedupe(
+        [r for p in partials for r in _as_str_list(p.get("test_hints"))]
+    )[:max_other]
+    entities = _dedupe([r for p in partials for r in _as_str_list(p.get("entities"))])[
+        :max_other
+    ]
+    suggested = _dedupe(
+        [r for p in partials for r in _as_str_list(p.get("suggested_page_types"))]
+    )
+    if not suggested:
+        suggested = ["source_summary"]
+
+    return {
+        "summary_title": summary,
+        "key_rules": key_rules,
+        "api_points": api_points,
+        "test_hints": test_hints,
+        "entities": entities,
+        "suggested_page_types": suggested,
+        "global_digest": (digest or "").strip(),
+        "window_count": len(partials),
+        "coverage": {"chars": source_chars, "windows": len(partials)},
+    }
+
+
+def trim_digest(digest: str, max_chars: int | None = None) -> str:
+    cap = int(max_chars or config.WIKI_ANALYZE_DIGEST_MAX)
+    d = (digest or "").strip()
+    if len(d) <= cap:
+        return d
+    return d[:cap].rstrip() + "\n…[digest truncated]"
+
+
+def heuristic_digest_append(digest: str, partial: dict[str, Any]) -> str:
+    parts = [digest.strip()] if digest.strip() else []
+    title = str(partial.get("summary_title") or "").strip()
+    if title:
+        parts.append(f"## {title}")
+    for rule in _as_str_list(partial.get("key_rules"))[:8]:
+        parts.append(f"- {rule}")
+    for ent in _as_str_list(partial.get("entities"))[:6]:
+        parts.append(f"- 实体: {ent}")
+    return trim_digest("\n".join(parts))
