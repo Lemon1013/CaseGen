@@ -21,6 +21,7 @@ from app.schemas.tasks import (
     CaseDraftOut,
     PromptRevisionOut,
     ReviewResultOut,
+    TaskCitationOut,
     TaskCreate,
     TaskEventOut,
     TaskOut,
@@ -277,6 +278,31 @@ def list_drafts(task_id: int, session: Session = Depends(get_session)) -> list[C
         .order_by(col(CaseDraft.version).desc())
     ).all()
     return list(rows)
+
+
+@router.get("/{task_id}/citations", response_model=List[TaskCitationOut])
+def list_citations(
+    task_id: int, session: Session = Depends(get_session)
+) -> list[TaskCitationOut]:
+    task = session.get(GenerationTask, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    rows = session.exec(
+        select(TaskCitation)
+        .where(TaskCitation.task_id == task_id)
+        .order_by(col(TaskCitation.id).asc())
+    ).all()
+    return [
+        TaskCitationOut(
+            id=r.id,
+            title=r.title,
+            path=r.path,
+            score=r.score,
+            snippet=r.snippet,
+            wiki_page_id=r.wiki_page_id,
+        )
+        for r in rows
+    ]
 
 
 @router.get("/{task_id}/events", response_model=List[TaskEventOut])

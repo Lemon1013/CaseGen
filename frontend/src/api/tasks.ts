@@ -74,6 +74,15 @@ export interface PromptRevision {
   created_at: string
 }
 
+export interface TaskCitation {
+  id: number
+  title: string
+  path: string
+  score: number
+  snippet: string
+  wiki_page_id: number | null
+}
+
 export type ApplyPromptMode = 'global' | 'task_temp'
 
 export const IN_PROGRESS_STATUSES = new Set([
@@ -143,6 +152,10 @@ export function listReviews(id: number) {
 
 export function listRevisions(id: number) {
   return api<PromptRevision[]>(`/api/tasks/${id}/revisions`)
+}
+
+export function listCitations(id: number) {
+  return api<TaskCitation[]>(`/api/tasks/${id}/citations`)
 }
 
 export function statusLabel(status: string): string {

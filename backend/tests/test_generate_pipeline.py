@@ -110,6 +110,16 @@ def test_generate_creates_draft(tmp_app_data, monkeypatch):
     assert "用例" in drafts[0]["content_md"]
     assert drafts[0]["version"] == 1
 
+    citations = client.get(f"/api/tasks/{tid}/citations").json()
+    assert len(citations) >= 1
+    cite = citations[0]
+    assert "id" in cite
+    assert cite["title"]
+    assert cite["path"]
+    assert "score" in cite
+    assert "snippet" in cite
+    assert "wiki_page_id" in cite
+
     events = client.get(f"/api/tasks/{tid}/events").json()
     assert len(events) >= 2
     steps = {e["step"] for e in events}

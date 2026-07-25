@@ -12,6 +12,7 @@ import {
   generateTask,
   getTask,
   IN_PROGRESS_STATUSES,
+  listCitations,
   listDrafts,
   listEvents,
   listReviews,
@@ -25,6 +26,7 @@ import {
   type CaseDraft,
   type PromptRevision,
   type ReviewResult,
+  type TaskCitation,
   type TaskEvent,
   type TaskItem,
 } from '../api/tasks'
@@ -39,6 +41,7 @@ const drafts = ref<CaseDraft[]>([])
 const events = ref<TaskEvent[]>([])
 const reviews = ref<ReviewResult[]>([])
 const revisions = ref<PromptRevision[]>([])
+const citations = ref<TaskCitation[]>([])
 const activeDraftTab = ref('')
 
 const applyDialogVisible = ref(false)
@@ -58,7 +61,7 @@ const showEmptyCitationBanner = computed(() => {
   if (!task.value) return false
   const s = task.value.status
   return (
-    task.value.citation_count === 0 &&
+    citations.value.length === 0 &&
     ['generated', 'reviewed', 'finalized', 'regenerating'].includes(s)
   )
 })
@@ -77,27 +80,24 @@ const highlightFinal = computed(() => {
   return Boolean(r.payload?.ready_for_final) || r.score >= 80
 })
 
-const citationsFromEvents = computed(() => {
-  // Backend does not expose citation list; surface hit_count via timeline summary only.
-  return [] as { title: string; path: string; score?: number; snippet?: string }[]
-})
-
 async function loadAll() {
   if (!taskId.value || Number.isNaN(taskId.value)) return
   loading.value = true
   try {
-    const [t, d, e, rev, revs] = await Promise.all([
+    const [t, d, e, rev, revs, c] = await Promise.all([
       getTask(taskId.value),
       listDrafts(taskId.value),
       listEvents(taskId.value),
       listReviews(taskId.value),
       listRevisions(taskId.value),
+      listCitations(taskId.value),
     ])
     task.value = t
     drafts.value = d
     events.value = e
     reviews.value = rev
     revisions.value = revs
+    citations.value = c
     if (!activeDraftTab.value && d.length) {
       activeDraftTab.value = String(d[0].id)
     }
@@ -111,18 +111,20 @@ async function loadAll() {
 async function refreshLight() {
   if (!taskId.value || Number.isNaN(taskId.value)) return
   try {
-    const [t, d, e, rev, revs] = await Promise.all([
+    const [t, d, e, rev, revs, c] = await Promise.all([
       getTask(taskId.value),
       listDrafts(taskId.value),
       listEvents(taskId.value),
       listReviews(taskId.value),
       listRevisions(taskId.value),
+      listCitations(taskId.value),
     ])
     task.value = t
     drafts.value = d
     events.value = e
     reviews.value = rev
     revisions.value = revs
+    citations.value = c
     if (d.length && !d.some((x) => String(x.id) === activeDraftTab.value)) {
       activeDraftTab.value = String(d[0].id)
     }
@@ -399,8 +401,8 @@ onUnmounted(stopPolling)
 
         <el-card shadow="never" class="block">
           <CitationList
-            :citations="citationsFromEvents"
-            :count="task?.citation_count || 0"
+            :citations="citations"
+            :count="citations.length || task?.citation_count || 0"
           />
         </el-card>
 

@@ -48,6 +48,17 @@ class TaskOut(BaseModel):
     updated_at: datetime
 
 
+class TaskCitationOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    title: str
+    path: str
+    score: float = 0.0
+    snippet: str = ""
+    wiki_page_id: Optional[int] = None
+
+
 class CaseDraftOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

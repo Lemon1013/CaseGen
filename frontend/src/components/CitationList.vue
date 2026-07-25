@@ -5,6 +5,7 @@ export interface CitationItem {
   path: string
   score?: number
   snippet?: string
+  wiki_page_id?: number | null
 }
 
 withDefaults(
