@@ -13,10 +13,18 @@ from app.models.entities import Document, IngestJob, ModelConfig, PromptTemplate
 from app.services.llm import LLMError, chat_completion
 from app.services.parse_document import parse_file
 from app.services.wiki_index import rebuild_index
-from app.services.wiki_pages_parse import parse_json_flexible, split_wiki_pages
+from app.services.wiki_pages_parse import (
+    pages_from_analysis,
+    parse_json_flexible,
+    split_wiki_pages,
+)
 
 MAX_WIKI_PAGES_PER_DOC = 8
 INDEX_EXCERPT_CHARS = 4000
+# wiki_write only needs analysis; re-sending full source often triggers gateway 502
+WRITE_SOURCE_EXCERPT_CHARS = 2500
+# Cap analyze input so first LLM call stays reliable on long regulations
+ANALYZE_SOURCE_CHARS = 14000
 
 ChatFn = Callable[[list[dict[str, str]]], Any]
 
@@ -91,6 +99,8 @@ def _default_chat_fn(session: Session) -> ChatFn:
             api_key=model.api_key,
             model=model.model_name,
             messages=messages,
+            timeout=float(config.LLM_WIKI_TIMEOUT_SEC),
+            max_retries=3,
         )
         return content
 
@@ -194,6 +204,10 @@ def ingest_document(
 
         # 2) Analyze
         analyze_prompt = _load_active_prompt(session, "wiki_analyze")
+        analyze_text = text if len(text) <= ANALYZE_SOURCE_CHARS else (
+            text[:ANALYZE_SOURCE_CHARS]
+            + f"\n\n[... 原文共 {len(text)} 字，已截断至 {ANALYZE_SOURCE_CHARS} 字用于分析 ...]"
+        )
         analyze_messages = [
             {"role": "system", "content": analyze_prompt.content},
             {
@@ -201,37 +215,71 @@ def ingest_document(
                 "content": (
                     f"源文件路径: {doc.stored_path}\n"
                     f"文件名: {doc.filename}\n\n"
-                    f"# 原文\n{text}"
+                    f"# 原文\n{analyze_text}"
                 ),
             },
         ]
         analysis_raw = _call_chat(chat_fn, analyze_messages)
         analysis = parse_json_flexible(analysis_raw)
-        _append_step(job, "wiki_analyze", "Analysis JSON parsed", keys=list(analysis.keys()))
+        _append_step(
+            job,
+            "wiki_analyze",
+            "Analysis JSON parsed",
+            keys=list(analysis.keys()),
+            source_chars=len(text),
+            analyze_chars=len(analyze_text),
+        )
         session.add(job)
         session.commit()
 
-        # 3) Write wiki pages
+        # 3) Write wiki pages (LLM preferred; analysis fallback on gateway failure)
         write_prompt = _load_active_prompt(session, "wiki_write")
         index_excerpt = _read_index_excerpt()
+        # Keep payload lean: analysis already carries rules/entities; full dual context
+        # has been observed to 502 on long finance/exchange documents.
+        analysis_json = json.dumps(analysis, ensure_ascii=False, indent=2)
+        if len(analysis_json) > 12000:
+            analysis_json = analysis_json[:12000] + "\n...[truncated]"
         write_messages = [
             {"role": "system", "content": write_prompt.content},
             {
                 "role": "user",
                 "content": (
-                    f"# Step A 分析结果\n```json\n{json.dumps(analysis, ensure_ascii=False, indent=2)}\n```\n\n"
+                    f"# Step A 分析结果\n```json\n{analysis_json}\n```\n\n"
                     f"# 源路径\n{doc.stored_path}\n\n"
-                    f"# 现有 index 摘要\n{index_excerpt}\n\n"
-                    f"# 原文要点（可参考）\n{text[:8000]}"
+                    f"# 现有 index 摘要\n{index_excerpt[:2000]}\n\n"
+                    f"# 原文摘录（辅助）\n{text[:WRITE_SOURCE_EXCERPT_CHARS]}"
                 ),
             },
         ]
-        write_raw = _call_chat(chat_fn, write_messages)
-        pages = split_wiki_pages(write_raw)
-        if not pages:
-            raise ValueError("wiki_write produced no pages")
+        pages: list[dict] = []
+        write_mode = "llm"
+        try:
+            write_raw = _call_chat(chat_fn, write_messages)
+            pages = split_wiki_pages(write_raw)
+            if not pages:
+                raise ValueError("wiki_write produced no pages")
+        except (LLMError, ValueError) as write_exc:
+            write_mode = "analysis_fallback"
+            pages = pages_from_analysis(
+                analysis,
+                source_path=doc.stored_path or "",
+                filename=doc.filename or "",
+            )
+            if not pages:
+                raise write_exc
+            _append_step(
+                job,
+                "wiki_write_fallback",
+                f"LLM write failed ({write_exc}); built {len(pages)} page(s) from analysis",
+            )
         pages = pages[:MAX_WIKI_PAGES_PER_DOC]
-        _append_step(job, "wiki_write", f"Split into {len(pages)} page(s)")
+        _append_step(
+            job,
+            "wiki_write",
+            f"Split into {len(pages)} page(s) via {write_mode}",
+            mode=write_mode,
+        )
         session.add(job)
         session.commit()
 

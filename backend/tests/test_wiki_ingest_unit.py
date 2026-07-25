@@ -1,4 +1,8 @@
-from app.services.wiki_pages_parse import parse_json_flexible, split_wiki_pages
+from app.services.wiki_pages_parse import (
+    pages_from_analysis,
+    parse_json_flexible,
+    split_wiki_pages,
+)
 
 
 def test_split_markdown_pages():
@@ -62,3 +66,26 @@ def test_parse_json_flexible_fenced():
     data = parse_json_flexible(raw)
     assert data["summary_title"] == "余额"
     assert data["key_rules"] == ["a"]
+
+
+def test_pages_from_analysis_fallback():
+    analysis = {
+        "summary_title": "上交所交易规则摘要",
+        "key_rules": ["集合竞价规则", "连续竞价规则"],
+        "api_points": ["下单接口需校验证券代码"],
+        "test_hints": ["覆盖涨跌幅边界"],
+        "entities": ["集合竞价", "连续竞价"],
+        "suggested_page_types": ["source_summary", "business"],
+    }
+    pages = pages_from_analysis(
+        analysis,
+        source_path="raw/sources/sse.docx",
+        filename="sse.docx",
+    )
+    assert len(pages) >= 3
+    assert pages[0]["type"] == "source_summary"
+    assert "集合竞价规则" in pages[0]["body"]
+    types = {p["type"] for p in pages}
+    assert "business" in types
+    assert "test_hint" in types
+    assert pages[0]["sources"] == ["raw/sources/sse.docx"]

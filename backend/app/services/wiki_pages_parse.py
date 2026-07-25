@@ -141,3 +141,121 @@ def parse_json_flexible(text: str) -> dict[str, Any]:
             return data
 
     raise ValueError("Could not parse analysis JSON")
+
+
+def _as_str_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        return [text] if text else []
+    if isinstance(value, list):
+        out: list[str] = []
+        for item in value:
+            if item is None:
+                continue
+            if isinstance(item, dict):
+                # Prefer common label fields from LLM analysis blobs
+                for key in ("name", "title", "rule", "text", "point", "hint"):
+                    if item.get(key):
+                        out.append(str(item[key]).strip())
+                        break
+                else:
+                    out.append(str(item).strip())
+            else:
+                s = str(item).strip()
+                if s:
+                    out.append(s)
+        return [x for x in out if x]
+    return [str(value).strip()] if str(value).strip() else []
+
+
+def pages_from_analysis(
+    analysis: dict[str, Any],
+    *,
+    source_path: str,
+    filename: str = "",
+) -> list[dict[str, Any]]:
+    """Deterministic wiki pages from Step-A analysis when wiki_write fails.
+
+    Keeps compile usable when the second LLM call hits gateway 502/timeouts.
+    """
+    sources = [source_path] if source_path else []
+    title_base = (
+        str(analysis.get("summary_title") or "").strip()
+        or (filename.rsplit(".", 1)[0] if filename else "")
+        or "文档摘要"
+    )
+    key_rules = _as_str_list(analysis.get("key_rules"))
+    api_points = _as_str_list(analysis.get("api_points"))
+    test_hints = _as_str_list(analysis.get("test_hints"))
+    entities = _as_str_list(analysis.get("entities"))
+    suggested = _as_str_list(analysis.get("suggested_page_types"))
+    tags = entities[:8] if entities else (["业务规则"] if key_rules else [])
+
+    pages: list[dict[str, Any]] = []
+
+    summary_lines = [f"# {title_base}", "", f"来源：`{source_path or filename or 'unknown'}`", ""]
+    if key_rules:
+        summary_lines.append("## 核心规则")
+        summary_lines.extend(f"- {r}" for r in key_rules[:20])
+        summary_lines.append("")
+    if entities:
+        summary_lines.append("## 关键实体")
+        summary_lines.extend(f"- {e}" for e in entities[:20])
+        summary_lines.append("")
+    if suggested:
+        summary_lines.append("## 建议页面类型")
+        summary_lines.extend(f"- {s}" for s in suggested[:10])
+        summary_lines.append("")
+    pages.append(
+        {
+            "title": title_base,
+            "type": "source_summary",
+            "page_type": "source_summary",
+            "sources": sources,
+            "tags": tags,
+            "body": "\n".join(summary_lines).strip(),
+        }
+    )
+
+    if key_rules:
+        rules_body = ["# 业务规则要点", ""] + [f"{i}. {r}" for i, r in enumerate(key_rules[:30], 1)]
+        pages.append(
+            {
+                "title": f"{title_base}-业务规则",
+                "type": "business",
+                "page_type": "business",
+                "sources": sources,
+                "tags": tags,
+                "body": "\n".join(rules_body).strip(),
+            }
+        )
+
+    if api_points:
+        api_body = ["# 接口/约束要点", ""] + [f"- {p}" for p in api_points[:30]]
+        pages.append(
+            {
+                "title": f"{title_base}-接口要点",
+                "type": "api",
+                "page_type": "api",
+                "sources": sources,
+                "tags": tags + ["api"],
+                "body": "\n".join(api_body).strip(),
+            }
+        )
+
+    if test_hints:
+        hint_body = ["# 测试设计提示", ""] + [f"- {h}" for h in test_hints[:30]]
+        pages.append(
+            {
+                "title": f"{title_base}-测试提示",
+                "type": "test_hint",
+                "page_type": "test_hint",
+                "sources": sources,
+                "tags": tags + ["测试"],
+                "body": "\n".join(hint_body).strip(),
+            }
+        )
+
+    return pages[:8]
