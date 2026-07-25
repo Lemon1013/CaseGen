@@ -204,6 +204,11 @@ def pages_from_analysis(
         summary_lines.append("## 关键实体")
         summary_lines.extend(f"- {e}" for e in entities[:20])
         summary_lines.append("")
+    digest = str(analysis.get("global_digest") or "").strip()
+    if digest:
+        summary_lines.append("## 全局摘要")
+        summary_lines.append(digest[:3000])
+        summary_lines.append("")
     if suggested:
         summary_lines.append("## 建议页面类型")
         summary_lines.extend(f"- {s}" for s in suggested[:10])

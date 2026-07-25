@@ -13,18 +13,15 @@ from app.models.entities import Document, IngestJob, ModelConfig, PromptTemplate
 from app.services.llm import LLMError, chat_completion
 from app.services.parse_document import parse_file
 from app.services.wiki_index import rebuild_index
+from app.services.source_chunks_store import replace_chunks_for_document
+from app.services.wiki_long_analyze import run_long_source_analyze
 from app.services.wiki_pages_parse import (
     pages_from_analysis,
-    parse_json_flexible,
     split_wiki_pages,
 )
 
 MAX_WIKI_PAGES_PER_DOC = 8
 INDEX_EXCERPT_CHARS = 4000
-# wiki_write only needs analysis; re-sending full source often triggers gateway 502
-WRITE_SOURCE_EXCERPT_CHARS = 2500
-# Cap analyze input so first LLM call stays reliable on long regulations
-ANALYZE_SOURCE_CHARS = 14000
 
 ChatFn = Callable[[list[dict[str, str]]], Any]
 
@@ -202,44 +199,68 @@ def ingest_document(
         session.add(job)
         session.commit()
 
-        # 2) Analyze
-        analyze_prompt = _load_active_prompt(session, "wiki_analyze")
-        analyze_text = text if len(text) <= ANALYZE_SOURCE_CHARS else (
-            text[:ANALYZE_SOURCE_CHARS]
-            + f"\n\n[... 原文共 {len(text)} 字，已截断至 {ANALYZE_SOURCE_CHARS} 字用于分析 ...]"
+        # 1b) Verbatim source chunks (lossless layer for hybrid retrieve)
+        chunk_rows = replace_chunks_for_document(
+            session,
+            document_id,
+            text,
+            chunk_chars=config.SOURCE_CHUNK_CHARS,
+            overlap_chars=config.SOURCE_CHUNK_OVERLAP,
         )
-        analyze_messages = [
-            {"role": "system", "content": analyze_prompt.content},
-            {
-                "role": "user",
-                "content": (
-                    f"源文件路径: {doc.stored_path}\n"
-                    f"文件名: {doc.filename}\n\n"
-                    f"# 原文\n{analyze_text}"
-                ),
-            },
-        ]
-        analysis_raw = _call_chat(chat_fn, analyze_messages)
-        analysis = parse_json_flexible(analysis_raw)
         _append_step(
             job,
-            "wiki_analyze",
-            "Analysis JSON parsed",
-            keys=list(analysis.keys()),
-            source_chars=len(text),
-            analyze_chars=len(analyze_text),
+            "source_chunks",
+            f"Stored {len(chunk_rows)} verbatim source chunk(s)",
+            chunk_count=len(chunk_rows),
         )
+        session.add(job)
+        session.commit()
+
+        # 2) Analyze (single-pass or multi-window long-source)
+        analyze_prompt = _load_active_prompt(session, "wiki_analyze")
+
+        def _on_analyze_step(step: str, message: str, **extra: Any) -> None:
+            _append_step(job, step, message, **extra)
+            session.add(job)
+            session.commit()
+
+        analyze_result = run_long_source_analyze(
+            text,
+            chat_fn=chat_fn,
+            analyze_system_prompt=analyze_prompt.content,
+            source_path=doc.stored_path or "",
+            filename=doc.filename or "",
+            on_step=_on_analyze_step,
+        )
+        analysis = analyze_result["analysis"]
         session.add(job)
         session.commit()
 
         # 3) Write wiki pages (LLM preferred; analysis fallback on gateway failure)
         write_prompt = _load_active_prompt(session, "wiki_write")
         index_excerpt = _read_index_excerpt()
-        # Keep payload lean: analysis already carries rules/entities; full dual context
-        # has been observed to 502 on long finance/exchange documents.
+        # Primary knowledge is consolidated analysis (+ digest); keep only a small
+        # raw sample for tone/format so long dual-context payloads do not 502.
         analysis_json = json.dumps(analysis, ensure_ascii=False, indent=2)
-        if len(analysis_json) > 12000:
-            analysis_json = analysis_json[:12000] + "\n...[truncated]"
+        write_cap = int(getattr(config, "WIKI_WRITE_ANALYSIS_CHARS", 24000))
+        if len(analysis_json) > write_cap:
+            slim = {
+                "summary_title": analysis.get("summary_title"),
+                "global_digest": analysis.get("global_digest"),
+                "key_rules": (analysis.get("key_rules") or [])[:60],
+                "api_points": (analysis.get("api_points") or [])[:30],
+                "test_hints": (analysis.get("test_hints") or [])[:30],
+                "entities": (analysis.get("entities") or [])[:30],
+                "suggested_page_types": analysis.get("suggested_page_types"),
+                "window_count": analysis.get("window_count"),
+                "coverage": analysis.get("coverage"),
+                "_truncated": True,
+            }
+            analysis_json = json.dumps(slim, ensure_ascii=False, indent=2)
+            if len(analysis_json) > write_cap:
+                analysis_json = analysis_json[:write_cap] + "\n...[truncated]"
+
+        digest = str(analysis.get("global_digest") or "").strip()
         write_messages = [
             {"role": "system", "content": write_prompt.content},
             {
@@ -248,7 +269,8 @@ def ingest_document(
                     f"# Step A 分析结果\n```json\n{analysis_json}\n```\n\n"
                     f"# 源路径\n{doc.stored_path}\n\n"
                     f"# 现有 index 摘要\n{index_excerpt[:2000]}\n\n"
-                    f"# 原文摘录（辅助）\n{text[:WRITE_SOURCE_EXCERPT_CHARS]}"
+                    f"# 全局摘要 digest\n{digest[:8000] if digest else '（无）'}\n\n"
+                    f"# 原文抽样（辅助，非全文）\n{(text[:1500])}"
                 ),
             },
         ]
