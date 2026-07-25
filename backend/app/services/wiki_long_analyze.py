@@ -1,15 +1,26 @@
-"""Long-source wiki analyze: window split + partial merge (orchestration later)."""
+"""Long-source wiki analyze: window split + partial merge + orchestration."""
 
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, Callable, Optional
 
 from app import config
+from app.services.llm import LLMError
+from app.services.wiki_pages_parse import parse_json_flexible
 
 _SENTENCE_SPLIT = re.compile(r"(?<=[。！？；\n])")
 _HEADING_LINE = re.compile(
     r"^(#{1,6}\s+\S|第[0-9一二三四五六七八九十百千]+[章节]|[1-9]\d*(?:\.\d+){1,2}\s*\S)"
+)
+
+ChatFn = Callable[[list[dict[str, str]]], Any]
+
+_WINDOW_SYSTEM_APPENDIX = (
+    "\n\n【分窗分析】本轮只分析当前窗口正文。"
+    "请输出 JSON，字段含 summary_title, key_rules, api_points, test_hints, "
+    "entities, suggested_page_types，并额外提供 digest_update："
+    "用简洁要点更新全局 digest，覆盖本窗新信息，勿重复已有 digest。"
 )
 
 
@@ -28,7 +39,11 @@ def split_analyze_windows(
     if not text:
         return []
 
-    target = max(1000, int(target_chars or config.WIKI_ANALYZE_WINDOW_CHARS))
+    # Explicit target (tests/small windows) may go below production default floor.
+    if target_chars is None:
+        target = max(1000, int(config.WIKI_ANALYZE_WINDOW_CHARS))
+    else:
+        target = max(200, int(target_chars))
     overlap = max(
         0,
         min(
@@ -323,3 +338,237 @@ def heuristic_digest_append(digest: str, partial: dict[str, Any]) -> str:
     for ent in _as_str_list(partial.get("entities"))[:6]:
         parts.append(f"- 实体: {ent}")
     return trim_digest("\n".join(parts))
+
+
+def _emit(
+    on_step: Optional[Callable[..., None]],
+    step: str,
+    message: str,
+    **extra: Any,
+) -> None:
+    if on_step is None:
+        return
+    try:
+        on_step(step, message, **extra)
+    except TypeError:
+        on_step(step, message)
+
+
+def _call_chat(chat_fn: ChatFn, messages: list[dict[str, str]]) -> str:
+    result = chat_fn(messages)
+    if isinstance(result, tuple):
+        content = result[0]
+    else:
+        content = result
+    if content is None or not str(content).strip():
+        raise LLMError("Empty LLM content")
+    return str(content)
+
+
+def _analyze_once(
+    *,
+    chat_fn: ChatFn,
+    system_prompt: str,
+    user_content: str,
+    retries: int | None = None,
+) -> dict[str, Any]:
+    """Call chat_fn and parse JSON analysis; retry on empty/parse failures."""
+    max_retries = (
+        int(config.WIKI_ANALYZE_WINDOW_RETRIES) if retries is None else int(retries)
+    )
+    attempts = max(1, max_retries + 1)
+    last_err: Exception | None = None
+    for _ in range(attempts):
+        try:
+            raw = _call_chat(
+                chat_fn,
+                [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_content},
+                ],
+            )
+            return parse_json_flexible(raw)
+        except (LLMError, ValueError, TypeError) as e:
+            last_err = e
+            continue
+    raise LLMError(f"wiki analyze failed after {attempts} attempts: {last_err}")
+
+
+def _single_user_prompt(
+    text: str,
+    *,
+    source_path: str,
+    filename: str,
+) -> str:
+    meta_bits = []
+    if source_path:
+        meta_bits.append(f"source_path: {source_path}")
+    if filename:
+        meta_bits.append(f"filename: {filename}")
+    header = "\n".join(meta_bits)
+    if header:
+        header += "\n\n"
+    return f"{header}# 原文\n{text}"
+
+
+def _window_user_prompt(
+    window: dict[str, Any],
+    *,
+    digest: str,
+    source_path: str,
+    filename: str,
+) -> str:
+    parts: list[str] = []
+    if source_path or filename:
+        meta = []
+        if source_path:
+            meta.append(f"source_path: {source_path}")
+        if filename:
+            meta.append(f"filename: {filename}")
+        parts.append("\n".join(meta))
+    parts.append(
+        f"# 窗口 {window['index']}/{window['total']}"
+        f" (chars {window['start']}-{window['end']})"
+    )
+    hint = str(window.get("heading_hint") or "").strip()
+    if hint:
+        parts.append(f"heading_hint: {hint}")
+    parts.append("# GLOBAL DIGEST\n" + (digest.strip() or "(empty)"))
+    overlap = str(window.get("overlap_before") or "")
+    if overlap.strip():
+        parts.append("# OVERLAP\n" + overlap)
+    parts.append("# MAIN\n" + str(window.get("main") or ""))
+    return "\n\n".join(parts)
+
+
+def run_long_source_analyze(
+    text: str,
+    *,
+    chat_fn: ChatFn,
+    analyze_system_prompt: str,
+    source_path: str = "",
+    filename: str = "",
+    on_step: Optional[Callable[..., None]] = None,
+    single_pass_chars: int | None = None,
+    window_chars: int | None = None,
+    overlap_chars: int | None = None,
+) -> dict[str, Any]:
+    """Analyze source text in a single pass or multi-window mode.
+
+    Returns: {mode: "single"|"multi", analysis: dict, window_count: int}
+    """
+    text = text or ""
+    single_budget = int(
+        single_pass_chars
+        if single_pass_chars is not None
+        else config.WIKI_ANALYZE_SINGLE_PASS_CHARS
+    )
+    win_chars = (
+        int(window_chars)
+        if window_chars is not None
+        else int(config.WIKI_ANALYZE_WINDOW_CHARS)
+    )
+    ov_chars = (
+        int(overlap_chars)
+        if overlap_chars is not None
+        else int(config.WIKI_ANALYZE_WINDOW_OVERLAP)
+    )
+
+    def _do_single() -> dict[str, Any]:
+        analysis = _analyze_once(
+            chat_fn=chat_fn,
+            system_prompt=analyze_system_prompt,
+            user_content=_single_user_prompt(
+                text, source_path=source_path, filename=filename
+            ),
+        )
+        _emit(
+            on_step,
+            "wiki_analyze",
+            "single-pass analyze complete",
+            mode="single",
+            chars=len(text),
+            source_path=source_path,
+            filename=filename,
+        )
+        return {
+            "mode": "single",
+            "analysis": analysis,
+            "window_count": 1,
+        }
+
+    if len(text) <= single_budget:
+        return _do_single()
+
+    windows = split_analyze_windows(
+        text,
+        target_chars=win_chars,
+        overlap_chars=ov_chars,
+    )
+    if len(windows) <= 1:
+        return _do_single()
+
+    _emit(
+        on_step,
+        "wiki_analyze_plan",
+        f"multi-window plan: {len(windows)} windows",
+        window_count=len(windows),
+        chars=len(text),
+        window_chars=win_chars,
+        overlap_chars=ov_chars,
+        source_path=source_path,
+        filename=filename,
+    )
+
+    system_multi = (analyze_system_prompt or "") + _WINDOW_SYSTEM_APPENDIX
+    digest = ""
+    partials: list[dict[str, Any]] = []
+
+    for w in windows:
+        partial = _analyze_once(
+            chat_fn=chat_fn,
+            system_prompt=system_multi,
+            user_content=_window_user_prompt(
+                w,
+                digest=digest,
+                source_path=source_path,
+                filename=filename,
+            ),
+        )
+        partials.append(partial)
+        update = str(partial.get("digest_update") or "").strip()
+        if update:
+            digest = trim_digest(
+                (digest + "\n" + update).strip() if digest else update
+            )
+        else:
+            digest = heuristic_digest_append(digest, partial)
+        _emit(
+            on_step,
+            "wiki_analyze_window",
+            f"window {w['index']}/{w['total']} analyzed",
+            index=w["index"],
+            total=w["total"],
+            start=w["start"],
+            end=w["end"],
+            source_path=source_path,
+        )
+
+    merged = merge_analysis_partials(
+        partials,
+        digest=digest,
+        source_chars=len(text),
+    )
+    _emit(
+        on_step,
+        "wiki_analyze_consolidate",
+        "merged multi-window analysis",
+        window_count=len(partials),
+        chars=len(text),
+        source_path=source_path,
+    )
+    return {
+        "mode": "multi",
+        "analysis": merged,
+        "window_count": len(partials),
+    }
