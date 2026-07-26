@@ -27,11 +27,32 @@ export interface RetrieveHit {
   tags: string[]
   content: string | null
   source_document_id: number | null
+  /** wiki | source */
+  citation_type?: string
+  source_chunk_id?: number | null
+  start_char?: number | null
+  end_char?: number | null
+  clause_ids?: string[]
+  anchor_clause?: string | null
 }
 
 export interface RetrieveResponse {
   query: string
   hits: RetrieveHit[]
+  wiki_hit_count?: number
+  source_hit_count?: number
+  clause_ids?: string[]
+  anchored_clause_ids?: string[]
+}
+
+export interface SourceChunk {
+  id: number
+  document_id: number
+  chunk_index: number
+  title: string
+  text: string
+  start_char: number
+  end_char: number
 }
 
 export function listWikiPages() {
@@ -40,6 +61,10 @@ export function listWikiPages() {
 
 export function getWikiPage(id: number) {
   return api<WikiPage>(`/api/wiki/pages/${id}`)
+}
+
+export function getSourceChunk(id: number) {
+  return api<SourceChunk>(`/api/source-chunks/${id}`)
 }
 
 export function getWikiIndex() {

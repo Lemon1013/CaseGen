@@ -81,6 +81,11 @@ export interface TaskCitation {
   score: number
   snippet: string
   wiki_page_id: number | null
+  citation_type?: string
+  source_chunk_id?: number | null
+  content_excerpt?: string
+  clause_ids?: string[]
+  anchor_clause?: string | null
 }
 
 export type ApplyPromptMode = 'global' | 'task_temp'
@@ -101,6 +106,10 @@ export function getTask(id: number) {
   return api<TaskItem>(`/api/tasks/${id}`)
 }
 
+export function deleteTask(id: number) {
+  return api<{ ok: boolean; id: number }>(`/api/tasks/${id}`, { method: 'DELETE' })
+}
+
 export function createTask(body: TaskCreate) {
   return api<TaskItem>('/api/tasks', {
     method: 'POST',
@@ -108,8 +117,9 @@ export function createTask(body: TaskCreate) {
   })
 }
 
-export function generateTask(id: number) {
-  return api<TaskItem>(`/api/tasks/${id}/generate`, { method: 'POST' })
+export function generateTask(id: number, opts?: { auto_review?: boolean }) {
+  const q = opts?.auto_review ? '?auto_review=true' : ''
+  return api<TaskItem>(`/api/tasks/${id}/generate${q}`, { method: 'POST' })
 }
 
 export function reviewTask(id: number) {

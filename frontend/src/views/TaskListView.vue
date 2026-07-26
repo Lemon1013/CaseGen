@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, Refresh } from '@element-plus/icons-vue'
 import {
+  deleteTask,
   listTasks,
   statusLabel,
   statusTagType,
@@ -12,6 +13,7 @@ import {
 
 const router = useRouter()
 const loading = ref(false)
+const deletingId = ref<number | null>(null)
 const tasks = ref<TaskItem[]>([])
 
 async function load() {
@@ -32,6 +34,28 @@ function formatTime(value: string) {
 
 function openDetail(row: TaskItem) {
   router.push(`/tasks/${row.id}`)
+}
+
+async function handleDelete(row: TaskItem) {
+  try {
+    await ElMessageBox.confirm(
+      `确认删除任务 #${row.id}「${row.title || '未命名'}」？相关草稿、评审与事件将一并删除，且不可恢复。`,
+      '删除确认',
+      { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  deletingId.value = row.id
+  try {
+    await deleteTask(row.id)
+    ElMessage.success('任务已删除')
+    await load()
+  } catch (e) {
+    ElMessage.error(`删除失败：${(e as Error).message}`)
+  } finally {
+    deletingId.value = null
+  }
 }
 
 onMounted(load)
@@ -98,9 +122,17 @@ onMounted(load)
           {{ formatTime(row.updated_at) }}
         </template>
       </el-table-column>
-      <el-table-column label="操作" width="100" fixed="right">
+      <el-table-column label="操作" width="140" fixed="right">
         <template #default="{ row }">
           <el-button link type="primary" @click.stop="openDetail(row)">详情</el-button>
+          <el-button
+            link
+            type="danger"
+            :loading="deletingId === row.id"
+            @click.stop="handleDelete(row)"
+          >
+            删除
+          </el-button>
         </template>
       </el-table-column>
     </el-table>

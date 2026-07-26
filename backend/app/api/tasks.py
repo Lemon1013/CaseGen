@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from sqlmodel import Session, col, select
 
 from app.db import get_session
@@ -26,6 +26,13 @@ from app.schemas.tasks import (
     TaskEventOut,
     TaskOut,
 )
+from app.services.task_events import append_event
+from app.services.task_jobs import (
+    job_generate,
+    job_optimize_prompt,
+    job_regenerate,
+    job_review,
+)
 from app.services.task_pipeline import (
     apply_prompt,
     finalize_task,
@@ -34,6 +41,7 @@ from app.services.task_pipeline import (
     run_regenerate,
     run_review,
 )
+from app.services.task_state import InvalidTransition, transition
 
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
 
@@ -42,6 +50,11 @@ _PIPELINE_CHAT_FN = None
 _GENERATE_CHAT_FN = None
 _REVIEW_CHAT_FN = None
 _OPTIMIZE_CHAT_FN = None
+
+# Statuses that mean a long-running job is already in flight
+_BUSY = frozenset(
+    {"retrieving", "generating", "reviewing", "optimizing", "regenerating"}
+)
 
 
 def _chat_for(stage: str = "generate"):
@@ -55,6 +68,33 @@ def _chat_for(stage: str = "generate"):
     if _PIPELINE_CHAT_FN is not None:
         return _PIPELINE_CHAT_FN
     return _GENERATE_CHAT_FN
+
+
+def _force_sync(stage: str = "generate", wait: bool = False) -> bool:
+    """Sync when tests inject chat hooks, or client explicitly asks wait=1."""
+    if wait:
+        return True
+    return _chat_for(stage) is not None
+
+
+def _begin_status(
+    session: Session,
+    task: GenerationTask,
+    new_status: str,
+    step: str,
+    message: str,
+) -> GenerationTask:
+    """Transition to an in-progress status so UI can poll immediately."""
+    try:
+        task.status = transition(task.status, new_status)
+    except InvalidTransition as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    task.error_message = None
+    session.add(task)
+    append_event(session, task.id, step, message)
+    session.commit()
+    session.refresh(task)
+    return task
 
 
 def _tags_list(requirement: Optional[Requirement]) -> list[str]:
@@ -143,7 +183,12 @@ def to_task_out(session: Session, task: GenerationTask) -> TaskOut:
 @router.post("", response_model=TaskOut)
 def create_task(
     body: TaskCreate,
+    background_tasks: BackgroundTasks,
     session: Session = Depends(get_session),
+    wait: bool = Query(
+        False,
+        description="If true (or chat hooks injected), run generate inline before responding",
+    ),
 ) -> TaskOut:
     requirement = Requirement(
         title=body.title,
@@ -165,11 +210,19 @@ def create_task(
     session.refresh(task)
 
     if body.run_generate:
-        run_generate(session, task.id, chat_fn=_chat_for("generate"))
-        session.refresh(task)
-        if body.auto_review and task.status == "generated":
-            run_review(session, task.id, chat_fn=_chat_for("review"))
+        if _force_sync("generate", wait):
+            run_generate(session, task.id, chat_fn=_chat_for("generate"))
             session.refresh(task)
+            if body.auto_review and task.status == "generated":
+                run_review(session, task.id, chat_fn=_chat_for("review"))
+                session.refresh(task)
+        else:
+            task = _begin_status(
+                session, task, "retrieving", "retrieve", "任务已创建，后台开始检索/生成"
+            )
+            background_tasks.add_task(
+                job_generate, task.id, bool(body.auto_review)
+            )
 
     return to_task_out(session, task)
 
@@ -188,35 +241,123 @@ def get_task(task_id: int, session: Session = Depends(get_session)) -> TaskOut:
     return to_task_out(session, task)
 
 
+@router.delete("/{task_id}")
+def delete_task(task_id: int, session: Session = Depends(get_session)) -> dict:
+    """Hard-delete a task and its dependent rows (drafts, reviews, events, …)."""
+    task = session.get(GenerationTask, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    requirement_id = task.requirement_id
+
+    for model in (TaskCitation, CaseDraft, ReviewResult, PromptRevision, TaskEvent):
+        rows = session.exec(select(model).where(model.task_id == task_id)).all()
+        for row in rows:
+            session.delete(row)
+
+    session.delete(task)
+    session.flush()
+
+    # Requirement is created 1:1 with the task; drop it if nothing else references it.
+    other = session.exec(
+        select(GenerationTask).where(GenerationTask.requirement_id == requirement_id)
+    ).first()
+    if other is None:
+        req = session.get(Requirement, requirement_id)
+        if req is not None:
+            session.delete(req)
+
+    session.commit()
+    return {"ok": True, "id": task_id}
+
+
 @router.post("/{task_id}/generate", response_model=TaskOut)
-def generate_task(task_id: int, session: Session = Depends(get_session)) -> TaskOut:
-    task = session.get(GenerationTask, task_id)
-    if task is None:
-        raise HTTPException(status_code=404, detail="Task not found")
-
-    task = run_generate(session, task_id, chat_fn=_chat_for("generate"))
-    return to_task_out(session, task)
-
-
-@router.post("/{task_id}/review", response_model=TaskOut)
-def review_task(task_id: int, session: Session = Depends(get_session)) -> TaskOut:
-    task = session.get(GenerationTask, task_id)
-    if task is None:
-        raise HTTPException(status_code=404, detail="Task not found")
-
-    task = run_review(session, task_id, chat_fn=_chat_for("review"))
-    return to_task_out(session, task)
-
-
-@router.post("/{task_id}/optimize-prompt", response_model=TaskOut)
-def optimize_prompt_task(
-    task_id: int, session: Session = Depends(get_session)
+def generate_task(
+    task_id: int,
+    background_tasks: BackgroundTasks,
+    session: Session = Depends(get_session),
+    wait: bool = Query(False),
+    auto_review: bool = Query(False),
 ) -> TaskOut:
     task = session.get(GenerationTask, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    task = run_optimize_prompt(session, task_id, chat_fn=_chat_for("optimize"))
+    if task.status in _BUSY:
+        # Already running — do not double-schedule
+        return to_task_out(session, task)
+
+    if _force_sync("generate", wait):
+        task = run_generate(session, task_id, chat_fn=_chat_for("generate"))
+        if auto_review and task.status == "generated":
+            task = run_review(session, task_id, chat_fn=_chat_for("review"))
+        return to_task_out(session, task)
+
+    if task.status not in ("draft", "failed", "regenerating"):
+        # Preserve envelope: pipeline marks failed + error_message
+        task = run_generate(session, task_id, chat_fn=_chat_for("generate"))
+        return to_task_out(session, task)
+
+    task = _begin_status(
+        session, task, "retrieving", "retrieve", "后台开始检索 Wiki / 原文"
+    )
+    background_tasks.add_task(job_generate, task_id, auto_review)
+    return to_task_out(session, task)
+
+
+@router.post("/{task_id}/review", response_model=TaskOut)
+def review_task(
+    task_id: int,
+    background_tasks: BackgroundTasks,
+    session: Session = Depends(get_session),
+    wait: bool = Query(False),
+) -> TaskOut:
+    task = session.get(GenerationTask, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    if task.status in _BUSY:
+        return to_task_out(session, task)
+
+    if _force_sync("review", wait):
+        task = run_review(session, task_id, chat_fn=_chat_for("review"))
+        return to_task_out(session, task)
+
+    if task.status not in ("generated", "failed"):
+        task = run_review(session, task_id, chat_fn=_chat_for("review"))
+        return to_task_out(session, task)
+
+    task = _begin_status(session, task, "reviewing", "review", "后台开始评审")
+    background_tasks.add_task(job_review, task_id)
+    return to_task_out(session, task)
+
+
+@router.post("/{task_id}/optimize-prompt", response_model=TaskOut)
+def optimize_prompt_task(
+    task_id: int,
+    background_tasks: BackgroundTasks,
+    session: Session = Depends(get_session),
+    wait: bool = Query(False),
+) -> TaskOut:
+    task = session.get(GenerationTask, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    if task.status in _BUSY:
+        return to_task_out(session, task)
+
+    if _force_sync("optimize", wait):
+        task = run_optimize_prompt(session, task_id, chat_fn=_chat_for("optimize"))
+        return to_task_out(session, task)
+
+    if task.status not in ("reviewed", "failed"):
+        task = run_optimize_prompt(session, task_id, chat_fn=_chat_for("optimize"))
+        return to_task_out(session, task)
+
+    task = _begin_status(
+        session, task, "optimizing", "optimize", "后台开始优化 Prompt"
+    )
+    background_tasks.add_task(job_optimize_prompt, task_id)
     return to_task_out(session, task)
 
 
@@ -243,12 +384,31 @@ def apply_prompt_task(
 
 
 @router.post("/{task_id}/regenerate", response_model=TaskOut)
-def regenerate_task(task_id: int, session: Session = Depends(get_session)) -> TaskOut:
+def regenerate_task(
+    task_id: int,
+    background_tasks: BackgroundTasks,
+    session: Session = Depends(get_session),
+    wait: bool = Query(False),
+) -> TaskOut:
     task = session.get(GenerationTask, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    task = run_regenerate(session, task_id, chat_fn=_chat_for("generate"))
+    if task.status in _BUSY:
+        return to_task_out(session, task)
+
+    if _force_sync("generate", wait):
+        task = run_regenerate(session, task_id, chat_fn=_chat_for("generate"))
+        return to_task_out(session, task)
+
+    if task.status not in ("generated", "reviewed", "failed"):
+        task = run_regenerate(session, task_id, chat_fn=_chat_for("generate"))
+        return to_task_out(session, task)
+
+    task = _begin_status(
+        session, task, "regenerating", "regenerate", "后台开始重新生成"
+    )
+    background_tasks.add_task(job_regenerate, task_id)
     return to_task_out(session, task)
 
 
@@ -292,17 +452,32 @@ def list_citations(
         .where(TaskCitation.task_id == task_id)
         .order_by(col(TaskCitation.id).asc())
     ).all()
-    return [
-        TaskCitationOut(
-            id=r.id,
-            title=r.title,
-            path=r.path,
-            score=r.score,
-            snippet=r.snippet,
-            wiki_page_id=r.wiki_page_id,
+    out: list[TaskCitationOut] = []
+    for r in rows:
+        cids: list[str] = []
+        raw = getattr(r, "clause_ids_json", None) or "[]"
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                cids = [str(x) for x in parsed]
+        except json.JSONDecodeError:
+            cids = []
+        out.append(
+            TaskCitationOut(
+                id=r.id,
+                title=r.title,
+                path=r.path,
+                score=r.score,
+                snippet=r.snippet,
+                wiki_page_id=r.wiki_page_id,
+                citation_type=getattr(r, "citation_type", None) or "wiki",
+                source_chunk_id=getattr(r, "source_chunk_id", None),
+                content_excerpt=getattr(r, "content_excerpt", None) or "",
+                clause_ids=cids,
+                anchor_clause=getattr(r, "anchor_clause", None),
+            )
         )
-        for r in rows
-    ]
+    return out
 
 
 @router.get("/{task_id}/events", response_model=List[TaskEventOut])

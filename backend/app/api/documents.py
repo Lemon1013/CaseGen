@@ -3,15 +3,17 @@ from pathlib import Path
 from typing import List
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
-from sqlmodel import Session, select
+from sqlmodel import Session, col, select
 
+from app import config
 from app.config import ALLOWED_EXTENSIONS, MAX_UPLOAD_BYTES, ensure_data_dirs
 from app.db import get_session
-from app.models.entities import Document
-from app.schemas.documents import DocumentOut
+from app.models.entities import Document, SourceChunk
+from app.schemas.documents import DocumentOut, RechunkOut, SourceChunkOut
 from app.schemas.wiki import IngestJobOut
 from app.services.parse_document import parse_file
 from app.services.paths import make_raw_filename, raw_path_for, relative_raw_stored_path
+from app.services.source_chunks_store import replace_chunks_for_document
 from app.services.wiki_ingest import ingest_document
 
 router = APIRouter(prefix="/api/documents", tags=["documents"])
@@ -101,3 +103,49 @@ def start_ingest(
         raise HTTPException(status_code=404, detail="Document not found")
     job = ingest_document(session, document_id, chat_fn=_INGEST_CHAT_FN)
     return job
+
+
+@router.get("/{document_id}/chunks", response_model=List[SourceChunkOut])
+def list_document_chunks(
+    document_id: int,
+    session: Session = Depends(get_session),
+) -> list[SourceChunk]:
+    doc = session.get(Document, document_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    rows = session.exec(
+        select(SourceChunk)
+        .where(SourceChunk.document_id == document_id)
+        .order_by(col(SourceChunk.chunk_index).asc())
+    ).all()
+    return list(rows)
+
+
+@router.post("/{document_id}/rechunk", response_model=RechunkOut)
+def rechunk_document(
+    document_id: int,
+    session: Session = Depends(get_session),
+) -> RechunkOut:
+    """Rebuild verbatim source chunks without re-running LLM wiki compile."""
+    doc = session.get(Document, document_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    stored = (doc.stored_path or "").replace("\\", "/")
+    path = Path(stored)
+    if not path.is_absolute():
+        path = config.DATA_DIR / stored
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Source file not found on disk")
+    try:
+        text = parse_file(path)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"Parse failed: {exc}") from exc
+    rows = replace_chunks_for_document(
+        session,
+        document_id,
+        text,
+        chunk_chars=config.SOURCE_CHUNK_CHARS,
+        overlap_chars=config.SOURCE_CHUNK_OVERLAP,
+    )
+    session.commit()
+    return RechunkOut(document_id=document_id, chunk_count=len(rows))

@@ -11,6 +11,11 @@ const props = withDefaults(
   },
 )
 
+const emit = defineEmits<{
+  /** Fired for in-app / relative links (browser navigation is prevented). */
+  linkClick: [href: string]
+}>()
+
 const md = new MarkdownIt({
   html: false,
   linkify: true,
@@ -18,10 +23,40 @@ const md = new MarkdownIt({
 })
 
 const html = computed(() => md.render(props.content || ''))
+
+function isExternalHref(href: string) {
+  return /^(https?:|mailto:|tel:)/i.test(href)
+}
+
+function onClick(e: MouseEvent) {
+  const el = e.target
+  if (!(el instanceof Element)) return
+  const a = el.closest('a')
+  if (!a) return
+  const href = a.getAttribute('href')
+  if (!href || href === '#') return
+
+  // In-document hash anchors (not Vue history hashes like #/path)
+  if (href.startsWith('#') && !href.startsWith('#/')) return
+
+  if (isExternalHref(href)) {
+    // Keep external links usable; open in new tab when possible
+    if (!a.getAttribute('target')) {
+      a.setAttribute('target', '_blank')
+      a.setAttribute('rel', 'noopener noreferrer')
+    }
+    return
+  }
+
+  // Relative / SPA paths like pages/foo.md or /pages/foo.md — never full-page navigate
+  e.preventDefault()
+  e.stopPropagation()
+  emit('linkClick', href)
+}
 </script>
 
 <template>
-  <div class="markdown-view" v-html="html" />
+  <div class="markdown-view" v-html="html" @click="onClick" />
 </template>
 
 <style scoped>
@@ -113,5 +148,6 @@ const html = computed(() => md.render(props.content || ''))
 
 .markdown-view :deep(a) {
   color: var(--cg-primary);
+  cursor: pointer;
 }
 </style>

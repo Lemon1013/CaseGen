@@ -4,7 +4,7 @@ import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { listModels, type ModelConfig } from '../api/models'
 import { listPrompts, type PromptTemplate } from '../api/prompts'
-import { createTask, generateTask, reviewTask } from '../api/tasks'
+import { createTask, generateTask } from '../api/tasks'
 
 const router = useRouter()
 const submitting = ref(false)
@@ -48,6 +48,7 @@ async function submit() {
   }
   submitting.value = true
   try {
+    // 1) 快速创建任务（不阻塞在 LLM 上）
     const task = await createTask({
       title: form.title.trim(),
       description: form.description.trim(),
@@ -57,17 +58,17 @@ async function submit() {
       auto_review: form.auto_review,
       run_generate: false,
     })
-    ElMessage.success(`任务 #${task.id} 已创建，开始生成…`)
+
+    // 2) 触发后台生成（接口立即返回 retrieving/generating），不在此页空转等待
     try {
-      const generated = await generateTask(task.id)
-      ElMessage.success('生成完成')
-      if (form.auto_review && generated.status === 'generated') {
-        await reviewTask(task.id)
-        ElMessage.success('自动评审完成')
-      }
+      await generateTask(task.id, { auto_review: form.auto_review })
     } catch (e) {
-      ElMessage.warning(`生成/评审返回错误：${(e as Error).message}，请在详情页查看状态`)
+      ElMessage.warning(
+        `启动生成失败：${(e as Error).message}，请到任务详情页重试`,
+      )
     }
+
+    ElMessage.success(`任务 #${task.id} 已创建，正在后台生成`)
     await router.push(`/tasks/${task.id}`)
   } catch (e) {
     ElMessage.error(`创建任务失败：${(e as Error).message}`)

@@ -53,5 +53,42 @@ def test_score_text_weights():
         content="account balance check",
         tags=["balance"],
     )
-    # 余额 in title (+10); balance in tags (+4) and content (+1)
-    assert score >= 15.0
+    # ascii in tags/content + CJK bigram in title — must be positive & ordered
+    assert score >= 7.0
+    weak = score_text(
+        "balance 余额",
+        title="其他",
+        content="无关",
+        tags=[],
+    )
+    assert score > weak
+
+
+def test_clean_query_strips_generate_instruction():
+    from app.services.retrieve import clean_retrieve_query
+
+    q = clean_retrieve_query(
+        "开盘集合竞价的成交价格撮合规则。生成正常/边界/异常测试用例。"
+    )
+    assert "生成" not in q
+    assert "测试用例" not in q
+    assert "成交价格" in q
+
+
+def test_body_phrase_outranks_unrelated_title():
+    """Query phrases in body should score higher than unrelated title-only docs."""
+    q = "指定交易 撤销指定"
+    related = score_text(
+        q,
+        title="第二节 委托",
+        content="投资者变更指定交易的，应当向已指定的会员提出撤销的意思表示。",
+        tags=["原文"],
+    )
+    unrelated = score_text(
+        q,
+        title="临时停市公告",
+        content="因系统故障实行临时停市。",
+        tags=[],
+    )
+    assert related > unrelated
+    assert related > 0

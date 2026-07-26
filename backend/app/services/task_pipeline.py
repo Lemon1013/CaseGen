@@ -19,6 +19,7 @@ from app.models.entities import (
 )
 from app.services.llm import LLMError, chat_completion
 from app.services.retrieve import load_all_wiki_pages, rank_pages
+from app.services.source_chunks_store import load_all_source_chunks, rank_source_chunks
 from app.services.review_parse import parse_review_payload
 from app.services.task_events import append_event
 from app.services.task_state import InvalidTransition, transition
@@ -53,11 +54,14 @@ def _focus_tags(requirement: Requirement) -> list[str]:
 
 
 def _build_query(requirement: Requirement) -> str:
+    from app.services.retrieve import clean_retrieve_query
+
     tags = _focus_tags(requirement)
     parts = [requirement.title or "", requirement.description or ""]
     if tags:
         parts.append(" ".join(tags))
-    return " ".join(p for p in parts if p).strip()
+    raw = " ".join(p for p in parts if p).strip()
+    return clean_retrieve_query(raw)
 
 
 def _resolve_generate_prompt(session: Session, task: GenerationTask) -> tuple[str, str]:
@@ -105,13 +109,33 @@ def _clear_citations(session: Session, task_id: int) -> None:
     session.flush()
 
 
+def _strip_yaml_frontmatter(content: str) -> str:
+    """Drop leading YAML frontmatter so generate context stays lean."""
+    text = content or ""
+    if not text.startswith("---"):
+        return text
+    end = text.find("\n---", 3)
+    if end == -1:
+        return text
+    return text[end + 4 :].lstrip("\n")
+
+
+# Used when the primary generate call hits a flaky gateway (502 etc.).
+_LEAN_GENERATE_SYSTEM = (
+    "你是金融/交易所测试专家。根据需求、Wiki 与原文块输出中文测试用例 Markdown。"
+    "每条用例含：标题、优先级、类型、关联知识、条款号、前置条件、步骤、预期。"
+    "必须引用 Wiki 编号[1]与/或原文[S1]，并写明规则条款号（如 3.5.2）；"
+    "覆盖正常/边界/异常；不得编造未提供的规则；只输出用例 Markdown。"
+)
+
+
 def _truncate_wiki_context(pages: list[dict[str, Any]], max_chars: int) -> str:
     blocks: list[str] = []
     used = 0
     for i, page in enumerate(pages, start=1):
         title = page.get("title") or ""
         path = page.get("path") or ""
-        content = page.get("content") or ""
+        content = _strip_yaml_frontmatter(page.get("content") or "")
         header = f"[{i}] {title} ({path})\n"
         remaining = max_chars - used - len(header)
         if remaining <= 0:
@@ -125,10 +149,38 @@ def _truncate_wiki_context(pages: list[dict[str, Any]], max_chars: int) -> str:
     return "\n\n".join(blocks)
 
 
+def _truncate_source_context(chunks: list[dict[str, Any]], max_chars: int) -> str:
+    blocks: list[str] = []
+    used = 0
+    for i, ch in enumerate(chunks, start=1):
+        title = ch.get("title") or f"原文块{i}"
+        path = ch.get("path") or ""
+        text = ch.get("text") or ch.get("content") or ch.get("content_excerpt") or ""
+        cids = ch.get("clause_ids") or []
+        anchor = ch.get("anchor_clause")
+        clause_note = ""
+        if anchor:
+            clause_note = f" 锚定条款={anchor}"
+        elif cids:
+            clause_note = f" 含条款={','.join(cids[:8])}"
+        header = f"[S{i}] {title} ({path}){clause_note}\n"
+        remaining = max_chars - used - len(header)
+        if remaining <= 0:
+            break
+        body = text if len(text) <= remaining else text[:remaining]
+        block = header + body
+        blocks.append(block)
+        used += len(block) + 2
+        if used >= max_chars:
+            break
+    return "\n\n".join(blocks)
+
+
 def _build_messages(
     system_prompt: str,
     requirement: Requirement,
     wiki_context: str,
+    source_context: str = "",
 ) -> list[dict[str, str]]:
     tags = _focus_tags(requirement)
     user_parts = [
@@ -139,10 +191,22 @@ def _build_messages(
     if tags:
         user_parts.append(f"关注标签：{', '.join(tags)}")
     user_parts.append("")
-    user_parts.append("# Wiki 引用上下文")
+    user_parts.append("# Wiki 结构化知识（摘要/规则卡片）")
     user_parts.append(wiki_context if wiki_context.strip() else "（无匹配 Wiki 页面）")
     user_parts.append("")
-    user_parts.append("请根据以上需求与 Wiki 上下文生成测试用例 Markdown。")
+    user_parts.append("# 原文摘录（Source Chunks，请优先引用可核对的原句）")
+    user_parts.append(
+        source_context if source_context.strip() else "（无匹配原文块）"
+    )
+    user_parts.append("")
+    user_parts.append(
+        "请根据需求、Wiki 与【原文摘录】生成测试用例 Markdown。\n"
+        "硬性要求：\n"
+        "1) 规则断言必须能在原文 [S#] 中找到依据，优先引用条款号（如 3.5.2）；\n"
+        "2) 每条用例「关联知识」同时写 Wiki 编号 [n] 与原文 [S#]（若有）；\n"
+        "3) 覆盖正常 / 边界 / 异常；不得编造上下文未出现的规则；\n"
+        "4) 只输出用例 Markdown。"
+    )
     return [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": "\n".join(user_parts)},
@@ -373,7 +437,7 @@ def run_generate(
         if task.status in ("draft", "failed", "regenerating"):
             _set_status(task, "retrieving")
             session.add(task)
-            append_event(session, task.id, "retrieve", "开始检索 Wiki 知识")
+            append_event(session, task.id, "retrieve", "开始混合检索（Wiki + 原文块）")
             session.commit()
             session.refresh(task)
         elif task.status != "retrieving":
@@ -382,34 +446,87 @@ def run_generate(
             )
 
         query = _build_query(requirement)
-        pages = load_all_wiki_pages(session)
-        hits = rank_pages(query, pages, top_k=config.RETRIEVE_TOP_K)
+        from app.services.hybrid_retrieve import hybrid_retrieve
+
+        retrieved = hybrid_retrieve(
+            session,
+            query,
+            wiki_k=config.RETRIEVE_WIKI_TOP_K,
+            source_k=config.RETRIEVE_SOURCE_TOP_K,
+            top_k=config.RETRIEVE_WIKI_TOP_K + config.RETRIEVE_SOURCE_TOP_K,
+        )
+        wiki_hits = list(retrieved.get("wiki_hits") or [])
+        source_hits = list(retrieved.get("source_hits") or [])
+        # Ensure wiki hit content loaded for context truncation
+        for wh in wiki_hits:
+            if not wh.get("content"):
+                # rank_pages/hybrid may already set content via load_all_wiki_pages
+                pass
 
         _clear_citations(session, task.id)
-        for hit in hits:
+        for hit in wiki_hits:
+            cids = list(hit.get("clause_ids") or [])
             session.add(
                 TaskCitation(
                     task_id=task.id,
+                    citation_type="wiki",
                     wiki_page_id=hit.get("id"),
+                    source_chunk_id=None,
                     title=hit.get("title") or "",
                     path=hit.get("path") or "",
                     score=float(hit.get("score") or 0.0),
                     snippet=hit.get("snippet") or "",
+                    content_excerpt=(hit.get("content") or hit.get("snippet") or "")[
+                        :2000
+                    ],
+                    clause_ids_json=json.dumps(cids, ensure_ascii=False),
+                    anchor_clause=None,
                 )
             )
+        for hit in source_hits:
+            cids = list(hit.get("clause_ids") or [])
+            session.add(
+                TaskCitation(
+                    task_id=task.id,
+                    citation_type="source",
+                    wiki_page_id=None,
+                    source_chunk_id=hit.get("id"),
+                    title=hit.get("title") or "",
+                    path=hit.get("path") or "",
+                    score=float(hit.get("score") or 0.0),
+                    snippet=hit.get("snippet") or "",
+                    content_excerpt=hit.get("content_excerpt")
+                    or (hit.get("text") or "")[:2000],
+                    clause_ids_json=json.dumps(cids, ensure_ascii=False),
+                    anchor_clause=hit.get("anchor_clause"),
+                )
+            )
+        hit_count = len(wiki_hits) + len(source_hits)
         append_event(
             session,
             task.id,
             "retrieve",
-            f"检索完成，命中 {len(hits)} 条",
-            detail={"query": query, "hit_count": len(hits)},
+            f"检索完成：Wiki {len(wiki_hits)} + 原文 {len(source_hits)}"
+            + (
+                f"（条款锚定 {len(retrieved.get('anchored_clause_ids') or [])}）"
+                if retrieved.get("anchored_clause_ids")
+                else ""
+            ),
+            detail={
+                "query": query,
+                "wiki_hit_count": len(wiki_hits),
+                "source_hit_count": len(source_hits),
+                "hit_count": hit_count,
+                "clause_ids": retrieved.get("clause_ids") or [],
+                "anchored_clause_ids": retrieved.get("anchored_clause_ids") or [],
+            },
         )
-        if not hits:
+        if hit_count == 0:
             append_event(
                 session,
                 task.id,
                 "retrieve",
-                "警告：未检索到相关 Wiki 页面，将仅基于需求生成",
+                "警告：未检索到 Wiki 或原文块，将仅基于需求生成",
             )
         session.commit()
         session.refresh(task)
@@ -422,15 +539,54 @@ def run_generate(
 
         system_prompt, prompt_ref = _resolve_generate_prompt(session, task)
         model = _resolve_model(session, task)
-        wiki_context = _truncate_wiki_context(hits, config.MAX_WIKI_CONTEXT_CHARS)
-        messages = _build_messages(system_prompt, requirement, wiki_context)
-
-        content = _call_chat(
-            chat_fn,
-            model=model,
-            messages=messages,
-            stage_fn=_GENERATE_CHAT_FN,
+        wiki_context = _truncate_wiki_context(
+            wiki_hits, config.MAX_WIKI_CONTEXT_CHARS
         )
+        source_context = _truncate_source_context(
+            source_hits, config.MAX_SOURCE_CONTEXT_CHARS
+        )
+        messages = _build_messages(
+            system_prompt, requirement, wiki_context, source_context
+        )
+
+        used_lean_fallback = False
+        try:
+            content = _call_chat(
+                chat_fn,
+                model=model,
+                messages=messages,
+                stage_fn=_GENERATE_CHAT_FN,
+            )
+        except LLMError as primary_exc:
+            # Gateway instability on long finance prompts: retry lean system + smaller wiki.
+            lean_cap = min(4500, max(2000, config.MAX_WIKI_CONTEXT_CHARS // 2))
+            lean_wiki = _truncate_wiki_context(wiki_hits, lean_cap)
+            lean_source = _truncate_source_context(
+                source_hits, min(2500, config.MAX_SOURCE_CONTEXT_CHARS // 2 or 2500)
+            )
+            lean_messages = _build_messages(
+                _LEAN_GENERATE_SYSTEM, requirement, lean_wiki, lean_source
+            )
+            append_event(
+                session,
+                task.id,
+                "generate",
+                f"主生成失败，精简上下文重试: {primary_exc}",
+                detail={
+                    "lean_wiki_chars": len(lean_wiki),
+                    "primary_error": str(primary_exc)[:300],
+                },
+            )
+            session.commit()
+            content = _call_chat(
+                chat_fn,
+                model=model,
+                messages=lean_messages,
+                stage_fn=_GENERATE_CHAT_FN,
+            )
+            used_lean_fallback = True
+            prompt_ref = f"{prompt_ref}|lean_fallback"
+
         if not content or not str(content).strip():
             raise LLMError("Empty LLM content")
 
@@ -450,8 +606,14 @@ def run_generate(
             session,
             task.id,
             "generate",
-            f"生成完成，draft v{version}",
-            detail={"draft_version": version, "model_id": model.id, "prompt_ref": prompt_ref},
+            f"生成完成，draft v{version}"
+            + ("（lean_fallback）" if used_lean_fallback else ""),
+            detail={
+                "draft_version": version,
+                "model_id": model.id,
+                "prompt_ref": prompt_ref,
+                "lean_fallback": used_lean_fallback,
+            },
         )
         session.commit()
         session.refresh(task)

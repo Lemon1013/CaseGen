@@ -11,21 +11,95 @@ from app import config
 from app.db import get_engine
 from app.models.entities import WikiPageRow
 
+# Instruction-y noise often appended to requirements; hurts keyword retrieve.
+_QUERY_NOISE = re.compile(
+    r"(生成|编写|输出|给出|请).{0,12}(正常|边界|异常|正例|反例)?.{0,8}"
+    r"(测试用例|用例|案例|场景)[。．\.！!？?]*",
+    re.I,
+)
+_CLAUSE_RE = re.compile(r"\d+(?:\.\d+){1,3}")
+_CJK_RUN = re.compile(r"[\u4e00-\u9fff]{2,}")
 
-def _tokens(text: str) -> list[str]:
-    text = text.lower()
-    # CJK bigrams + ascii words
-    parts = re.findall(r"[a-z0-9_]+|[\u4e00-\u9fff]+", text)
-    tokens: list[str] = []
-    for p in parts:
-        if re.fullmatch(r"[\u4e00-\u9fff]+", p):
-            if len(p) == 1:
-                tokens.append(p)
-            else:
-                tokens.extend(p[i : i + 2] for i in range(len(p) - 1))
-        else:
-            tokens.append(p)
-    return tokens
+# Very common connectors / document meta — low signal for ranking.
+_STOP_BIGRAMS = frozenset(
+    {
+        "根据",
+        "按照",
+        "进行",
+        "可以",
+        "应当",
+        "或者",
+        "以及",
+        "有关",
+        "相关",
+        "本所",
+        "规则",
+        "中的",
+        "中开",
+        "则中",
+        "价的",
+        "的成",
+        "格撮",
+        "合规",
+        "上交",
+        "交所",
+        "所交",
+        "易规",
+        "交易",  # too common across whole SSE rulebook
+    }
+)
+
+
+def clean_retrieve_query(query: str) -> str:
+    """Drop generation-instruction tails so domain terms dominate ranking."""
+    q = (query or "").strip()
+    if not q:
+        return ""
+    q = _QUERY_NOISE.sub(" ", q)
+    q = re.sub(r"\s+", " ", q).strip(" ，,。．")
+    return q or query.strip()
+
+
+def _clause_ids(text: str) -> list[str]:
+    return _CLAUSE_RE.findall(text.lower())
+
+
+def _cjk_ngrams(text: str, n: int) -> list[str]:
+    out: list[str] = []
+    for run in _CJK_RUN.findall(text):
+        if len(run) < n:
+            continue
+        out.extend(run[i : i + n] for i in range(len(run) - n + 1))
+    return out
+
+
+def _ascii_tokens(text: str) -> list[str]:
+    return re.findall(r"[a-z0-9_]{2,}", text.lower())
+
+
+def _key_phrases(query: str) -> list[str]:
+    """
+    Prefer multi-char domain phrases over the whole noisy sentence.
+    e.g. 集合竞价 / 成交价格 / 撮合规则
+    """
+    q = clean_retrieve_query(query)
+    phrases: list[str] = []
+    for run in _CJK_RUN.findall(q):
+        # 4-char windows (成交价格、集合竞价、开盘集合…)
+        if len(run) >= 4:
+            phrases.extend(run[i : i + 4] for i in range(len(run) - 3))
+        # 3-char windows (撮合规 is weak; 集合竞 / 竞价的 — still useful)
+        if len(run) >= 3:
+            phrases.extend(run[i : i + 3] for i in range(len(run) - 2))
+    # de-dupe
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for p in phrases:
+        if p in seen:
+            continue
+        seen.add(p)
+        uniq.append(p)
+    return uniq
 
 
 def score_text(
@@ -35,20 +109,75 @@ def score_text(
     content: str,
     tags: list[str] | None = None,
 ) -> float:
-    q_tokens = _tokens(query)
-    if not q_tokens:
+    """
+    Generic CJK keyword score — no domain-specific topic boosts.
+
+    Signals (all topic-agnostic):
+    - clause ids in query (e.g. 3.5.2)
+    - ascii tokens
+    - CJK bigrams (with light stop-list)
+    - 3/4-char phrases from the query itself
+    """
+    query = clean_retrieve_query(query)
+    if not query:
         return 0.0
-    title_l = title.lower()
-    content_l = content.lower()
+
+    title_l = (title or "").lower()
+    content_l = (content or "").lower()
     tags_l = " ".join(tags or []).lower()
+
     score = 0.0
-    for t in q_tokens:
-        if t in title_l:
-            score += 10.0
-        if t in tags_l:
+
+    # --- clause numbers ---
+    for cid in set(_clause_ids(query)):
+        if cid in title_l:
+            score += 50.0
+        elif cid in content_l:
+            score += 35.0
+
+    # --- ascii tokens ---
+    for tok in set(_ascii_tokens(query)):
+        if tok in title_l:
+            score += 8.0
+        elif tok in tags_l:
             score += 4.0
-        if t in content_l:
+        elif tok in content_l:
+            score += 2.0
+
+    # --- CJK bigrams (low weight; skip stop-ish) ---
+    for bg in set(_cjk_ngrams(query, 2)):
+        if bg in _STOP_BIGRAMS:
+            continue
+        if bg in title_l:
+            score += 3.0
+        elif bg in tags_l:
+            score += 1.5
+        elif bg in content_l:
             score += 1.0
+
+    # --- key phrases (main signal): 4-char then 3-char windows from query ---
+    ph4_hits = 0
+    ph3_hits = 0
+    for ph in _key_phrases(query):
+        if len(ph) >= 4:
+            if ph in title_l:
+                score += 10.0
+                ph4_hits += 1
+            elif ph in content_l:
+                score += 14.0
+                ph4_hits += 1
+            if ph4_hits >= 6:
+                break
+        else:
+            if ph3_hits >= 4:
+                continue
+            if ph in title_l:
+                score += 4.0
+                ph3_hits += 1
+            elif ph in content_l:
+                score += 6.0
+                ph3_hits += 1
+
     return score
 
 
@@ -58,7 +187,7 @@ def rank_pages(
     top_k: int = 6,
     types: list[str] | None = None,
 ) -> list[dict[str, Any]]:
-    if not query.strip():
+    if not (query or "").strip():
         return []
     scored: list[dict[str, Any]] = []
     for p in pages:
@@ -91,7 +220,6 @@ def load_all_wiki_pages(session: Session | None = None) -> list[dict[str, Any]]:
             path = row.path or ""
             file_path = Path(path)
             if not file_path.is_absolute():
-                # Prefer wiki root, then pages dir (path may be relative to either).
                 candidate = config.WIKI_DIR / path
                 if not candidate.exists():
                     candidate = config.WIKI_PAGES_DIR / path

@@ -1,3 +1,4 @@
+from sqlalchemy import text
 from sqlmodel import SQLModel, Session, create_engine
 from app import config
 from app.config import ensure_data_dirs
@@ -16,10 +17,45 @@ def get_engine():
     return _engine
 
 
+def _migrate_sqlite_columns(engine) -> None:
+    """Add columns introduced after first deploy (SQLite has no auto-alter)."""
+    with engine.begin() as conn:
+        try:
+            cols = conn.execute(text("PRAGMA table_info(task_citations)")).fetchall()
+        except Exception:  # table may not exist yet
+            return
+        names = {row[1] for row in cols}
+        alters: list[str] = []
+        if "citation_type" not in names:
+            alters.append(
+                "ALTER TABLE task_citations ADD COLUMN citation_type VARCHAR DEFAULT 'wiki'"
+            )
+        if "source_chunk_id" not in names:
+            alters.append(
+                "ALTER TABLE task_citations ADD COLUMN source_chunk_id INTEGER"
+            )
+        if "content_excerpt" not in names:
+            alters.append(
+                "ALTER TABLE task_citations ADD COLUMN content_excerpt TEXT DEFAULT ''"
+            )
+        if "clause_ids_json" not in names:
+            alters.append(
+                "ALTER TABLE task_citations ADD COLUMN clause_ids_json TEXT DEFAULT '[]'"
+            )
+        if "anchor_clause" not in names:
+            alters.append(
+                "ALTER TABLE task_citations ADD COLUMN anchor_clause VARCHAR"
+            )
+        for sql in alters:
+            conn.execute(text(sql))
+
+
 def init_db() -> None:
     from app.models import entities  # noqa: F401
 
-    SQLModel.metadata.create_all(get_engine())
+    engine = get_engine()
+    SQLModel.metadata.create_all(engine)
+    _migrate_sqlite_columns(engine)
 
 
 def get_session():

@@ -8,9 +8,10 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import Session, select
 
 from app import config
-from app.config import RETRIEVE_TOP_K
+from app.config import RETRIEVE_SOURCE_TOP_K, RETRIEVE_TOP_K, RETRIEVE_WIKI_TOP_K
 from app.db import get_session
-from app.models.entities import IngestJob, WikiPageRow
+from app.models.entities import IngestJob, SourceChunk, WikiPageRow
+from app.schemas.documents import SourceChunkOut
 from app.schemas.wiki import (
     IngestJobOut,
     RetrieveHit,
@@ -20,6 +21,7 @@ from app.schemas.wiki import (
     WikiPageOut,
 )
 from app.services.retrieve import load_all_wiki_pages, rank_pages
+from app.services.source_chunks_store import load_all_source_chunks, rank_source_chunks
 
 router = APIRouter(tags=["wiki"])
 
@@ -82,6 +84,16 @@ def get_wiki_page(page_id: int, session: Session = Depends(get_session)) -> Wiki
     return _to_page_out(row, include_content=True)
 
 
+@router.get("/api/source-chunks/{chunk_id}", response_model=SourceChunkOut)
+def get_source_chunk(
+    chunk_id: int, session: Session = Depends(get_session)
+) -> SourceChunk:
+    row = session.get(SourceChunk, chunk_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Source chunk not found")
+    return row
+
+
 @router.get("/api/wiki/index", response_model=WikiIndexOut)
 def get_wiki_index() -> WikiIndexOut:
     config.ensure_data_dirs()
@@ -98,21 +110,52 @@ def retrieve_wiki(
     body: RetrieveRequest,
     session: Session = Depends(get_session),
 ) -> RetrieveResponse:
+    """Hybrid retrieve: Wiki + source chunks + clause anchors."""
     top_k = body.top_k if body.top_k is not None else RETRIEVE_TOP_K
-    pages = load_all_wiki_pages(session)
-    ranked = rank_pages(body.query, pages, top_k=top_k, types=body.types)
-    hits = [
-        RetrieveHit(
-            id=h.get("id"),
-            title=h.get("title") or "",
-            page_type=h.get("page_type") or "",
-            path=h.get("path") or "",
-            score=float(h.get("score") or 0),
-            snippet=h.get("snippet") or "",
-            tags=list(h.get("tags") or []),
-            content=None,
-            source_document_id=h.get("source_document_id"),
+    wiki_k = min(RETRIEVE_WIKI_TOP_K, max(1, top_k // 2 + top_k % 2))
+    source_k = min(RETRIEVE_SOURCE_TOP_K, max(1, top_k - wiki_k))
+
+    from app.services.hybrid_retrieve import hybrid_retrieve
+
+    result = hybrid_retrieve(
+        session,
+        body.query,
+        top_k=top_k,
+        wiki_k=wiki_k,
+        source_k=source_k,
+        types=body.types,
+    )
+
+    hits: list[RetrieveHit] = []
+    for h in result["hits"]:
+        hits.append(
+            RetrieveHit(
+                id=h.get("id"),
+                title=h.get("title") or "",
+                page_type=h.get("page_type") or "",
+                path=h.get("path") or "",
+                score=float(h.get("score") or 0),
+                snippet=h.get("snippet") or "",
+                tags=list(h.get("tags") or []),
+                content=h.get("content") if h.get("citation_type") == "source" else None,
+                source_document_id=h.get("source_document_id") or h.get("document_id"),
+                citation_type=h.get("citation_type") or "wiki",
+                source_chunk_id=h.get("source_chunk_id") or (
+                    h.get("id") if h.get("citation_type") == "source" else None
+                ),
+                start_char=h.get("start_char"),
+                end_char=h.get("end_char"),
+                clause_ids=list(h.get("clause_ids") or []),
+                anchor_clause=h.get("anchor_clause"),
+            )
         )
-        for h in ranked
-    ]
-    return RetrieveResponse(query=body.query, hits=hits)
+    return RetrieveResponse(
+        query=body.query,
+        hits=hits,
+        wiki_hit_count=int(result.get("wiki_hit_count") or 0),
+        source_hit_count=int(result.get("source_hit_count") or 0),
+        clause_ids=list(result.get("clause_ids") or []),
+        anchored_clause_ids=[
+            c for c in (result.get("anchored_clause_ids") or []) if c
+        ],
+    )

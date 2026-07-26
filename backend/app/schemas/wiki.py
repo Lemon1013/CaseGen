@@ -51,8 +51,19 @@ class RetrieveHit(BaseModel):
     tags: List[str] = Field(default_factory=list)
     content: Optional[str] = None
     source_document_id: Optional[int] = None
+    # wiki | source
+    citation_type: str = "wiki"
+    source_chunk_id: Optional[int] = None
+    start_char: Optional[int] = None
+    end_char: Optional[int] = None
+    clause_ids: List[str] = Field(default_factory=list)
+    anchor_clause: Optional[str] = None
 
 
 class RetrieveResponse(BaseModel):
     query: str
     hits: List[RetrieveHit]
+    wiki_hit_count: int = 0
+    source_hit_count: int = 0
+    clause_ids: List[str] = Field(default_factory=list)
+    anchored_clause_ids: List[str] = Field(default_factory=list)

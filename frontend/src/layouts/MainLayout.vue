@@ -91,7 +91,8 @@ onMounted(loadDefaultModel)
       </div>
     </el-aside>
 
-    <el-container class="body">
+    <!-- direction=vertical: topbar above content (default horizontal left the title column empty) -->
+    <el-container class="body" direction="vertical">
       <header class="topbar">
         <div class="topbar-left">
           <h1 class="topbar-title">{{ pageTitle }}</h1>
@@ -243,7 +244,9 @@ onMounted(loadDefaultModel)
 }
 
 .body {
+  flex: 1;
   min-width: 0;
+  min-height: 100vh;
   background: var(--cg-bg-glow);
 }
 
@@ -252,6 +255,8 @@ onMounted(loadDefaultModel)
   align-items: center;
   justify-content: space-between;
   gap: 16px;
+  flex: 0 0 auto;
+  width: 100%;
   min-height: 64px;
   padding: 12px 28px;
   background: rgba(255, 255, 255, 0.82);
@@ -311,6 +316,8 @@ onMounted(loadDefaultModel)
 }
 
 .main-content {
+  flex: 1;
+  width: 100%;
   padding: 24px 28px 32px;
   background: transparent;
 }

@@ -10,6 +10,27 @@ def test_list_tasks_empty(tmp_app_data):
     assert r.json() == []
 
 
+def test_delete_task_removes_task_and_children(tmp_app_data):
+    client = TestClient(create_app())
+    created = client.post(
+        "/api/tasks",
+        json={"title": "to-delete", "description": "will be removed", "focus_tags": ["x"]},
+    )
+    assert created.status_code == 200
+    tid = created.json()["id"]
+    assert client.get(f"/api/tasks/{tid}").status_code == 200
+
+    deleted = client.delete(f"/api/tasks/{tid}")
+    assert deleted.status_code == 200
+    assert deleted.json() == {"ok": True, "id": tid}
+
+    assert client.get(f"/api/tasks/{tid}").status_code == 404
+    assert all(t["id"] != tid for t in client.get("/api/tasks").json())
+
+    missing = client.delete(f"/api/tasks/{tid}")
+    assert missing.status_code == 404
+
+
 def test_create_task_validation(tmp_app_data):
     client = TestClient(create_app())
     # missing required fields

@@ -156,11 +156,18 @@ async function runAction(
   if (!task.value) return
   acting.value = true
   try {
-    ElMessage.info(`正在${label}…`)
+    ElMessage.info(`已提交${label}…`)
     const updated = await fn(task.value.id)
     task.value = updated
     await refreshLight()
-    ElMessage.success(`${label}完成`)
+    // 后台任务：接口快速返回 in-progress，由轮询刷新结果，按钮不必一直转
+    if (IN_PROGRESS_STATUSES.has(updated.status)) {
+      ElMessage.success(`${label}已在后台执行，状态会自动刷新`)
+    } else if (updated.status === 'failed') {
+      ElMessage.error(`${label}失败：${updated.error_message || '未知错误'}`)
+    } else {
+      ElMessage.success(`${label}完成`)
+    }
   } catch (e) {
     ElMessage.error(`${label}失败：${(e as Error).message}`)
     await refreshLight()

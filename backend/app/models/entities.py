@@ -75,6 +75,21 @@ class WikiPageRow(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=_utcnow, sa_column_kwargs={"onupdate": _utcnow})
 
 
+class SourceChunk(SQLModel, table=True):
+    """Verbatim source text slice — lossless layer for hybrid retrieve."""
+
+    __tablename__ = "source_chunks"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    document_id: int = Field(index=True)
+    chunk_index: int = 0
+    title: str = ""
+    text: str = ""
+    start_char: int = 0
+    end_char: int = 0
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
 class Requirement(SQLModel, table=True):
     __tablename__ = "requirements"
 
@@ -107,10 +122,19 @@ class TaskCitation(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     task_id: int
     wiki_page_id: Optional[int] = None
+    # wiki | source
+    citation_type: str = "wiki"
+    source_chunk_id: Optional[int] = None
     title: str
     path: str
     score: float = 0.0
     snippet: str = ""
+    # Longer excerpt for source citations (UI drawer / generate context)
+    content_excerpt: str = ""
+    # JSON list of clause ids e.g. ["3.5.1","3.5.2"]
+    clause_ids_json: str = "[]"
+    # Primary anchored clause if any
+    anchor_clause: Optional[str] = None
 
 
 class CaseDraft(SQLModel, table=True):

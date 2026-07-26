@@ -57,6 +57,11 @@ class TaskCitationOut(BaseModel):
     score: float = 0.0
     snippet: str = ""
     wiki_page_id: Optional[int] = None
+    citation_type: str = "wiki"
+    source_chunk_id: Optional[int] = None
+    content_excerpt: str = ""
+    clause_ids: List[str] = Field(default_factory=list)
+    anchor_clause: Optional[str] = None
 
 
 class CaseDraftOut(BaseModel):

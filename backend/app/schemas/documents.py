@@ -17,3 +17,21 @@ class DocumentOut(BaseModel):
     error_message: Optional[str] = None
     created_at: datetime
     updated_at: datetime
+
+
+class SourceChunkOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    document_id: int
+    chunk_index: int
+    title: str
+    text: str
+    start_char: int
+    end_char: int
+    created_at: datetime
+
+
+class RechunkOut(BaseModel):
+    document_id: int
+    chunk_count: int
