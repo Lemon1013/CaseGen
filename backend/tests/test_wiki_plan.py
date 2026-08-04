@@ -1,0 +1,213 @@
+import json
+
+import pytest
+
+from app.services.wiki_candidates import recall_wiki_candidates
+from app.services.wiki_long_analyze import run_long_source_analyze
+from app.services.wiki_long_analyze import merge_analysis_partials, trim_digest
+from app.services.wiki_plan import (
+    PlanValidationError,
+    coerce_step_a_plan,
+    merge_step_a_plans,
+    validate_step_a_plan,
+)
+
+
+def _anchor(window_index: int = 1, start: int = 0, end: int = 10) -> dict:
+    return {
+        "document_id": 1,
+        "window_index": window_index,
+        "start_char": start,
+        "end_char": end,
+        "clause_id": "3.5.2",
+    }
+
+
+def test_candidates_match_title_alias_clause_tag_and_keep_late_match():
+    pages = [
+        {"page_key": f"rule.order.noise-{index}", "title": "无关规则"}
+        for index in range(90)
+    ]
+    pages.extend(
+        [
+            {
+                "page_key": "rule.order.auction",
+                "title": "集合竞价成交规则",
+                "aliases": ["开盘竞价"],
+                "tags": ["竞价"],
+                "body": "第3.5.2条规定申报价格优先。",
+            },
+            {
+                "page_key": "rule.order.tail-only",
+                "title": "尾部规则",
+                "tags": ["尾部专属"],
+                "body": "TAIL_RULE_2026",
+            },
+        ]
+    )
+    result = recall_wiki_candidates(
+        pages,
+        text="第3.5.2条 尾部专属 TAIL_RULE_2026",
+        title="集合竞价",
+        limit=4,
+    )
+    keys = {item["page_key"] for item in result}
+    assert "rule.order.auction" in keys
+    assert "rule.order.tail-only" in keys
+    assert any("title" in item["matched_fields"] for item in result if item["page_key"] == "rule.order.auction")
+
+
+def test_strict_plan_accepts_create_update_noop_and_rejects_merge():
+    plan = validate_step_a_plan(
+        {
+            "source_summary": {"title": "交易规则", "summary": "成交与申报"},
+            "claims": [
+                {
+                    "claim_id": "c-1",
+                    "statement": "申报价格按规则比较",
+                    "clauses": ["3.5.2"],
+                    "source_anchors": [_anchor()],
+                }
+            ],
+            "entities": ["申报"],
+            "related_pages": [{"page_key": "rule.order.auction", "matched_on": ["title"]}],
+            "contradictions": [],
+            "page_operations": [
+                {"op": "create", "page_key": "rule.order.new-rule", "source_anchors": [_anchor()]},
+                {"op": "update", "page_key": "rule.order.auction", "source_anchors": [_anchor()]},
+                {"op": "noop", "page_key": "rule.order.existing"},
+            ],
+            "review_items": [],
+        },
+        existing_page_keys={"rule.order.auction", "rule.order.existing"},
+        source_windows=[{"index": 1, "start": 0, "end": 100, "clause_ids": ["3.5.2"]}],
+    )
+    assert [item.op for item in plan.page_operations] == ["create", "update", "noop"]
+
+    with pytest.raises(PlanValidationError):
+        validate_step_a_plan(
+            {"page_operations": [{"op": "merge", "page_key": "rule.order.auction"}]}
+        )
+
+
+def test_plan_rejects_invalid_key_missing_anchor_and_unknown_target():
+    with pytest.raises(PlanValidationError):
+        validate_step_a_plan(
+            {"page_operations": [{"op": "create", "page_key": "../escape", "source_anchors": [_anchor()]}]}
+        )
+    with pytest.raises(PlanValidationError):
+        validate_step_a_plan(
+            {"page_operations": [{"op": "create", "page_key": "rule.order.no-anchor"}]}
+        )
+    with pytest.raises(PlanValidationError):
+        validate_step_a_plan(
+            {"page_operations": [{"op": "update", "page_key": "rule.order.missing", "source_anchors": [_anchor()]}]},
+            existing_page_keys={"rule.order.present"},
+        )
+    with pytest.raises(PlanValidationError):
+        validate_step_a_plan(
+            {"page_operations": [{"op": "update", "page_key": "rule.order.present", "source_anchors": [{"window_index": 9}]}]},
+            existing_page_keys={"rule.order.present"},
+            source_windows=[{"index": 1, "start": 0, "end": 10}],
+        )
+
+
+def test_plan_rejects_unknown_fields_and_partially_invalid_anchors():
+    with pytest.raises(PlanValidationError, match="unknown Step A fields"):
+        coerce_step_a_plan(
+            {
+                "claims": [],
+                "page_operations": [],
+                "unexpected": "must not be ignored",
+            }
+        )
+    with pytest.raises(PlanValidationError, match="chunk"):
+        validate_step_a_plan(
+            {
+                "page_operations": [
+                    {
+                        "op": "create",
+                        "page_key": "rule.order.invalid-anchor",
+                        "source_anchors": [{"chunk_ids": [7, 999]}],
+                    }
+                ]
+            },
+            source_windows=[{"chunk_ids": [7], "start": 0, "end": 20}],
+        )
+
+
+def test_legacy_analysis_is_coerced_without_breaking_old_json():
+    plan = coerce_step_a_plan(
+        {
+            "summary_title": "旧格式摘要",
+            "key_rules": ["前部规则", "尾部规则"],
+            "entities": ["订单"],
+            "suggested_page_types": ["source_summary"],
+        },
+        source_path="raw/sources/rules.md",
+    )
+    assert plan.source_summary.title == "旧格式摘要"
+    assert [claim.statement for claim in plan.claims] == ["前部规则", "尾部规则"]
+
+
+def test_merge_uses_semantic_dedupe_and_tail_quota():
+    plans = [
+        {"claims": [{"statement": f"前部规则 {index}"} for index in range(70)]},
+        {"claims": [{"statement": f"尾部规则 {index}"} for index in range(70)]},
+    ]
+    merged = merge_step_a_plans(plans, max_claims=80)
+    statements = [claim.statement for claim in merged.claims]
+    assert len(statements) == 80
+    assert any(statement == "尾部规则 69" for statement in statements)
+
+
+def test_legacy_merge_and_digest_keep_tail_content():
+    partials = [
+        {"summary_title": f"窗{index}", "key_rules": [f"规则{index}"]}
+        for index in range(100)
+    ]
+    merged = merge_analysis_partials(partials, max_rules=10)
+    assert "规则99" in merged["key_rules"]
+
+    digest = "HEAD_MARKER\n" + ("中间" * 100) + "\nTAIL_MARKER"
+    trimmed = trim_digest(digest, max_chars=80)
+    assert "HEAD_MARKER" in trimmed
+    assert "TAIL_MARKER" in trimmed
+
+
+def test_long_analyze_passes_wiki_context_and_returns_plan(monkeypatch):
+    monkeypatch.setattr("app.services.wiki_long_analyze.config.WIKI_ANALYZE_SINGLE_PASS_CHARS", 10000)
+    seen: list[str] = []
+
+    def chat(messages):
+        seen.append(messages[-1]["content"])
+        return json.dumps(
+            {
+                "source_summary": {"title": "新规则", "summary": "窗口摘要"},
+                "claims": [{"statement": "规则结论", "source_anchors": [_anchor()]}],
+                "entities": ["订单"],
+                "related_pages": [{"page_key": "rule.order.existing", "reason": "同一实体"}],
+                "contradictions": [],
+                "page_operations": [{"op": "update", "page_key": "rule.order.existing", "source_anchors": [_anchor()]}],
+                "review_items": [],
+            },
+            ensure_ascii=False,
+        )
+
+    result = run_long_source_analyze(
+        "订单 第3.5.2条 规则正文",
+        chat_fn=chat,
+        analyze_system_prompt="Step A JSON",
+        source_path="raw/sources/rules.md",
+        purpose="Wiki 目标",
+        schema="Wiki Schema",
+        candidate_pages=[
+            {"page_key": "rule.order.existing", "title": "现有订单规则", "tags": ["订单"]}
+        ],
+        existing_page_keys={"rule.order.existing"},
+        source_windows=[{"index": 1, "start": 0, "end": 100, "clause_ids": ["3.5.2"]}],
+    )
+    assert result["plan"]["page_operations"][0]["op"] == "update"
+    assert "Wiki 目标" in seen[0]
+    assert "rule.order.existing" in seen[0]
+    assert "3.5.2" in seen[0]

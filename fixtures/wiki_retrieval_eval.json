@@ -1,0 +1,116 @@
+{
+  "pages": [
+    {
+      "page_key": "trading.auction-price",
+      "title": "集合竞价成交价格确定原则",
+      "aliases": ["集合竞价撮合价", "开盘价确定"],
+      "tags": ["集合竞价", "成交价格", "最大成交量"],
+      "clause": "3.5.2",
+      "body": "3.5.2 集合竞价时，成交价格按照可实现最大成交量等原则确定，所有交易以同一价格成交。"
+    },
+    {
+      "page_key": "trading.cancel-window",
+      "title": "开盘集合竞价撤单限制",
+      "aliases": ["不可撤单时段", "撤销申报限制"],
+      "tags": ["撤单", "开盘集合竞价", "申报"],
+      "clause": "2.4.2",
+      "body": "2.4.2 每个交易日9:20至9:25的开盘集合竞价阶段，交易主机不接受撤销申报。"
+    },
+    {
+      "page_key": "trading.market-hours",
+      "title": "竞价交易时间",
+      "aliases": ["开盘收盘时间", "连续竞价时段"],
+      "tags": ["交易时间", "连续竞价", "交易日"],
+      "clause": "2.4.1",
+      "body": "2.4.1 交易日包括开盘集合竞价、连续竞价和收盘集合竞价时段，具体时间按交易所安排执行。"
+    },
+    {
+      "page_key": "trading.temporary-suspension",
+      "title": "盘中临时停牌与复牌",
+      "aliases": ["异常波动暂停交易", "临停"],
+      "tags": ["临时停牌", "复牌", "十分钟"],
+      "clause": "4.2.4",
+      "body": "4.2.4 证券竞价交易出现规定情形时实施盘中临时停牌，单次停牌持续10分钟，届满后复牌。"
+    },
+    {
+      "page_key": "orders.valid-price-range",
+      "title": "买卖申报有效价格范围",
+      "aliases": ["申报价范围", "价格笼子"],
+      "tags": ["有效申报", "申报价格", "基准价格"],
+      "clause": "3.3.14",
+      "body": "3.3.14 连续竞价阶段的限价申报应当符合有效申报价格范围，超出基准价格规定幅度的申报无效。"
+    },
+    {
+      "page_key": "trading.block-trade",
+      "title": "大宗交易申报与成交",
+      "aliases": ["大宗交易门槛", "协议大宗"],
+      "tags": ["大宗交易", "意向申报", "成交确认"],
+      "clause": "3.6.1",
+      "body": "3.6.1 符合单笔数量或金额门槛的证券交易可以采用大宗交易方式，支持意向申报和成交确认申报。"
+    },
+    {
+      "page_key": "risk.warning-board-limit",
+      "title": "风险警示板单日买入限制",
+      "aliases": ["ST股票买入上限", "风险警示股票限购"],
+      "tags": ["风险警示板", "五十万股", "买入限制"],
+      "clause": "4.1.3",
+      "body": "4.1.3 投资者当日通过竞价交易和大宗交易累计买入的单只风险警示股票，数量不得超过50万股。"
+    },
+    {
+      "page_key": "accounts.designated-trading",
+      "title": "指定交易制度",
+      "aliases": ["指定交易撤销", "证券账户指定"],
+      "tags": ["指定交易", "证券账户", "会员营业部"],
+      "clause": "3.1.2",
+      "body": "3.1.2 投资者应当就证券账户指定一家会员营业部参与交易，符合条件时可以申请撤销指定交易。"
+    },
+    {
+      "page_key": "compliance.program-trading-report",
+      "title": "程序化交易报告义务",
+      "aliases": ["量化交易报告", "算法交易报备"],
+      "tags": ["程序化交易", "报告", "最高申报速率"],
+      "clause": "7.2.1",
+      "body": "7.2.1 程序化交易投资者应当按规定报告账户、资金、交易策略、最高申报速率等信息。"
+    },
+    {
+      "page_key": "matching.price-time-priority",
+      "title": "价格优先时间优先撮合原则",
+      "aliases": ["竞价成交优先级", "撮合顺序"],
+      "tags": ["价格优先", "时间优先", "撮合成交"],
+      "clause": "3.5.1",
+      "body": "3.5.1 证券竞价交易按价格优先、时间优先的原则撮合成交，较优价格申报优先于较差价格申报。"
+    }
+  ],
+  "queries": [
+    {"query": "集合竞价成交价怎么确定", "expected": "trading.auction-price"},
+    {"query": "哪个价格能实现最大成交量", "expected": "trading.auction-price"},
+    {"query": "开盘集合竞价的撮合价格原则", "expected": "trading.auction-price"},
+    {"query": "9点20到9点25可以撤单吗", "expected": "trading.cancel-window"},
+    {"query": "开盘集合竞价什么时候不能撤单", "expected": "trading.cancel-window"},
+    {"query": "撤销申报限制在哪个时段", "expected": "trading.cancel-window"},
+    {"query": "上交所股票几点开盘收盘", "expected": "trading.market-hours"},
+    {"query": "连续竞价交易时间怎么安排", "expected": "trading.market-hours"},
+    {"query": "一个交易日有哪些竞价时段", "expected": "trading.market-hours"},
+    {"query": "盘中临时停牌持续多久", "expected": "trading.temporary-suspension"},
+    {"query": "异常波动暂停交易十分钟", "expected": "trading.temporary-suspension"},
+    {"query": "临停后什么时候恢复交易", "expected": "trading.temporary-suspension"},
+    {"query": "买卖申报价格范围如何限制", "expected": "orders.valid-price-range"},
+    {"query": "有效申报价格范围", "expected": "orders.valid-price-range"},
+    {"query": "申报价超出基准价范围会怎样", "expected": "orders.valid-price-range"},
+    {"query": "什么交易可以走大宗交易", "expected": "trading.block-trade"},
+    {"query": "大宗交易的数量金额门槛", "expected": "trading.block-trade"},
+    {"query": "意向申报和成交确认申报", "expected": "trading.block-trade"},
+    {"query": "ST股票一天最多买多少", "expected": "risk.warning-board-limit"},
+    {"query": "风险警示板五十万股限制", "expected": "risk.warning-board-limit"},
+    {"query": "风险警示股票单日买入上限", "expected": "risk.warning-board-limit"},
+    {"query": "证券账户为什么要办指定交易", "expected": "accounts.designated-trading"},
+    {"query": "如何申请撤销指定交易", "expected": "accounts.designated-trading"},
+    {"query": "账户指定会员营业部的规则", "expected": "accounts.designated-trading"},
+    {"query": "量化交易需要向交易所报什么", "expected": "compliance.program-trading-report"},
+    {"query": "程序化交易报告义务", "expected": "compliance.program-trading-report"},
+    {"query": "算法交易最高申报速率是否要报备", "expected": "compliance.program-trading-report"},
+    {"query": "撮合时价格优先还是时间优先", "expected": "matching.price-time-priority"},
+    {"query": "竞价成交的委托排序规则", "expected": "matching.price-time-priority"},
+    {"query": "较优价格申报为什么先成交", "expected": "matching.price-time-priority"}
+  ]
+}

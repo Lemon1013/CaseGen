@@ -3,6 +3,7 @@
 
 # CaseGen project-specific
 data/
+data-backups/
 *.db
 *.sqlite3
 .venv/
@@ -66,6 +67,7 @@ coverage.xml
 *.py.cover
 .hypothesis/
 .pytest_cache/
+.pytest-tmp/
 cover/
 
 # Translations

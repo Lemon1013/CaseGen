@@ -1,0 +1,30 @@
+CaseGen 前端开箱说明（本压缩包已含 frontend/node_modules）
+============================================================
+
+【前提】目标机器仍需安装：
+  - Node.js 18+（含 npm）—— 用来执行 npm run dev，不能省
+  - 后端另需 Python 3.11+（本包未含 backend/.venv，需 pip install）
+
+【解压】
+  解压后得到 CaseGen/ 目录。
+
+【前端（无需 npm install）】
+  cd CaseGen/frontend
+  npm run dev
+  浏览器打开 http://127.0.0.1:5173
+
+  若提示依赖缺失或 native 模块异常（跨系统时常见）：
+  删除 node_modules 后执行一次：npm install
+
+【后端（需装依赖）】
+  cd CaseGen/backend
+  python -m venv .venv
+  # Windows Git Bash: source .venv/Scripts/activate
+  pip install -r requirements.txt
+  uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+
+【说明】
+  - 本包在 Windows 上打包，优先在 Windows 新机器上开箱使用
+  - 已排除：backend/.venv、data/（含密钥与本地库）、.git、缓存
+  - 业务数据请自行拷贝 data/，或在新机重新上传文档并编译 Wiki
+  - 详细步骤见 CaseGen/README.md

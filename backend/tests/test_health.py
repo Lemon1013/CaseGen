@@ -1,0 +1,9 @@
+from fastapi.testclient import TestClient
+from app.main import create_app
+
+
+def test_health(tmp_app_data):
+    client = TestClient(create_app())
+    r = client.get("/api/health")
+    assert r.status_code == 200
+    assert r.json()["status"] == "ok"
