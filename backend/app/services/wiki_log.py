@@ -17,10 +17,18 @@ def _now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def _path(path: Path | str | None) -> Path:
+def _path(
+    path: Path | str | None,
+    *,
+    space_slug: str | None = None,
+) -> Path:
     if path is not None:
         return Path(path)
     config.ensure_data_dirs()
+    if space_slug:
+        from app.services.wiki_spaces import space_root
+
+        return space_root(space_slug) / "log.md"
     return Path(config.WIKI_DIR) / "log.md"
 
 
@@ -30,6 +38,8 @@ def append_event(
     *,
     log_path: Path | str | None = None,
     at: str | None = None,
+    space_id: int | None = None,
+    space_slug: str | None = None,
     **fields: Any,
 ) -> dict[str, Any]:
     """Append one JSON object as a Markdown list item; never rewrite old events."""
@@ -40,8 +50,10 @@ def append_event(
     record: dict[str, Any] = {"at": at or _now(), "event": event}
     if details:
         record["details"] = dict(details)
+    if space_id is not None:
+        record["space_id"] = int(space_id)
     record.update(fields)
-    target = _path(log_path)
+    target = _path(log_path, space_slug=space_slug)
     target.parent.mkdir(parents=True, exist_ok=True)
     line = "- " + json.dumps(record, ensure_ascii=False, sort_keys=True, default=str)
     with _LOCK:
@@ -57,8 +69,12 @@ def append_event(
 append_log = append_event
 
 
-def read_events(log_path: Path | str | None = None) -> list[dict[str, Any]]:
-    target = _path(log_path)
+def read_events(
+    log_path: Path | str | None = None,
+    *,
+    space_slug: str | None = None,
+) -> list[dict[str, Any]]:
+    target = _path(log_path, space_slug=space_slug)
     if not target.exists():
         return []
     result: list[dict[str, Any]] = []

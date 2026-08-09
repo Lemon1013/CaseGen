@@ -15,6 +15,8 @@ export interface WikiPage {
   content: string | null
   created_at: string
   updated_at: string
+  space_id: number
+  space_name: string
 }
 
 export interface WikiIndex {
@@ -46,6 +48,7 @@ export interface RetrieveHit {
   explain?: Record<string, unknown> | null
   aliases?: string[]
   source_document_ids?: number[]
+  space_id?: number | null
 }
 
 export interface RetrieveResponse {
@@ -65,6 +68,8 @@ export interface WikiReview {
   id: number
   page_id: number | null
   job_id: number | null
+  space_id?: number | null
+  space_name?: string
   kind: string
   status: WikiReviewStatus | string
   reason: string
@@ -161,26 +166,30 @@ export interface SourceChunk {
   end_char: number
 }
 
-export function listWikiPages() {
-  return api<WikiPage[]>('/api/wiki/pages')
+export function listWikiPages(spaceId?: number) {
+  const query = spaceId ? `?space_id=${spaceId}` : ''
+  return api<WikiPage[]>(`/api/wiki/pages${query}`)
 }
 
-export function getWikiPage(id: number) {
-  return api<WikiPage>(`/api/wiki/pages/${id}`)
+export function getWikiPage(id: number, spaceId?: number) {
+  const query = spaceId ? `?space_id=${spaceId}` : ''
+  return api<WikiPage>(`/api/wiki/pages/${id}${query}`)
 }
 
-export function getSourceChunk(id: number) {
-  return api<SourceChunk>(`/api/source-chunks/${id}`)
+export function getSourceChunk(id: number, spaceId?: number) {
+  const query = spaceId ? `?space_id=${spaceId}` : ''
+  return api<SourceChunk>(`/api/source-chunks/${id}${query}`)
 }
 
-export function getWikiIndex() {
-  return api<WikiIndex>('/api/wiki/index')
+export function getWikiIndex(spaceId?: number) {
+  const query = spaceId ? `?space_id=${spaceId}` : ''
+  return api<WikiIndex>(`/api/wiki/index${query}`)
 }
 
-export function retrieveWiki(query: string, top_k?: number) {
+export function retrieveWiki(query: string, top_k?: number, spaceId?: number) {
   return api<RetrieveResponse>('/api/wiki/retrieve', {
     method: 'POST',
-    body: JSON.stringify({ query, top_k }),
+    body: JSON.stringify({ query, top_k, space_id: spaceId }),
   })
 }
 
@@ -189,6 +198,7 @@ export interface WikiReviewQuery {
   kind?: string
   page_id?: number
   job_id?: number
+  space_id?: number
 }
 
 function withQuery(path: string, params: Record<string, string | number | undefined>) {
@@ -209,46 +219,54 @@ export function listWikiReviews(params: WikiReviewQuery = {}) {
       kind: params.kind,
       page_id: params.page_id,
       job_id: params.job_id,
+      space_id: params.space_id,
     }),
   )
 }
 
-export function getWikiReview(id: number) {
-  return api<WikiReviewDetail>(`/api/wiki/reviews/${id}`)
+export function getWikiReview(id: number, spaceId?: number) {
+  const query = spaceId ? `?space_id=${spaceId}` : ''
+  return api<WikiReviewDetail>(`/api/wiki/reviews/${id}${query}`)
 }
 
-export function approveWikiReview(id: number, body: WikiReviewDecision = {}) {
-  return api<WikiReviewDetail>(`/api/wiki/reviews/${id}/approve`, {
+export function approveWikiReview(id: number, body: WikiReviewDecision = {}, spaceId?: number) {
+  const query = spaceId ? `?space_id=${spaceId}` : ''
+  return api<WikiReviewDetail>(`/api/wiki/reviews/${id}/approve${query}`, {
     method: 'POST',
     body: JSON.stringify(body),
   })
 }
 
-export function rejectWikiReview(id: number, body: WikiReviewDecision = {}) {
-  return api<WikiReviewDetail>(`/api/wiki/reviews/${id}/reject`, {
+export function rejectWikiReview(id: number, body: WikiReviewDecision = {}, spaceId?: number) {
+  const query = spaceId ? `?space_id=${spaceId}` : ''
+  return api<WikiReviewDetail>(`/api/wiki/reviews/${id}/reject${query}`, {
     method: 'POST',
     body: JSON.stringify(body),
   })
 }
 
-export function acknowledgeWikiReview(id: number, body: WikiReviewDecision = {}) {
-  return api<WikiReviewDetail>(`/api/wiki/reviews/${id}/acknowledge`, {
+export function acknowledgeWikiReview(id: number, body: WikiReviewDecision = {}, spaceId?: number) {
+  const query = spaceId ? `?space_id=${spaceId}` : ''
+  return api<WikiReviewDetail>(`/api/wiki/reviews/${id}/acknowledge${query}`, {
     method: 'POST',
     body: JSON.stringify(body),
   })
 }
 
-export function listWikiRevisions(pageId: number) {
-  return api<WikiRevision[]>(`/api/wiki/pages/${pageId}/revisions`)
+export function listWikiRevisions(pageId: number, spaceId?: number) {
+  const query = spaceId ? `?space_id=${spaceId}` : ''
+  return api<WikiRevision[]>(`/api/wiki/pages/${pageId}/revisions${query}`)
 }
 
-export function getWikiRevision(pageId: number, revisionId: number) {
-  return api<WikiRevision>(`/api/wiki/pages/${pageId}/revisions/${revisionId}`)
+export function getWikiRevision(pageId: number, revisionId: number, spaceId?: number) {
+  const query = spaceId ? `?space_id=${spaceId}` : ''
+  return api<WikiRevision>(`/api/wiki/pages/${pageId}/revisions/${revisionId}${query}`)
 }
 
 export interface WikiDiffQuery {
   from_revision?: number
   to_revision?: number
+  space_id?: number
 }
 
 export function getWikiDiff(pageId: number, params: WikiDiffQuery = {}) {
@@ -256,12 +274,14 @@ export function getWikiDiff(pageId: number, params: WikiDiffQuery = {}) {
     withQuery(`/api/wiki/pages/${pageId}/diff`, {
       from_revision: params.from_revision,
       to_revision: params.to_revision,
+      space_id: params.space_id,
     }),
   )
 }
 
-export function rollbackWikiPage(pageId: number, body: WikiRollbackRequest) {
-  return api<WikiRollbackResponse>(`/api/wiki/pages/${pageId}/rollback`, {
+export function rollbackWikiPage(pageId: number, body: WikiRollbackRequest, spaceId?: number) {
+  const query = spaceId ? `?space_id=${spaceId}` : ''
+  return api<WikiRollbackResponse>(`/api/wiki/pages/${pageId}/rollback${query}`, {
     method: 'POST',
     body: JSON.stringify(body),
   })

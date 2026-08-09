@@ -21,11 +21,11 @@ WIKI_FTS_TABLE = "wiki_pages_fts"
 SOURCE_CHUNKS_FTS_TABLE = "source_chunks_fts"
 SOURCE_FTS_TABLE = SOURCE_CHUNKS_FTS_TABLE
 
-_WIKI_COLUMNS = ("page_id", "page_key", "status", "domain", "page_type", "source_document_id", "title", "aliases", "tags", "clauses", "body")
-_SOURCE_COLUMNS = ("chunk_id", "document_id", "chunk_index", "page_start", "page_end", "section", "parent_index", "title", "aliases", "tags", "clauses", "body")
+_WIKI_COLUMNS = ("page_id", "space_id", "page_key", "status", "domain", "page_type", "source_document_id", "title", "aliases", "tags", "clauses", "body")
+_SOURCE_COLUMNS = ("chunk_id", "space_id", "document_id", "chunk_index", "page_start", "page_end", "section", "parent_index", "title", "aliases", "tags", "clauses", "body")
 _SEARCH_FIELDS = ("title", "aliases", "tags", "clauses", "body")
-_WIKI_META = _WIKI_COLUMNS[:6]
-_SOURCE_META = _SOURCE_COLUMNS[:7]
+_WIKI_META = _WIKI_COLUMNS[:7]
+_SOURCE_META = _SOURCE_COLUMNS[:8]
 DEFAULT_FIELD_WEIGHTS = {"title": 12.0, "aliases": 9.0, "tags": 5.0, "clauses": 10.0, "body": 1.0}
 _CLAUSE_RE = re.compile(r"(?<!\d)\d+(?:\.\d+){1,4}(?!\d)")
 _QUERY_TOKEN_RE = re.compile(r"[0-9A-Za-z_\u4e00-\u9fff]+(?:[./-][0-9A-Za-z_\u4e00-\u9fff]+)*")
@@ -169,12 +169,27 @@ def _create_table(connection: Any, table: str, columns: tuple[str, ...], meta_co
     _execute(connection, sql)
 
 
+def _table_columns(connection: Any, table: str) -> set[str]:
+    try:
+        result = _execute(connection, f'PRAGMA table_info("{table}")')
+        return {str(row[1]) for row in result.fetchall()}
+    except Exception:
+        return set()
+
+
 def _ensure_on_connection(connection: Any) -> Fts5Status:
     status = _probe_fts5(connection)
     if not status.available:
         return status
     try:
         tokenizer = status.tokenizer or "unicode61"
+        # FTS5 virtual tables do not support adding a projected column.  If a
+        # pre-space projection is present, rebuild both projections together;
+        # otherwise an old table would silently ignore the isolation filter.
+        existing_tables = _table_columns(connection, WIKI_FTS_TABLE), _table_columns(connection, SOURCE_CHUNKS_FTS_TABLE)
+        if any(columns and "space_id" not in columns for columns in existing_tables):
+            _execute(connection, f"DROP TABLE IF EXISTS {WIKI_FTS_TABLE}")
+            _execute(connection, f"DROP TABLE IF EXISTS {SOURCE_CHUNKS_FTS_TABLE}")
         _create_table(connection, WIKI_FTS_TABLE, _WIKI_COLUMNS, len(_WIKI_META), tokenizer)
         _create_table(connection, SOURCE_CHUNKS_FTS_TABLE, _SOURCE_COLUMNS, len(_SOURCE_META), tokenizer)
     except Exception as exc:
@@ -330,6 +345,7 @@ def _page_values(item: Any, content: str | None = None, **overrides: Any) -> tup
         clause_value = clause_values
     values = {
         "page_id": _text(page_id),
+        "space_id": _text(overrides.get("space_id", _get(source, "space_id", _get(row, "space_id", "")))),
         "page_key": _text(overrides.get("page_key", _get(source, "page_key", _get(row, "page_key", "")))),
         "status": _text(overrides.get("status", _get(source, "status", _get(row, "status", "published")))),
         "domain": _text(overrides.get("domain", _get(source, "domain", _get(row, "domain", "")))),
@@ -357,6 +373,7 @@ def _source_values(item: Any, content: str | None = None, **overrides: Any) -> t
     clauses = overrides.get("clauses", _get(item, "clause_ids", _get(item, "clause_ids_json", [])))
     values = {
         "chunk_id": _text(chunk_id),
+        "space_id": _text(overrides.get("space_id", _get(item, "space_id", ""))),
         "document_id": _text(overrides.get("document_id", _get(item, "document_id", ""))),
         "chunk_index": _text(_get(item, "chunk_index", "")),
         "page_start": _text(_get(item, "page_start", "")),
@@ -415,32 +432,45 @@ def delete_source_chunk(target: Any, chunk_id: Any) -> FtsOperationResult:
     return _delete(target, SOURCE_CHUNKS_FTS_TABLE, chunk_id)
 
 
-def _rows_from_target(target: Any, connection: Any, table: str) -> list[Any]:
+def _rows_from_target(target: Any, connection: Any, table: str, space_id: int | None = None) -> list[Any]:
     try:
         if isinstance(target, Session):
             from sqlmodel import select
             from app.models.entities import SourceChunk, WikiPageRow
             model = WikiPageRow if table == WIKI_FTS_TABLE else SourceChunk
-            return list(target.exec(select(model)).all())
-        result = _execute(connection, f"SELECT * FROM {'wiki_pages' if table == WIKI_FTS_TABLE else 'source_chunks'}")
+            statement = select(model)
+            if space_id is not None and hasattr(model, "space_id"):
+                statement = statement.where(model.space_id == int(space_id))
+            return list(target.exec(statement).all())
+        source_table = "wiki_pages" if table == WIKI_FTS_TABLE else "source_chunks"
+        sql = f"SELECT * FROM {source_table}"
+        params: tuple[Any, ...] = ()
+        if space_id is not None:
+            sql += " WHERE space_id = ?"
+            params = (int(space_id),)
+        result = _execute(connection, sql, params)
         rows = result.fetchall()
         return list(_rows_as_mappings(result, rows))
     except Exception:
         return []
 
 
-def rebuild_fts(target: Any, wiki_pages: Any = None, source_chunks: Any = None, *, clear: bool = True) -> FtsOperationResult:
+def rebuild_fts(target: Any, wiki_pages: Any = None, source_chunks: Any = None, *, clear: bool = True, space_id: int | None = None) -> FtsOperationResult:
     """Idempotently rebuild both indexes; supplied rows may be ORM or mappings."""
     with _connection_scope(target) as connection:
         status = _require(connection)
-        pages = list(wiki_pages) if wiki_pages is not None else _rows_from_target(target, connection, WIKI_FTS_TABLE)
-        chunks = list(source_chunks) if source_chunks is not None else _rows_from_target(target, connection, SOURCE_CHUNKS_FTS_TABLE)
+        pages = list(wiki_pages) if wiki_pages is not None else _rows_from_target(target, connection, WIKI_FTS_TABLE, space_id)
+        chunks = list(source_chunks) if source_chunks is not None else _rows_from_target(target, connection, SOURCE_CHUNKS_FTS_TABLE, space_id)
         deleted_pages = deleted_chunks = 0
         if clear:
-            deleted_pages = int(_execute(connection, f"SELECT count(*) FROM {WIKI_FTS_TABLE}").scalar_one() if hasattr(connection, "exec_driver_sql") else _execute(connection, f"SELECT count(*) FROM {WIKI_FTS_TABLE}").fetchone()[0])
-            deleted_chunks = int(_execute(connection, f"SELECT count(*) FROM {SOURCE_CHUNKS_FTS_TABLE}").scalar_one() if hasattr(connection, "exec_driver_sql") else _execute(connection, f"SELECT count(*) FROM {SOURCE_CHUNKS_FTS_TABLE}").fetchone()[0])
-            _execute(connection, f"DELETE FROM {WIKI_FTS_TABLE}")
-            _execute(connection, f"DELETE FROM {SOURCE_CHUNKS_FTS_TABLE}")
+            scope_clause = " WHERE space_id = :space_id" if space_id is not None else ""
+            scope_params = {"space_id": int(space_id)} if space_id is not None else {}
+            page_count_result = _execute(connection, f"SELECT count(*) FROM {WIKI_FTS_TABLE}{scope_clause}", scope_params)
+            chunk_count_result = _execute(connection, f"SELECT count(*) FROM {SOURCE_CHUNKS_FTS_TABLE}{scope_clause}", scope_params)
+            deleted_pages = int(page_count_result.scalar_one() if hasattr(page_count_result, "scalar_one") else page_count_result.fetchone()[0])
+            deleted_chunks = int(chunk_count_result.scalar_one() if hasattr(chunk_count_result, "scalar_one") else chunk_count_result.fetchone()[0])
+            _execute(connection, f"DELETE FROM {WIKI_FTS_TABLE}{scope_clause}", scope_params)
+            _execute(connection, f"DELETE FROM {SOURCE_CHUNKS_FTS_TABLE}{scope_clause}", scope_params)
         for page in pages:
             _upsert(connection, WIKI_FTS_TABLE, _page_values(page)[1])
         for chunk in chunks:
@@ -452,14 +482,19 @@ rebuild_fts_index = rebuild_fts
 rebuild_index = rebuild_fts
 
 
-def index_counts(target: Any) -> dict[str, Any]:
+def index_counts(target: Any, *, space_id: int | None = None) -> dict[str, Any]:
     """Return projection row counts, with an explicit fallback signal."""
     with _connection_scope(target) as connection:
         status = _ensure_on_connection(connection)
         if not status.available:
             return {"wiki_pages": 0, "source_chunks": 0, **status.as_dict()}
         def count(table: str) -> int:
-            result = _execute(connection, f"SELECT count(*) FROM {table}")
+            sql = f"SELECT count(*) FROM {table}"
+            params: tuple[Any, ...] = ()
+            if space_id is not None:
+                sql += " WHERE space_id = ?"
+                params = (int(space_id),)
+            result = _execute(connection, sql, params)
             if hasattr(result, "scalar_one"):
                 return int(result.scalar_one())
             return int(result.fetchone()[0])
@@ -512,7 +547,7 @@ def _search(target: Any, table: str, query: str, *, limit: int, offset: int, wei
         where = [f"{table} MATCH :match_query"]
         params: dict[str, Any] = {"match_query": match_query, "open_tag": "<mark>", "close_tag": "</mark>", "ellipsis": "…", "snippet_tokens": 48, "limit": min(int(limit), 100), "offset": max(int(offset), 0)}
         for name, value in filters.items():
-            if value is not None and name in columns and name in {"status", "domain", "page_type", "source_document_id", "document_id"}:
+            if value is not None and name in columns and name in {"space_id", "status", "domain", "page_type", "source_document_id", "document_id"}:
                 where.append(f"{table}.{name} = :filter_{name}")
                 params[f"filter_{name}"] = str(value)
         if table == WIKI_FTS_TABLE and not include_archived and "status" not in filters:
@@ -536,6 +571,8 @@ def _search(target: Any, table: str, query: str, *, limit: int, offset: int, wei
                 snippet = next((highlights[name] for name in marked), snippet)
             item = {name: _row_value(row, name) for name in columns}
             item.update({"id": int(_row_value(row, "_rowid")), "kind": "wiki_page" if table == WIKI_FTS_TABLE else "source_chunk", "score": max(0.0, -raw_bm25), "bm25": raw_bm25, "snippet": snippet, "highlights": highlights, "explain": {"algorithm": "bm25", "raw_bm25": raw_bm25, "field_weights": weight_map, "matched_fields": marked, "match_query": match_query}})
+            if str(item.get("space_id") or "").isdigit():
+                item["space_id"] = int(item["space_id"])
             if table == WIKI_FTS_TABLE:
                 item["page_id"] = int(item["page_id"])
                 item["aliases"] = str(item["aliases"] or "").split()
@@ -552,21 +589,40 @@ def _search(target: Any, table: str, query: str, *, limit: int, offset: int, wei
         return FtsResults(values, status=status, query=query or "", match_query=match_query)
 
 
-def search_wiki(target: Any, query: str, *, limit: int = 10, offset: int = 0, field_weights: Mapping[str, Any] | None = None, status: str | None = None, domain: str | None = None, page_type: str | None = None, include_archived: bool = False) -> FtsResults:
-    return _search(target, WIKI_FTS_TABLE, query, limit=limit, offset=offset, weights=field_weights, filters={"status": status, "domain": domain, "page_type": page_type}, include_archived=include_archived)
+def _compat_space_id(target: Any, space_id: int | None) -> int | None:
+    if space_id is not None:
+        return int(space_id)
+    # Legacy service/test callers receive the explicit default namespace.  A
+    # Session is the only target where this can be resolved without opening a
+    # second database handle; production retrieval always passes the id.
+    try:
+        from sqlmodel import Session as SqlModelSession
+        from app.services.wiki_spaces import resolve_space_id
+
+        if isinstance(target, SqlModelSession):
+            return resolve_space_id(target)
+    except Exception:
+        pass
+    return None
 
 
-def search_source_chunks(target: Any, query: str, *, limit: int = 10, offset: int = 0, field_weights: Mapping[str, Any] | None = None, document_id: int | None = None) -> FtsResults:
-    return _search(target, SOURCE_CHUNKS_FTS_TABLE, query, limit=limit, offset=offset, weights=field_weights, filters={"document_id": document_id}, include_archived=True)
+def search_wiki(target: Any, query: str, *, limit: int = 10, offset: int = 0, field_weights: Mapping[str, Any] | None = None, space_id: int | None = None, status: str | None = None, domain: str | None = None, page_type: str | None = None, include_archived: bool = False) -> FtsResults:
+    space_id = _compat_space_id(target, space_id)
+    return _search(target, WIKI_FTS_TABLE, query, limit=limit, offset=offset, weights=field_weights, filters={"space_id": space_id, "status": status, "domain": domain, "page_type": page_type}, include_archived=include_archived)
 
 
-def search(target: Any, query: str, *, limit: int = 10, scope: str = "all", field_weights: Mapping[str, Any] | None = None) -> FtsResults:
+def search_source_chunks(target: Any, query: str, *, limit: int = 10, offset: int = 0, field_weights: Mapping[str, Any] | None = None, space_id: int | None = None, document_id: int | None = None) -> FtsResults:
+    space_id = _compat_space_id(target, space_id)
+    return _search(target, SOURCE_CHUNKS_FTS_TABLE, query, limit=limit, offset=offset, weights=field_weights, filters={"space_id": space_id, "document_id": document_id}, include_archived=True)
+
+
+def search(target: Any, query: str, *, limit: int = 10, scope: str = "all", field_weights: Mapping[str, Any] | None = None, space_id: int | None = None) -> FtsResults:
     if scope == "wiki":
-        return search_wiki(target, query, limit=limit, field_weights=field_weights)
+        return search_wiki(target, query, limit=limit, field_weights=field_weights, space_id=space_id)
     if scope in {"source", "source_chunks"}:
-        return search_source_chunks(target, query, limit=limit, field_weights=field_weights)
-    wiki = search_wiki(target, query, limit=limit, field_weights=field_weights)
-    source = search_source_chunks(target, query, limit=limit, field_weights=field_weights)
+        return search_source_chunks(target, query, limit=limit, field_weights=field_weights, space_id=space_id)
+    wiki = search_wiki(target, query, limit=limit, field_weights=field_weights, space_id=space_id)
+    source = search_source_chunks(target, query, limit=limit, field_weights=field_weights, space_id=space_id)
     status = wiki.status if not wiki.status.available else source.status
     values = sorted([*wiki, *source], key=lambda item: (-float(item.get("score", 0.0)), int(item.get("id", 0))))[: max(0, int(limit))]
     return FtsResults(values, status=status, query=query or "", match_query=build_match_query(query), error=wiki.error or source.error)
@@ -584,8 +640,8 @@ class WikiFtsIndex:
     def ensure(self) -> Fts5Status:
         return ensure_fts_schema(self.target)
 
-    def rebuild(self, wiki_pages: Any = None, source_chunks: Any = None, *, clear: bool = True) -> FtsOperationResult:
-        return rebuild_fts(self.target, wiki_pages, source_chunks, clear=clear)
+    def rebuild(self, wiki_pages: Any = None, source_chunks: Any = None, *, clear: bool = True, space_id: int | None = None) -> FtsOperationResult:
+        return rebuild_fts(self.target, wiki_pages, source_chunks, clear=clear, space_id=space_id)
 
     def upsert_wiki_page(self, page: Any = None, content: str | None = None, **fields: Any) -> FtsOperationResult:
         return upsert_wiki_page(self.target, page, content, **fields)

@@ -16,6 +16,7 @@ from app import config
 from app.models.entities import WikiReviewItem, WikiPageRow
 from app.services.wiki_index import build_index_entries, render_index
 from app.services.wiki_schema import is_valid_page_key, parse_wiki_page, validate_page_key
+from app.services.wiki_spaces import space_scope_clause
 
 _WIKILINK = re.compile(r"\[\[([^\]|#]+)(?:\|[^\]]+)?\]\]")
 _MDLINK = re.compile(r"(?<!!)\[[^\]]+\]\(([^)]+)\)")
@@ -41,13 +42,18 @@ def _value(item: Any, name: str, default: Any = None) -> Any:
     return getattr(item, name, default)
 
 
-def _reviews(session: Any, supplied: Iterable[Any] | None) -> list[Any]:
+def _reviews(session: Any, supplied: Iterable[Any] | None, space_id: int | None = None) -> list[Any]:
     if supplied is not None:
         return list(supplied)
     if session is None:
         return []
     try:
-        return list(session.exec(select(WikiReviewItem).order_by(WikiReviewItem.id)).all())
+        statement = select(WikiReviewItem).order_by(WikiReviewItem.id)
+        if space_id is not None:
+            statement = statement.where(
+                space_scope_clause(session, WikiReviewItem.space_id, space_id)
+            )
+        return list(session.exec(statement).all())
     except Exception:
         return []
 
@@ -106,12 +112,13 @@ def lint_wiki(
     review_items: Iterable[Any] | None = None,
     wiki_root: Path | str | None = None,
     index_path: Path | str | None = None,
+    space_id: int | None = None,
 ) -> LintReport:
     """Return findings only.  This function never writes pages, index, or DB rows."""
 
     if session is None and hasattr(pages, "exec") and not isinstance(pages, (list, tuple, set)):
         session, pages = pages, None
-    entries = build_index_entries(pages, session=session)
+    entries = build_index_entries(pages, session=session, space_id=space_id)
     issues: list[dict[str, Any]] = []
     by_key: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
     path_by_rel: dict[str, str] = {}
@@ -126,7 +133,12 @@ def lint_wiki(
 
     known = {key for key in by_key if key}
     incoming: dict[str, int] = defaultdict(int)
-    root = Path(wiki_root or config.WIKI_DIR)
+    if wiki_root is None and space_id is not None:
+        from app.services.wiki_spaces import resolve_space, space_root
+
+        root = space_root(resolve_space(session, space_id))
+    else:
+        root = Path(wiki_root or config.WIKI_DIR)
     for entry in entries:
         issues.extend(_link_issues(entry, known, path_by_rel))
         source_count = int(entry.get("source_count") or 0)
@@ -145,7 +157,7 @@ def lint_wiki(
         if entry.get("status") != "archived" and entry.get("page_type") != "source" and not incoming.get(str(entry.get("page_key")), 0) and int(entry.get("source_count") or 0) == 0:
             issues.append(_issue("orphan_page", f"页面没有来源或入链：{entry.get('page_key')}", page_key=entry.get("page_key")))
 
-    for review in _reviews(session, review_items):
+    for review in _reviews(session, review_items, space_id):
         status = str(_value(review, "status", "pending")).lower()
         kind = str(_value(review, "kind", "")).lower()
         reason = str(_value(review, "reason", ""))

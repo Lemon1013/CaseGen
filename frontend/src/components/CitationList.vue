@@ -38,6 +38,7 @@ const props = withDefaults(
   defineProps<{
     citations?: CitationItem[]
     count?: number
+    spaceId?: number
   }>(),
   {
     citations: () => [],
@@ -80,11 +81,11 @@ async function openCitation(c: CitationItem, idx: number) {
     if (isSource(c)) {
       if (c.source_chunk_id != null) {
         chunkDetail.value = await api<SourceChunkDetail>(
-          `/api/source-chunks/${c.source_chunk_id}`,
+          `/api/source-chunks/${c.source_chunk_id}?space_id=${props.spaceId || ''}`,
         )
       }
     } else if (c.wiki_page_id != null) {
-      pageDetail.value = await getWikiPage(c.wiki_page_id)
+      pageDetail.value = await getWikiPage(c.wiki_page_id, props.spaceId)
     }
   } catch (e) {
     ElMessage.error(`加载引用详情失败：${(e as Error).message}`)
@@ -100,7 +101,10 @@ function goWikiPage() {
     return
   }
   drawerVisible.value = false
-  void router.push({ path: '/wiki', query: { page: String(id) } })
+  void router.push({
+    path: '/wiki',
+    query: { page: String(id), space_id: String(props.spaceId || '') },
+  })
 }
 
 function scoreText(score?: number) {

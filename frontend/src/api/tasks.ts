@@ -22,6 +22,8 @@ export interface ReviewResult {
 export interface TaskItem {
   id: number
   requirement_id: number
+  wiki_space_id: number
+  wiki_space_name: string
   status: string
   model_id: number | null
   prompt_template_id: number | null
@@ -45,6 +47,7 @@ export interface TaskCreate {
   prompt_template_id?: number | null
   auto_review?: boolean
   run_generate?: boolean
+  wiki_space_id?: number
 }
 
 export interface CaseDraft {
@@ -63,6 +66,8 @@ export interface TaskEvent {
   message: string
   detail_json: string | null
   created_at: string
+  wiki_space_id?: number | null
+  wiki_space_name?: string
 }
 
 export interface PromptRevision {

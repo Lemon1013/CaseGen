@@ -80,6 +80,11 @@ onMounted(load)
     >
       <el-table-column prop="id" label="ID" width="70" />
       <el-table-column prop="title" label="标题" min-width="180" show-overflow-tooltip />
+      <el-table-column label="Wiki 空间" min-width="150" show-overflow-tooltip>
+        <template #default="{ row }">
+          {{ row.wiki_space_name || `空间 #${row.wiki_space_id}` }}
+        </template>
+      </el-table-column>
       <el-table-column label="状态" width="120">
         <template #default="{ row }">
           <el-tag :type="statusTagType(row.status)" size="small" effect="light">

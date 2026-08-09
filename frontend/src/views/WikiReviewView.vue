@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { computed, onMounted, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { formatDateTime as formatTime } from '../utils/datetime'
 import {
@@ -17,11 +17,16 @@ import {
   type WikiReviewDetail,
   type WikiRevision,
 } from '../api/wiki'
+import { listWikiSpaces, type WikiSpace } from '../api/wikiSpaces'
+import { chooseSpace, rememberAndRoute, spaceIdFromQuery } from '../utils/wikiSpace'
 
 type ReviewFilter = 'pending' | 'all'
 
 const loading = ref(false)
 const router = useRouter()
+const route = useRoute()
+const spaces = ref<WikiSpace[]>([])
+const currentSpace = ref<WikiSpace | null>(null)
 const detailLoading = ref(false)
 const actionLoading = ref(false)
 const revisionsLoading = ref(false)
@@ -131,6 +136,7 @@ async function loadReviews() {
     reviews.value = await listWikiReviews({
       status: reviewFilter.value === 'pending' ? 'pending' : undefined,
       kind: kindFilter.value || undefined,
+      space_id: currentSpace.value?.id,
     })
     const stillExists = selectedId.value != null && reviews.value.some((item) => item.id === selectedId.value)
     const nextId = stillExists ? selectedId.value : reviews.value[0]?.id ?? null
@@ -161,7 +167,7 @@ async function loadReviewDetail(id: number) {
   diffTab.value = 'unified'
   decisionReason.value = ''
   try {
-    const loaded = await getWikiReview(id)
+    const loaded = await getWikiReview(id, currentSpace.value?.id)
     if (selectedId.value !== id) return
     detail.value = loaded
     if (loaded.page_id != null) {
@@ -181,7 +187,7 @@ async function loadReviewDetail(id: number) {
 async function loadRevisions(pageId: number) {
   revisionsLoading.value = true
   try {
-    revisions.value = await listWikiRevisions(pageId)
+    revisions.value = await listWikiRevisions(pageId, currentSpace.value?.id)
   } catch (error) {
     revisions.value = []
     ElMessage.error(actionableError('加载页面版本', error))
@@ -207,7 +213,7 @@ async function approve() {
     await approveWikiReview(current.id, {
       reviewed_by: reviewedBy.value.trim() || undefined,
       decision_reason: decisionReason.value.trim() || undefined,
-    })
+    }, currentSpace.value?.id)
     ElMessage.success('审核已批准，Wiki 页面已更新')
     await loadReviews()
   } catch (error) {
@@ -239,7 +245,7 @@ async function reject() {
     await rejectWikiReview(current.id, {
       reviewed_by: reviewedBy.value.trim() || undefined,
       decision_reason: reason,
-    })
+    }, currentSpace.value?.id)
     ElMessage.success('审核项已拒绝')
     await loadReviews()
   } catch (error) {
@@ -267,7 +273,7 @@ async function acknowledge() {
     await acknowledgeWikiReview(current.id, {
       reviewed_by: reviewedBy.value.trim() || undefined,
       decision_reason: decisionReason.value.trim() || undefined,
-    })
+    }, currentSpace.value?.id)
     ElMessage.success('提醒已标记为已处理')
     await loadReviews()
   } catch (error) {
@@ -286,6 +292,7 @@ async function compareRevision(revision: WikiRevision) {
     revisionDiff.value = await getWikiDiff(pageId, {
       from_revision: revision.revision,
       to_revision: current.revision,
+      space_id: currentSpace.value?.id,
     })
     diffTab.value = 'revision'
   } catch (error) {
@@ -318,7 +325,7 @@ async function rollback(revision: WikiRevision) {
       revision: revision.revision,
       reason: `人工回滚到 revision ${revision.revision}`,
       reviewed_by: reviewedBy.value.trim() || undefined,
-    })
+    }, currentSpace.value?.id)
     ElMessage.success(`回滚完成，已创建 revision ${created.revision}`)
     await loadRevisions(pageId)
     revisionDiff.value = null
@@ -331,7 +338,37 @@ async function rollback(revision: WikiRevision) {
   }
 }
 
-onMounted(loadReviews)
+async function changeSpace(id: number) {
+  await rememberAndRoute(router, id, '/wiki/reviews')
+  selectedId.value = null
+  detail.value = null
+  revisions.value = []
+  await loadReviews()
+}
+
+onMounted(async () => {
+  spaces.value = await listWikiSpaces()
+  currentSpace.value = chooseSpace(spaces.value, spaceIdFromQuery(route.query))
+  if (!currentSpace.value) return
+  if (spaceIdFromQuery(route.query) !== currentSpace.value.id) {
+    await rememberAndRoute(router, currentSpace.value.id, '/wiki/reviews')
+  }
+  await loadReviews()
+})
+
+watch(
+  () => route.query.space_id,
+  async () => {
+    if (!spaces.value.length) return
+    const next = chooseSpace(spaces.value, spaceIdFromQuery(route.query))
+    if (!next || next.id === currentSpace.value?.id) return
+    currentSpace.value = next
+    selectedId.value = null
+    detail.value = null
+    revisions.value = []
+    await loadReviews()
+  },
+)
 </script>
 
 <template>
@@ -339,9 +376,23 @@ onMounted(loadReviews)
     <div class="page-header">
       <div>
         <h1 class="page-title">Wiki 审核 / 版本</h1>
-        <p class="page-subtitle">核对候选内容、来源证据和版本差异，再决定是否写入知识库</p>
+        <p class="page-subtitle">核对当前空间的候选内容、来源证据和版本差异</p>
       </div>
       <div class="page-actions">
+        <el-select
+          v-if="spaces.length"
+          :model-value="currentSpace?.id"
+          class="space-select"
+          placeholder="选择 Wiki 空间"
+          @change="changeSpace"
+        >
+          <el-option
+            v-for="space in spaces"
+            :key="space.id"
+            :label="`${space.name} · ${space.pending_review_count} 待审核${space.status === 'archived' ? ' · 已归档' : ''}`"
+            :value="space.id"
+          />
+        </el-select>
         <el-button :loading="loading" @click="loadReviews">刷新列表</el-button>
       </div>
     </div>
@@ -505,7 +556,7 @@ onMounted(loadReviews)
                   type="primary"
                   link
                   size="small"
-                  @click="router.push({ path: '/documents', query: { document: source.document_id } })"
+                  @click="router.push({ path: '/documents', query: { document: source.document_id, space_id: String(currentSpace?.id || '') } })"
                 >
                   查看完整原文
                 </el-button>

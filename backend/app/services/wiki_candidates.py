@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from sqlmodel import Session, select
+from sqlmodel import Session, or_, select
 
 from app import config
 from app.models.entities import WikiPageRow, WikiPageSource
@@ -387,9 +387,18 @@ def format_candidate_context(candidates: Iterable[Any], *, max_chars: int = 1600
     return text[:head].rstrip() + "\n…[candidate context truncated]…\n" + text[-tail:].lstrip()
 
 
-def load_wiki_candidates_from_disk(root: Path | None = None) -> list[dict[str, Any]]:
+def load_wiki_candidates_from_disk(
+    root: Path | None = None,
+    *,
+    space_id: int | None = None,
+    space_slug: str | None = None,
+) -> list[dict[str, Any]]:
     """Load valid Markdown pages for integrations without a Session."""
 
+    if root is None and space_slug:
+        from app.services.wiki_spaces import space_root
+
+        root = space_root(space_slug)
     root = Path(root or config.WIKI_DIR)
     if not root.exists():
         return []
@@ -430,11 +439,19 @@ def recall_wiki_candidates_from_session(
     filename: str = "",
     limit: int | None = 80,
     top_k: int | None = None,
+    space_id: int | None = None,
     **kwargs: Any,
 ) -> list[dict[str, Any]]:
     """Recall candidates from migrated rows without opening arbitrary paths."""
 
-    rows = session.exec(select(WikiPageRow).order_by(WikiPageRow.id)).all()
+    from app.services.wiki_spaces import resolve_space_id, space_scope_clause
+
+    sid = resolve_space_id(session, space_id)
+    rows = session.exec(
+        select(WikiPageRow)
+        .where(space_scope_clause(session, WikiPageRow.space_id, sid))
+        .order_by(WikiPageRow.id)
+    ).all()
     source_counts: dict[int, int] = {}
     source_ids: dict[int, list[int]] = {}
     source_clauses: dict[int, list[str]] = {}

@@ -31,6 +31,7 @@ from app.services.wiki_pages_parse import (
     pages_from_analysis,
     split_wiki_pages,
 )
+from app.services.wiki_spaces import ensure_space_dirs, resolve_space, space_scope_clause
 
 MAX_WIKI_PAGES_PER_DOC = 8
 INDEX_EXCERPT_CHARS = 4000
@@ -130,11 +131,15 @@ def _load_reusable_chunks(
     session: Session,
     document_id: int,
     text_length: int,
+    space_id: int | None = None,
 ) -> list[SourceChunk] | None:
+    clause = SourceChunk.document_id == document_id
+    if space_id is not None:
+        clause = clause & space_scope_clause(session, SourceChunk.space_id, space_id)
     rows = list(
         session.exec(
             select(SourceChunk)
-            .where(SourceChunk.document_id == document_id)
+            .where(clause)
             .order_by(SourceChunk.chunk_index)
         ).all()
     )
@@ -281,17 +286,31 @@ def _default_chat_fn(session: Session) -> ChatFn:
     return _chat
 
 
-def _read_index_excerpt() -> str:
-    index_path = config.WIKI_DIR / "index.md"
+def _read_index_excerpt(space_slug: str | None = None) -> str:
+    if space_slug:
+        from app.services.wiki_spaces import space_root
+
+        index_path = space_root(space_slug) / "index.md"
+    else:
+        index_path = config.WIKI_DIR / "index.md"
     if not index_path.exists():
         return "# Wiki Index\n"
     text = index_path.read_text(encoding="utf-8", errors="replace")
     return text[:INDEX_EXCERPT_CHARS]
 
 
-def _delete_existing_pages(session: Session, document_id: int) -> None:
+def _delete_existing_pages(
+    session: Session,
+    document_id: int,
+    space_id: int | None = None,
+) -> None:
+    statement = select(WikiPageRow).where(WikiPageRow.source_document_id == document_id)
+    if space_id is not None:
+        statement = statement.where(
+            space_scope_clause(session, WikiPageRow.space_id, space_id)
+        )
     rows = session.exec(
-        select(WikiPageRow).where(WikiPageRow.source_document_id == document_id)
+        statement
     ).all()
     for row in rows:
         path = Path(row.path or "")
@@ -310,11 +329,22 @@ def _delete_existing_pages(session: Session, document_id: int) -> None:
         session.commit()
 
 
-def _write_page_file(row: WikiPageRow, body: str, sources: list[str], tags: list[str]) -> Path:
+def _write_page_file(
+    row: WikiPageRow,
+    body: str,
+    sources: list[str],
+    tags: list[str],
+    *,
+    space_slug: str | None = None,
+) -> Path:
     config.ensure_data_dirs()
     slug = _slugify(row.title)
     filename = f"{slug}-{row.id}.md"
-    rel_path = f"pages/{filename}"
+    rel_path = (
+        f"spaces/{space_slug}/pages/{filename}"
+        if space_slug
+        else f"pages/{filename}"
+    )
     abs_path = config.WIKI_DIR / rel_path
     abs_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -351,9 +381,17 @@ def ingest_document(
     if doc is None:
         raise ValueError(f"Document {document_id} not found")
 
+    try:
+        space = resolve_space(session, doc.space_id, for_write=True)
+    except ValueError as exc:
+        raise ValueError(str(exc)) from exc
+    doc.space_id = space.id
+    ensure_space_dirs(space)
+
     if job is None:
         job = IngestJob(
             document_id=document_id,
+            space_id=space.id,
             status="running",
             stage="parsing",
             progress=5,
@@ -362,6 +400,9 @@ def ingest_document(
         session.add(job)
     elif job.document_id != document_id:
         raise ValueError(f"Job {job.id} does not belong to document {document_id}")
+    elif job.space_id is not None and int(job.space_id) != int(space.id):
+        raise ValueError(f"Job {job.id} belongs to another Wiki space")
+    job.space_id = space.id
     job.status = "running"
     job.stage = "parsing"
     job.progress = max(5, int(job.progress or 0))
@@ -412,7 +453,7 @@ def ingest_document(
         _set_stage(session, job, "chunking", 20)
         retry_requested = _is_retry_requested(job)
         reusable_chunks = (
-            _load_reusable_chunks(session, document_id, len(text))
+            _load_reusable_chunks(session, document_id, len(text), space.id)
             if retry_requested
             else None
         )
@@ -431,6 +472,7 @@ def ingest_document(
                 parsed,
                 chunk_chars=config.SOURCE_CHUNK_CHARS,
                 overlap_chars=config.SOURCE_CHUNK_OVERLAP,
+                space_id=space.id,
             )
         job.progress = 25
         _append_step(
@@ -450,6 +492,7 @@ def ingest_document(
             text=text,
             filename=doc.filename or "",
             top_k=24,
+            space_id=space.id,
         )
         source_anchor_windows: list[dict[str, Any]] = []
         for row in chunk_rows:
@@ -506,6 +549,7 @@ def ingest_document(
             filename=doc.filename or "",
             on_step=_on_analyze_step,
             candidate_pages=candidate_pages,
+            space_slug=space.slug,
             existing_page_keys=[
                 str(item["page_key"])
                 for item in candidate_pages
@@ -551,7 +595,7 @@ def ingest_document(
         ).strip(";")
         _set_stage(session, job, "writing", 75)
         _raise_if_cancelled(session, job, doc)
-        index_excerpt = _read_index_excerpt()
+        index_excerpt = _read_index_excerpt(space.slug)
         # Primary knowledge is consolidated analysis (+ digest); keep only a small
         # raw sample for tone/format so long dual-context payloads do not 502.
         analysis_json = json.dumps(analysis, ensure_ascii=False, indent=2)
@@ -657,6 +701,7 @@ def ingest_document(
                 document_id=document_id,
                 job_id=job.id,
                 max_pages=MAX_WIKI_PAGES_PER_DOC,
+                space_id=space.id,
             )
             _append_step(
                 job,
@@ -702,7 +747,7 @@ def ingest_document(
         # 4) Persist pages (replace previous for this document)
         _set_stage(session, job, "writing", 82)
         if strict_apply_result is None:
-            _delete_existing_pages(session, document_id)
+            _delete_existing_pages(session, document_id, space.id)
             written_rows: list[WikiPageRow] = []
             for page in pages:
                 tags = page.get("tags") or []
@@ -714,11 +759,18 @@ def ingest_document(
                     title=page["title"],
                     page_type=page.get("page_type") or page.get("type") or "business",
                     source_document_id=document_id,
+                    space_id=space.id,
                     tags_json=json.dumps(tags, ensure_ascii=False),
                 )
                 session.add(row)
                 session.flush()
-                _write_page_file(row, page.get("body") or "", sources, tags)
+                _write_page_file(
+                    row,
+                    page.get("body") or "",
+                    sources,
+                    tags,
+                    space_slug=space.slug,
+                )
                 session.add(row)
                 written_rows.append(row)
             session.commit()
@@ -728,9 +780,15 @@ def ingest_document(
         # 5) Rebuild full index from all wiki pages
         _set_stage(session, job, "indexing", 95)
         _raise_if_cancelled(session, job, doc)
-        all_rows = list(session.exec(select(WikiPageRow).order_by(WikiPageRow.id)).all())
-        rebuild_index(all_rows, session=session)
-        rebuild_overview(all_rows, session=session)
+        all_rows = list(
+            session.exec(
+                select(WikiPageRow)
+                .where(space_scope_clause(session, WikiPageRow.space_id, int(space.id or 0)))
+                .order_by(WikiPageRow.id)
+            ).all()
+        )
+        rebuild_index(all_rows, session=session, space_id=space.id)
+        rebuild_overview(all_rows, session=session, space_id=space.id)
         _append_step(job, "index", f"Index rebuilt with {len(all_rows)} page(s)")
 
         doc.status = "ready"
@@ -780,6 +838,7 @@ def ingest_document(
                 {
                     "job_id": job.id,
                     "document_id": document_id,
+                    "space_id": space.id,
                     "status": job.status,
                     "stage": job.stage,
                     "degraded_windows": degraded_windows,
@@ -793,7 +852,9 @@ def ingest_document(
                         if strict_apply_result is not None
                         else []
                     ),
-                }
+                },
+                space_id=space.id,
+                space_slug=space.slug,
             )
         except OSError as log_exc:
             _append_step(job, "log_warning", f"Wiki log append failed: {log_exc}")

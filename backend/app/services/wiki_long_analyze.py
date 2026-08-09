@@ -788,6 +788,7 @@ def run_long_source_analyze(
     purpose: str | None = None,
     schema: str | None = None,
     candidate_pages: Iterable[Any] | None = None,
+    space_slug: str | None = None,
     source_windows: Iterable[Any] | None = None,
     existing_page_keys: Iterable[str] | None = None,
     resume_window_results: Iterable[Mapping[str, Any]] | None = None,
@@ -818,7 +819,7 @@ def run_long_source_analyze(
     schema_text = schema if schema is not None else _read_wiki_contract("schema.md")
     candidate_pages_were_provided = candidate_pages is not None
     if candidate_pages is None:
-        candidate_pages = load_wiki_candidates_from_disk()
+        candidate_pages = load_wiki_candidates_from_disk(space_slug=space_slug)
     else:
         candidate_pages = list(candidate_pages)
     recalled_candidates = recall_wiki_candidates(

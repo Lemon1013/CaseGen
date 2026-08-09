@@ -7,15 +7,37 @@ from typing import Any
 
 from sqlmodel import Session, col, select
 
-from app.models.entities import SourceChunk
+from app.models.entities import Document, SourceChunk
 from app.services.retrieve import score_text
 from app.services.parse_document import ParsedDocument
 from app.services.source_chunking import chunk_text
+from app.services.wiki_spaces import resolve_space_id, space_scope_clause
 
 
-def delete_chunks_for_document(session: Session, document_id: int) -> int:
+def _document_space_id(session: Session, document_id: int, space_id: int | None = None) -> int:
+    document = session.get(Document, document_id)
+    if document is not None and document.space_id is not None:
+        if space_id is not None and int(space_id) != int(document.space_id):
+            raise ValueError("document does not belong to the requested Wiki space")
+        return int(document.space_id)
+    sid = resolve_space_id(session, space_id)
+    if document is not None and document.space_id is None:
+        document.space_id = sid
+        session.add(document)
+    return sid
+
+
+def delete_chunks_for_document(
+    session: Session,
+    document_id: int,
+    space_id: int | None = None,
+) -> int:
+    sid = _document_space_id(session, document_id, space_id)
     rows = session.exec(
-        select(SourceChunk).where(SourceChunk.document_id == document_id)
+        select(SourceChunk).where(
+            SourceChunk.document_id == document_id,
+            space_scope_clause(session, SourceChunk.space_id, sid),
+        )
     ).all()
     n = len(rows)
     for row in rows:
@@ -41,13 +63,16 @@ def replace_chunks_for_document(
     *,
     chunk_chars: int = 1200,
     overlap_chars: int = 150,
+    space_id: int | None = None,
 ) -> list[SourceChunk]:
-    delete_chunks_for_document(session, document_id)
+    sid = _document_space_id(session, document_id, space_id)
+    delete_chunks_for_document(session, document_id, sid)
     built = chunk_text(text, chunk_chars=chunk_chars, overlap_chars=overlap_chars)
     rows: list[SourceChunk] = []
     for item in built:
         row = SourceChunk(
             document_id=document_id,
+            space_id=sid,
             chunk_index=int(item["chunk_index"]),
             title=str(item["title"] or ""),
             text=str(item["text"] or ""),
@@ -78,9 +103,16 @@ def replace_chunks_for_document(
     return rows
 
 
-def load_all_source_chunks(session: Session) -> list[dict[str, Any]]:
+def load_all_source_chunks(
+    session: Session,
+    *,
+    space_id: int | None = None,
+) -> list[dict[str, Any]]:
+    sid = resolve_space_id(session, space_id)
     rows = session.exec(
-        select(SourceChunk).order_by(
+        select(SourceChunk)
+        .where(space_scope_clause(session, SourceChunk.space_id, sid))
+        .order_by(
             col(SourceChunk.document_id), col(SourceChunk.chunk_index)
         )
     ).all()
@@ -90,6 +122,7 @@ def load_all_source_chunks(session: Session) -> list[dict[str, Any]]:
             {
                 "id": row.id,
                 "document_id": row.document_id,
+                "space_id": row.space_id if row.space_id is not None else sid,
                 "chunk_index": row.chunk_index,
                 "title": row.title,
                 "text": row.text,

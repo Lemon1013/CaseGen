@@ -25,6 +25,7 @@ from app.services.source_chunks_store import load_all_source_chunks, rank_source
 from app.services.review_parse import parse_review_payload
 from app.services.task_events import append_event
 from app.services.task_state import InvalidTransition, transition
+from app.services.wiki_spaces import resolve_space_id
 
 # Optional injectable chat hooks for tests: (messages, model_cfg) -> str
 # Prefer explicit chat_fn arg, then stage-specific hook, then shared pipeline hook.
@@ -943,6 +944,11 @@ def run_generate(
             )
 
         query = _build_query(requirement)
+        resolved_space_id = resolve_space_id(session, task.wiki_space_id)
+        if task.wiki_space_id is None:
+            task.wiki_space_id = resolved_space_id
+            session.add(task)
+            session.commit()
         from app.services.hybrid_retrieve import hybrid_retrieve
 
         retrieved = hybrid_retrieve(
@@ -951,6 +957,7 @@ def run_generate(
             wiki_k=config.RETRIEVE_WIKI_TOP_K,
             source_k=config.RETRIEVE_SOURCE_TOP_K,
             top_k=config.RETRIEVE_WIKI_TOP_K + config.RETRIEVE_SOURCE_TOP_K,
+            space_id=resolved_space_id,
         )
         context = assemble_task_context(
             retrieved.get("wiki_hits") or [],

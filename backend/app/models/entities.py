@@ -47,6 +47,24 @@ class PromptTemplate(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=_utcnow, sa_column_kwargs={"onupdate": _utcnow})
 
 
+class WikiSpace(SQLModel, table=True):
+    """Project-scoped Wiki namespace."""
+
+    __tablename__ = "wiki_spaces"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str
+    slug: str = Field(index=True, unique=True)
+    description: str = ""
+    status: str = Field(default="active", index=True)
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow, sa_column_kwargs={"onupdate": _utcnow})
+
+    __table_args__ = (
+        Index("ix_wiki_spaces_status_updated", "status", "updated_at"),
+    )
+
+
 class Document(SQLModel, table=True):
     __tablename__ = "documents"
 
@@ -56,6 +74,8 @@ class Document(SQLModel, table=True):
     content_type: str
     sha256: str
     status: str
+    # Nullable for legacy fixtures; services resolve it to the default space.
+    space_id: Optional[int] = Field(default=None, foreign_key="wiki_spaces.id", index=True)
     char_count: int = 0
     error_message: Optional[str] = None
     created_at: datetime = Field(default_factory=_utcnow)
@@ -67,6 +87,7 @@ class IngestJob(SQLModel, table=True):
 
     id: Optional[int] = Field(default=None, primary_key=True)
     document_id: int = Field(index=True)
+    space_id: Optional[int] = Field(default=None, foreign_key="wiki_spaces.id", index=True)
     status: str
     # Wiki 2.0 uses stage for the durable, user-visible pipeline phase while
     # status remains for compatibility with the original ingest API.
@@ -90,6 +111,7 @@ class WikiPageRow(SQLModel, table=True):
     title: str
     page_type: str
     source_document_id: Optional[int] = None
+    space_id: Optional[int] = Field(default=None, foreign_key="wiki_spaces.id", index=True)
     tags_json: str = "[]"
     # Optional during the migration window because the old synchronous
     # ingest path still creates rows without a page_key.
@@ -109,9 +131,17 @@ class WikiPageRow(SQLModel, table=True):
         Index(
             "uq_wiki_pages_page_key_not_null",
             "page_key",
+            unique=False,
+        ),
+        Index(
+            "uq_wiki_pages_space_page_key",
+            "space_id",
+            "page_key",
             unique=True,
             sqlite_where=text("page_key IS NOT NULL"),
         ),
+        Index("ix_wiki_pages_space_status", "space_id", "status"),
+        Index("ix_wiki_pages_space_document", "space_id", "source_document_id"),
     )
 
 
@@ -179,6 +209,7 @@ class WikiReviewItem(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     page_id: Optional[int] = Field(default=None, foreign_key="wiki_pages.id", index=True)
     job_id: Optional[int] = Field(default=None, foreign_key="ingest_jobs.id", index=True)
+    space_id: Optional[int] = Field(default=None, foreign_key="wiki_spaces.id", index=True)
     kind: str = "conflict"
     status: str = Field(default="pending", index=True)
     reason: str = ""
@@ -196,6 +227,7 @@ class WikiReviewItem(SQLModel, table=True):
     __table_args__ = (
         Index("ix_wiki_review_items_page_status", "page_id", "status"),
         Index("ix_wiki_review_items_job_status", "job_id", "status"),
+        Index("ix_wiki_review_items_space_status", "space_id", "status"),
     )
 
 
@@ -206,6 +238,7 @@ class SourceChunk(SQLModel, table=True):
 
     id: Optional[int] = Field(default=None, primary_key=True)
     document_id: int = Field(index=True)
+    space_id: Optional[int] = Field(default=None, foreign_key="wiki_spaces.id", index=True)
     chunk_index: int = 0
     title: str = ""
     text: str = ""
@@ -237,6 +270,7 @@ class GenerationTask(SQLModel, table=True):
 
     id: Optional[int] = Field(default=None, primary_key=True)
     requirement_id: int
+    wiki_space_id: Optional[int] = Field(default=None, foreign_key="wiki_spaces.id", index=True)
     status: str
     model_id: Optional[int] = None
     review_model_id: Optional[int] = None

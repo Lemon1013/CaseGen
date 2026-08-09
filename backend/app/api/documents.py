@@ -4,8 +4,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import List
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
-from sqlmodel import Session, col, select
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from sqlmodel import Session, col, or_, select
 
 from app import config
 from app.config import ALLOWED_EXTENSIONS, MAX_UPLOAD_BYTES, ensure_data_dirs
@@ -22,6 +22,7 @@ from app.services.wiki_jobs import (
     job_matches_fingerprint,
     schedule_ingest_job,
 )
+from app.services.wiki_spaces import resolve_space, resolve_space_id, space_scope_clause
 
 router = APIRouter(prefix="/api/documents", tags=["documents"])
 
@@ -29,12 +30,72 @@ router = APIRouter(prefix="/api/documents", tags=["documents"])
 _INGEST_CHAT_FN = None
 
 
+def _space_for_document(
+    session: Session,
+    doc: Document,
+    space_id: int | None = None,
+    *,
+    for_write: bool = False,
+):
+    if doc.space_id is not None:
+        if space_id is not None and int(doc.space_id) != int(space_id):
+            raise HTTPException(status_code=404, detail="Document not found in this Wiki space")
+        try:
+            return resolve_space(session, int(doc.space_id), for_write=for_write)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+    # Legacy NULL rows are owned by the default space; an explicit request
+    # must not be able to adopt them into another namespace.
+    try:
+        space = resolve_space(session, None, for_write=for_write)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if space_id is not None and int(space.id or 0) != int(space_id):
+        raise HTTPException(status_code=404, detail="Document not found in this Wiki space")
+    doc.space_id = space.id
+    session.add(doc)
+    return space
+
+
+def _document_out(session: Session, doc: Document) -> DocumentOut:
+    space = _space_for_document(session, doc)
+    return DocumentOut.model_validate(
+        {
+            **doc.model_dump(),
+            "space_id": int(space.id or 0),
+            "space_name": space.name,
+        }
+    )
+
+
+def _ingest_job_out(session: Session, job: IngestJob) -> IngestJobOut:
+    try:
+        space = resolve_space(session, job.space_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if job.space_id is None:
+        job.space_id = space.id
+        session.add(job)
+    return IngestJobOut.model_validate(
+        {
+            **job.model_dump(),
+            "space_id": int(space.id or 0),
+            "space_name": space.name,
+        }
+    )
+
+
 @router.post("", response_model=DocumentOut)
 async def upload_document(
     file: UploadFile = File(...),
+    space_id: int | None = Form(default=None),
     session: Session = Depends(get_session),
-) -> Document:
+) -> DocumentOut:
     ensure_data_dirs()
+    try:
+        space = resolve_space(session, space_id, for_write=True)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     filename = file.filename or "upload.bin"
     suffix = Path(filename).suffix.lower()
@@ -76,40 +137,56 @@ async def upload_document(
         status=status,
         char_count=char_count,
         error_message=error_message,
+        space_id=space.id,
     )
     session.add(doc)
     session.commit()
     session.refresh(doc)
-    return doc
+    return _document_out(session, doc)
 
 
 @router.get("", response_model=List[DocumentOut])
-def list_documents(session: Session = Depends(get_session)) -> list[Document]:
-    rows = session.exec(select(Document).order_by(Document.id.desc())).all()
-    return list(rows)
+def list_documents(
+    space_id: int | None = Query(default=None),
+    session: Session = Depends(get_session),
+) -> list[DocumentOut]:
+    try:
+        sid = resolve_space_id(session, space_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    rows = session.exec(
+        select(Document)
+        .where(space_scope_clause(session, Document.space_id, sid))
+        .order_by(Document.id.desc())
+    ).all()
+    return [_document_out(session, row) for row in rows]
 
 
 @router.get("/{document_id}", response_model=DocumentOut)
 def get_document(
     document_id: int,
+    space_id: int | None = Query(default=None),
     session: Session = Depends(get_session),
-) -> Document:
+) -> DocumentOut:
     doc = session.get(Document, document_id)
     if doc is None:
         raise HTTPException(status_code=404, detail="Document not found")
-    return doc
+    _space_for_document(session, doc, resolve_space_id(session, space_id))
+    return _document_out(session, doc)
 
 
 @router.get("/{document_id}/preview", response_model=DocumentPreviewOut)
 def preview_document(
     document_id: int,
     max_chars: int = Query(50000, ge=500, le=200000),
+    space_id: int | None = Query(default=None),
     session: Session = Depends(get_session),
 ) -> DocumentPreviewOut:
     """Parse the immutable upload on demand for quality display and preview."""
     doc = session.get(Document, document_id)
     if doc is None:
         raise HTTPException(status_code=404, detail="Document not found")
+    _space_for_document(session, doc, resolve_space_id(session, space_id))
     stored = Path((doc.stored_path or "").replace("\\", "/"))
     path = stored if stored.is_absolute() else config.DATA_DIR / stored
     try:
@@ -153,6 +230,7 @@ def start_ingest(
     document_id: int,
     session: Session = Depends(get_session),
     force: bool = Query(False, description="Force a new ingest after a previous terminal job"),
+    space_id: int | None = Query(default=None),
 ) -> IngestJobOut:
     doc = session.get(Document, document_id)
     if doc is None:
@@ -160,6 +238,9 @@ def start_ingest(
     # The SQLite row is the durable queue.  A second request for the same
     # document returns the existing active job and cannot start concurrent
     # page replacement/LLM work.
+    space = _space_for_document(
+        session, doc, resolve_space_id(session, space_id), for_write=True
+    )
     active = session.exec(
         select(IngestJob)
         .where(
@@ -169,7 +250,7 @@ def start_ingest(
         .order_by(IngestJob.id.desc())
     ).first()
     if active is not None:
-        return active
+        return _ingest_job_out(session, active)
 
     fingerprint = build_ingest_fingerprint(session, doc)
     if not force:
@@ -182,10 +263,10 @@ def start_ingest(
             .order_by(IngestJob.id.desc())
         ).first()
         if completed is not None and job_matches_fingerprint(completed, fingerprint):
-            return completed
-
+            return _ingest_job_out(session, completed)
     job = IngestJob(
         document_id=document_id,
+        space_id=space.id,
         status="queued",
         stage="queued",
         progress=0,
@@ -212,34 +293,46 @@ def start_ingest(
         )
     else:
         schedule_ingest_job(job.id)
-    return job
+    return _ingest_job_out(session, job)
 
 
 @router.get("/{document_id}/chunks", response_model=List[SourceChunkOut])
 def list_document_chunks(
     document_id: int,
+    space_id: int | None = Query(default=None),
     session: Session = Depends(get_session),
 ) -> list[SourceChunk]:
     doc = session.get(Document, document_id)
     if doc is None:
         raise HTTPException(status_code=404, detail="Document not found")
+    space = _space_for_document(session, doc, resolve_space_id(session, space_id))
     rows = session.exec(
         select(SourceChunk)
-        .where(SourceChunk.document_id == document_id)
+        .where(
+            SourceChunk.document_id == document_id,
+            space_scope_clause(session, SourceChunk.space_id, int(space.id or 0)),
+        )
         .order_by(col(SourceChunk.chunk_index).asc())
     ).all()
+    for row in rows:
+        if row.space_id is None:
+            row.space_id = space.id
     return list(rows)
 
 
 @router.post("/{document_id}/rechunk", response_model=RechunkOut)
 def rechunk_document(
     document_id: int,
+    space_id: int | None = Query(default=None),
     session: Session = Depends(get_session),
 ) -> RechunkOut:
     """Rebuild verbatim source chunks without re-running LLM wiki compile."""
     doc = session.get(Document, document_id)
     if doc is None:
         raise HTTPException(status_code=404, detail="Document not found")
+    space = _space_for_document(
+        session, doc, resolve_space_id(session, space_id), for_write=True
+    )
     stored = (doc.stored_path or "").replace("\\", "/")
     path = Path(stored)
     if not path.is_absolute():
@@ -256,6 +349,7 @@ def rechunk_document(
         parsed,
         chunk_chars=config.SOURCE_CHUNK_CHARS,
         overlap_chars=config.SOURCE_CHUNK_OVERLAP,
+        space_id=space.id,
     )
     session.commit()
     return RechunkOut(document_id=document_id, chunk_count=len(rows))

@@ -14,6 +14,7 @@ from app.models.entities import (
     WikiPageRow,
     WikiPageSource,
     WikiReviewItem,
+    WikiSpace,
 )
 
 
@@ -95,6 +96,7 @@ def test_init_db_creates_wiki2_columns_tables_and_indexes(tmp_app_data):
         "revision",
         "aliases_json",
         "content_hash",
+        "space_id",
     }.issubset(_sqlite_columns("wiki_pages"))
     assert {
         "stage",
@@ -103,6 +105,7 @@ def test_init_db_creates_wiki2_columns_tables_and_indexes(tmp_app_data):
         "model_ref",
         "prompt_version_ref",
         "cancel_requested",
+        "space_id",
     }.issubset(_sqlite_columns("ingest_jobs"))
 
     with get_engine().connect() as conn:
@@ -125,8 +128,10 @@ def test_init_db_creates_wiki2_columns_tables_and_indexes(tmp_app_data):
         "wiki_page_sources",
         "wiki_page_revisions",
         "wiki_review_items",
+        "wiki_spaces",
     }.issubset(tables)
     assert "uq_wiki_pages_page_key_not_null" in page_indexes
+    assert "uq_wiki_pages_space_page_key" in page_indexes
     assert {"ix_ingest_jobs_status", "ix_ingest_jobs_stage"}.issubset(job_indexes)
 
 
@@ -145,12 +150,32 @@ def test_old_schema_migrates_without_moving_page_or_losing_identity(tmp_app_data
         assert row.page_key == "legacy.page.7"
         assert row.status == "published"
         assert row.revision == 1
+        assert row.space_id is not None
+        assert session.get(WikiSpace, row.space_id).slug == "default"
 
     backup_path = config.DB_PATH.with_name(
         config.DB_PATH.name + ".wiki2-pre-migration.bak"
     )
     assert backup_path.exists()
     assert backup_path.read_bytes()
+
+
+def test_legacy_markdown_is_moved_after_database_path_update(tmp_app_data):
+    db_path = tmp_app_data / "meta" / "app.db"
+    _create_legacy_database(db_path, page_id=17)
+    old_path = tmp_app_data / "wiki" / "pages" / "legacy-page.md"
+    old_path.parent.mkdir(parents=True, exist_ok=True)
+    old_path.write_text("# 旧页面\n\n迁移内容", encoding="utf-8")
+
+    init_db()
+
+    new_path = tmp_app_data / "wiki" / "spaces" / "default" / "pages" / "legacy-page.md"
+    with Session(get_engine()) as session:
+        row = session.get(WikiPageRow, 17)
+        assert row is not None
+        assert row.path == "spaces/default/pages/legacy-page.md"
+    assert not old_path.exists()
+    assert new_path.read_text(encoding="utf-8") == "# 旧页面\n\n迁移内容"
 
 
 def test_wiki_migration_is_idempotent_and_backup_is_not_replaced(tmp_app_data):

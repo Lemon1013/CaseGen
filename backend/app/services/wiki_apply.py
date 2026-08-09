@@ -251,10 +251,12 @@ def _queue_review(
     reason: str,
     risks: list[str],
     candidate: Mapping[str, Any] | None = None,
+    space_id: int | None = None,
 ) -> int:
     item = WikiReviewItem(
         page_id=page_id,
         job_id=job_id,
+        space_id=space_id,
         kind="merge" if operation == "merge" else (risks[0] if risks else "needs_review"),
         reason=reason or ", ".join(risks) or f"{operation} requires review",
         candidate_frontmatter_json=json.dumps(
@@ -281,6 +283,7 @@ def queue_merge_review(
     target_page_key: str,
     job_id: int | None = None,
     reason: str = "duplicate pages require reviewed merge",
+    space_id: int | None = None,
 ) -> int:
     return _queue_review(
         session,
@@ -291,6 +294,7 @@ def queue_merge_review(
         reason=reason,
         risks=["merge"],
         candidate={"target_page_key": validate_page_key(target_page_key)},
+        space_id=space_id,
     )
 
 
@@ -302,10 +306,11 @@ def apply_wiki_plan(
     document_id: int,
     job_id: int | None = None,
     max_pages: int = MAX_APPLY_PAGES,
+    space_id: int | None = None,
 ) -> WikiApplyResult:
     """Apply safe candidates and queue high-risk updates for review."""
 
-    repository = WikiRepository(session)
+    repository = WikiRepository(session, space_id=space_id) if space_id is not None else WikiRepository(session)
     existing_rows = repository.list_rows(include_archived=True)
     existing_keys = {row.page_key for row in existing_rows if row.page_key}
     parsed_plan = coerce_step_a_plan(plan, existing_page_keys=existing_keys)
@@ -361,6 +366,7 @@ def apply_wiki_plan(
                 "claim_ids": item.claim_ids,
                 "severity": item.severity,
             },
+            space_id=repository.space_id,
         )
         result.review_item_ids.append(review_id)
     operation_keys = {operation.page_key for operation in operations}
@@ -376,6 +382,7 @@ def apply_wiki_plan(
             reason=contradiction.description,
             risks=["contradiction"],
             candidate={"claim_ids": contradiction.claim_ids},
+            space_id=repository.space_id,
         )
         result.review_item_ids.append(review_id)
     for operation in operations:
@@ -399,6 +406,7 @@ def apply_wiki_plan(
                     job_id=job_id,
                     reason=f"existing page cannot be safely read: {exc}",
                     risks=["legacy_or_corrupt_page"],
+                    space_id=repository.space_id,
                 )
                 result.review_item_ids.append(review_id)
                 continue
@@ -427,6 +435,7 @@ def apply_wiki_plan(
                     reason=operation.reason,
                     risks=risks,
                     candidate=review_candidate,
+                    space_id=repository.space_id,
                 )
                 result.review_item_ids.append(review_id)
                 continue

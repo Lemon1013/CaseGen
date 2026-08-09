@@ -21,10 +21,17 @@ from pathlib import Path
 from typing import Any, Iterator, Mapping
 
 from sqlalchemy.exc import IntegrityError
-from sqlmodel import Session, select
+from sqlmodel import Session, or_, select
 
 from app import config
-from app.models.entities import WikiPageRevision, WikiPageRow, WikiPageSource
+from app.models.entities import (
+    Document,
+    IngestJob,
+    WikiPageRevision,
+    WikiPageRow,
+    WikiPageSource,
+    WikiSpace,
+)
 from app.services.wiki_schema import (
     WikiFrontmatter,
     WikiPage,
@@ -38,6 +45,7 @@ from app.services.wiki_staging import (
     WikiStaging,
     relative_page_path,
 )
+from app.services.wiki_spaces import ensure_space_dirs, resolve_space, space_root
 
 
 class WikiRepositoryError(RuntimeError):
@@ -106,6 +114,10 @@ class WikiPageRecord:
         return self.row.id
 
     @property
+    def space_id(self) -> int | None:
+        return self.row.space_id
+
+    @property
     def raw_content(self) -> str:
         return self.content
 
@@ -131,15 +143,16 @@ def _utcnow() -> datetime:
 
 
 @contextmanager
-def page_key_lock(page_key: str) -> Iterator[None]:
+def page_key_lock(page_key: str, space_id: int | None = None) -> Iterator[None]:
     """Serialize writes for one stable key within this Python process."""
 
     key = validate_page_key(page_key)
+    lock_key = f"space:{int(space_id)}:{key}" if space_id is not None else key
     with _LOCK_REGISTRY_GUARD:
-        entry = _PAGE_LOCKS.get(key)
+        entry = _PAGE_LOCKS.get(lock_key)
         if entry is None:
             entry = _LockEntry(lock=threading.RLock())
-            _PAGE_LOCKS[key] = entry
+            _PAGE_LOCKS[lock_key] = entry
         entry.users += 1
 
     entry.lock.acquire()
@@ -149,8 +162,8 @@ def page_key_lock(page_key: str) -> Iterator[None]:
         entry.lock.release()
         with _LOCK_REGISTRY_GUARD:
             entry.users -= 1
-            if entry.users == 0 and _PAGE_LOCKS.get(key) is entry:
-                del _PAGE_LOCKS[key]
+            if entry.users == 0 and _PAGE_LOCKS.get(lock_key) is entry:
+                del _PAGE_LOCKS[lock_key]
 
 
 def _wiki_root() -> Path:
@@ -167,10 +180,15 @@ def _assert_formal_path(path: Path) -> Path:
     return resolved
 
 
-def page_path(page_type: str, page_key: str) -> Path:
+def page_path(
+    page_type: str,
+    page_key: str,
+    *,
+    space_slug: str | None = None,
+) -> Path:
     """Resolve a page identity to a safe absolute path below ``WIKI_DIR``."""
 
-    relative = relative_page_path(page_type, page_key)
+    relative = relative_page_path(page_type, page_key, space_slug=space_slug)
     return _assert_formal_path(_wiki_root() / relative)
 
 
@@ -337,20 +355,77 @@ def _record_from_page(
 class WikiRepository:
     """Small page repository used by the later governed ingest workflow."""
 
-    def __init__(self, session: Session) -> None:
+    def __init__(
+        self,
+        session: Session,
+        space_id: int | None = None,
+        *,
+        space_slug: str | None = None,
+    ) -> None:
         self.session = session
+        # No-argument construction remains a compatibility facade for old
+        # tests/fixtures.  Production ingest/review paths pass space_id and
+        # therefore use the per-space path layout.
+        if space_slug is not None:
+            row = session.exec(select(WikiSpace).where(WikiSpace.slug == space_slug)).first()
+            if row is None:
+                raise ValueError(f"Wiki space not found: {space_slug}")
+            self.space = row
+            self.space_id = int(row.id or 0)
+            self._compat_legacy_paths = False
+        else:
+            self.space = resolve_space(session, space_id)
+            self.space_id = int(self.space.id or 0)
+            self._compat_legacy_paths = space_id is None
+        # Rows created by pre-space fixtures have NULL space_id.  Treat NULL
+        # as default only; never broaden a non-default space query.
+        self._include_legacy_null_space = self.space.slug == "default"
+        ensure_space_dirs(self.space)
 
     def _find_row(self, page_key: str) -> WikiPageRow | None:
         key = validate_page_key(page_key)
-        return self.session.exec(
-            select(WikiPageRow).where(WikiPageRow.page_key == key)
-        ).first()
+        statement = select(WikiPageRow).where(WikiPageRow.page_key == key)
+        if self._compat_legacy_paths or self._include_legacy_null_space:
+            statement = statement.where(
+                or_(WikiPageRow.space_id == self.space_id, WikiPageRow.space_id.is_(None))
+            )
+        else:
+            statement = statement.where(WikiPageRow.space_id == self.space_id)
+        return self.session.exec(statement).first()
+
+    def _formal_path(self, row: WikiPageRow) -> Path:
+        if self._compat_legacy_paths and row.path and not str(row.path).startswith("spaces/"):
+            candidate = Path(row.path)
+            if not candidate.is_absolute():
+                candidate = config.WIKI_DIR / candidate
+            return _assert_formal_path(candidate)
+        return page_path(row.page_type, row.page_key or "", space_slug=self.space.slug)
+
+    def _validate_space_links(self, page: WikiPage, job_id: int | None) -> None:
+        for source in page.frontmatter.sources:
+            document = self.session.get(Document, source.document_id)
+            if document is None:
+                raise ValueError(f"source document not found: {source.document_id}")
+            if document.space_id is None:
+                document.space_id = self.space_id
+                self.session.add(document)
+            if int(document.space_id) != self.space_id:
+                raise ValueError("source document belongs to another Wiki space")
+        if job_id is not None:
+            job = self.session.get(IngestJob, job_id)
+            if job is None:
+                raise ValueError(f"ingest job not found: {job_id}")
+            if job.space_id is None:
+                job.space_id = self.space_id
+                self.session.add(job)
+            if int(job.space_id) != self.space_id:
+                raise ValueError("ingest job belongs to another Wiki space")
 
     def _read_row(self, row: WikiPageRow) -> WikiPageRecord:
         if row.id is None or not row.page_key:
             raise WikiPageCorruptError("Wiki page row has no stable page_key")
         try:
-            path = page_path(row.page_type, row.page_key)
+            path = self._formal_path(row)
         except ValueError as exc:
             raise WikiPageCorruptError(
                 f"Wiki page row has an invalid type/key: {row.page_type}/{row.page_key}"
@@ -392,6 +467,12 @@ class WikiRepository:
         """List validated pages in stable key order."""
 
         statement = select(WikiPageRow)
+        if self._compat_legacy_paths or self._include_legacy_null_space:
+            statement = statement.where(
+                or_(WikiPageRow.space_id == self.space_id, WikiPageRow.space_id.is_(None))
+            )
+        else:
+            statement = statement.where(WikiPageRow.space_id == self.space_id)
         if page_type is not None:
             # Path validation also rejects old, unsupported page types here.
             if page_type not in PAGE_TYPE_DIRECTORIES:
@@ -418,6 +499,12 @@ class WikiRepository:
         """List metadata without opening files (useful for maintenance jobs)."""
 
         statement = select(WikiPageRow)
+        if self._compat_legacy_paths or self._include_legacy_null_space:
+            statement = statement.where(
+                or_(WikiPageRow.space_id == self.space_id, WikiPageRow.space_id.is_(None))
+            )
+        else:
+            statement = statement.where(WikiPageRow.space_id == self.space_id)
         if page_type is not None:
             if page_type not in PAGE_TYPE_DIRECTORIES:
                 raise ValueError(f"unsupported Wiki page type: {page_type!r}")
@@ -517,6 +604,8 @@ class WikiRepository:
         job_id: int | None,
         reason: str,
     ) -> WikiPageRecord:
+        if self.space.status != "active":
+            raise ValueError("Archived Wiki spaces are read-only")
         if operation not in {"create", "update", "rollback", "archive"}:
             raise ValueError(f"unsupported Wiki repository operation: {operation}")
         if candidate is not None:
@@ -526,7 +615,10 @@ class WikiRepository:
         else:
             raise ValueError("page_key is required when no candidate page is provided")
 
-        with page_key_lock(key):
+        if candidate is not None:
+            self._validate_space_links(candidate, job_id)
+
+        with page_key_lock(key, self.space_id):
             existing = self._find_row(key)
             if operation == "create":
                 if existing is not None:
@@ -560,7 +652,18 @@ class WikiRepository:
                     )
                 target_revision = prepared.frontmatter.revision
 
-            target = page_path(prepared.type, prepared.page_key)
+            if self._compat_legacy_paths:
+                target = (
+                    page_path(prepared.type, prepared.page_key)
+                    if operation == "create"
+                    else self._formal_path(old_row)  # type: ignore[arg-type]
+                )
+            else:
+                target = page_path(
+                    prepared.type,
+                    prepared.page_key,
+                    space_slug=self.space.slug,
+                )
             snapshot = _snapshot_file(target)
             if operation == "create" and snapshot.exists:
                 raise WikiPageFileError(
@@ -571,7 +674,9 @@ class WikiRepository:
 
             file_applied = False
             try:
-                with WikiStaging() as staging:
+                with WikiStaging(
+                    space_slug=None if self._compat_legacy_paths else self.space.slug
+                ) as staging:
                     staged = staging.stage_page(prepared)
                     # ``stage_page`` already reparses; this explicit second
                     # call keeps the apply boundary obvious and catches a
@@ -588,6 +693,7 @@ class WikiRepository:
                             path=staged.relative_path,
                             title=prepared.title,
                             page_type=prepared.type,
+                            space_id=self.space_id,
                             source_document_id=(
                                 prepared.frontmatter.sources[0].document_id
                                 if prepared.frontmatter.sources
@@ -609,6 +715,7 @@ class WikiRepository:
                         row.path = staged.relative_path
                         row.title = prepared.title
                         row.page_type = prepared.type
+                        row.space_id = self.space_id
                         row.source_document_id = (
                             prepared.frontmatter.sources[0].document_id
                             if prepared.frontmatter.sources
