@@ -112,6 +112,62 @@ def test_plan_rejects_invalid_key_missing_anchor_and_unknown_target():
         )
 
 
+def test_plan_allows_references_to_pages_planned_in_this_ingest():
+    key = "rule.order.planned"
+    current = validate_step_a_plan(
+        {
+            "related_pages": [{"page_key": key}],
+            "page_operations": [
+                {"op": "create", "page_key": key, "source_anchors": [_anchor()]}
+            ],
+        },
+        existing_page_keys=set(),
+    )
+    assert current.related_pages[0].page_key == key
+
+    later = validate_step_a_plan(
+        {"related_pages": [{"page_key": key}]},
+        existing_page_keys=set(),
+        reference_page_keys={key},
+    )
+    assert later.related_pages[0].page_key == key
+
+    with pytest.raises(PlanValidationError, match="update target page does not exist"):
+        validate_step_a_plan(
+            {
+                "page_operations": [
+                    {"op": "update", "page_key": key, "source_anchors": [_anchor()]}
+                ]
+            },
+            existing_page_keys=set(),
+            reference_page_keys={key},
+        )
+
+
+def test_plan_drops_unknown_auxiliary_page_references():
+    plan = validate_step_a_plan(
+        {
+            "related_pages": [{"page_key": "rule.order.unknown"}],
+            "contradictions": [
+                {
+                    "page_key": "rule.order.unknown",
+                    "description": "可能冲突",
+                }
+            ],
+            "review_items": [
+                {
+                    "page_key": "rule.order.unknown",
+                    "reason": "需要复核",
+                }
+            ],
+        },
+        existing_page_keys={"rule.order.existing"},
+    )
+    assert plan.related_pages == []
+    assert plan.contradictions[0].page_key is None
+    assert plan.review_items[0].page_key is None
+
+
 def test_plan_rejects_unknown_fields_and_partially_invalid_anchors():
     with pytest.raises(PlanValidationError, match="unknown Step A fields"):
         coerce_step_a_plan(
@@ -121,6 +177,84 @@ def test_plan_rejects_unknown_fields_and_partially_invalid_anchors():
                 "unexpected": "must not be ignored",
             }
         )
+
+
+def test_anchor_drops_unverified_clause_when_chunk_is_valid():
+    plan = validate_step_a_plan(
+        {
+            "page_operations": [
+                {
+                    "op": "create",
+                    "page_key": "rule.order.chunk-backed",
+                    "source_anchors": [
+                        {"chunk_ids": [7], "clause_ids": ["3.5.2", "9.9.9"]}
+                    ],
+                }
+            ]
+        },
+        source_windows=[
+            {"chunk_ids": [7], "clause_ids": ["3.5.2"], "start": 0, "end": 20}
+        ],
+    )
+    anchor = plan.page_operations[0].source_anchors[0]
+    assert anchor.chunk_ids == [7]
+    assert anchor.clause_ids == ["3.5.2"]
+
+    with pytest.raises(PlanValidationError, match="9.9.9"):
+        validate_step_a_plan(
+            {
+                "claims": [
+                    {
+                        "statement": "条款结论",
+                        "source_anchors": [{"clause_ids": ["9.9.9"]}],
+                    }
+                ]
+            },
+            source_windows=[{"clause_ids": ["3.5.2"], "start": 0, "end": 20}],
+        )
+
+
+def test_anchor_drops_invalid_auxiliary_locations_when_chunk_is_valid():
+    plan = validate_step_a_plan(
+        {
+            "page_operations": [
+                {
+                    "op": "create",
+                    "page_key": "rule.order.chunk-location",
+                    "source_anchors": [
+                        {
+                            "chunk_ids": [7],
+                            "window_index": 9,
+                            "section": "不存在章节",
+                            "page_start": 99,
+                            "page_end": 100,
+                            "start_char": 50,
+                            "end_char": 60,
+                        }
+                    ],
+                }
+            ]
+        },
+        source_windows=[
+            {
+                "index": 1,
+                "chunk_ids": [7],
+                "section": "真实章节",
+                "page_start": 1,
+                "page_end": 2,
+                "start": 0,
+                "end": 20,
+            }
+        ],
+    )
+    anchor = plan.page_operations[0].source_anchors[0]
+    assert anchor.chunk_ids == [7]
+    assert anchor.window_index is None
+    assert anchor.section is None
+    assert anchor.page_start is None
+    assert anchor.page_end is None
+    assert anchor.start_char is None
+    assert anchor.end_char is None
     with pytest.raises(PlanValidationError, match="chunk"):
         validate_step_a_plan(
             {
@@ -159,6 +293,37 @@ def test_merge_uses_semantic_dedupe_and_tail_quota():
     statements = [claim.statement for claim in merged.claims]
     assert len(statements) == 80
     assert any(statement == "尾部规则 69" for statement in statements)
+
+
+def test_merge_bounds_operations_and_removes_dangling_related_pages():
+    plans = []
+    all_keys = {f"rule.order.topic-{index}" for index in range(10)}
+    for index in range(10):
+        key = f"rule.order.topic-{index}"
+        plans.append(
+            {
+                "related_pages": [{"page_key": key}],
+                "page_operations": [
+                    {
+                        "op": "create",
+                        "page_key": key,
+                        "source_anchors": [_anchor()],
+                    }
+                ],
+            }
+        )
+
+    merged = merge_step_a_plans(
+        plans,
+        existing_page_keys=set(),
+        reference_page_keys=all_keys,
+        max_operations=4,
+    )
+    kept_keys = {item.page_key for item in merged.page_operations}
+    assert len(kept_keys) == 4
+    assert {item.page_key for item in merged.related_pages}.issubset(kept_keys)
+    assert "rule.order.topic-0" in kept_keys
+    assert "rule.order.topic-9" in kept_keys
 
 
 def test_legacy_merge_and_digest_keep_tail_content():

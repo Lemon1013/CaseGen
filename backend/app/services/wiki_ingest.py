@@ -151,6 +151,28 @@ def _default_chat_fn(session: Session) -> ChatFn:
     if model is None:
         raise ValueError("No ModelConfig available for LLM ingest")
 
+    thinking_mode = str(config.LLM_WIKI_THINKING or "auto").lower()
+    if thinking_mode not in {"auto", "enabled", "disabled"}:
+        raise ValueError(
+            "LLM_WIKI_THINKING must be auto, enabled, or disabled"
+        )
+    if thinking_mode == "enabled":
+        use_thinking: bool | None = True
+    elif thinking_mode == "disabled":
+        use_thinking = False
+    elif model.model_name.lower().startswith("deepseek-v4-"):
+        # DeepSeek V4 defaults to thinking mode. Structured Wiki extraction
+        # can otherwise spend the entire output budget on reasoning_content
+        # and never emit the required JSON body.
+        use_thinking = False
+    else:
+        use_thinking = None
+    response_format = (
+        {"type": "json_object"}
+        if model.model_name.lower().startswith("deepseek-v4-")
+        else None
+    )
+
     def _chat(messages: list[dict[str, str]]) -> str:
         content, _usage = chat_completion(
             base_url=model.base_url,
@@ -158,6 +180,10 @@ def _default_chat_fn(session: Session) -> ChatFn:
             model=model.model_name,
             messages=messages,
             timeout=float(config.LLM_WIKI_TIMEOUT_SEC),
+            stream=config.LLM_WIKI_STREAM,
+            max_tokens=config.LLM_WIKI_MAX_TOKENS,
+            thinking=use_thinking,
+            response_format=response_format,
             # Analyze windows already own their retry policy.  Retrying again
             # inside each HTTP call multiplies attempts and can make a queued
             # job appear stuck for many minutes.  Wiki write falls back to a
