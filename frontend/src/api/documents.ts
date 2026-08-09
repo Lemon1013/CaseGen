@@ -114,3 +114,7 @@ export function getIngestJob(id: number) {
 export function cancelIngestJob(id: number) {
   return api<IngestJob>(`/api/ingest-jobs/${id}/cancel`, { method: 'POST' })
 }
+
+export function retryFailedWindows(id: number) {
+  return api<IngestJob>(`/api/ingest-jobs/${id}/retry-failed-windows`, { method: 'POST' })
+}

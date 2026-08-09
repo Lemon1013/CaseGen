@@ -177,7 +177,7 @@ def start_ingest(
             select(IngestJob)
             .where(
                 IngestJob.document_id == document_id,
-                IngestJob.status == "success",
+                IngestJob.status.in_(["success", "success_with_warnings"]),
             )
             .order_by(IngestJob.id.desc())
         ).first()

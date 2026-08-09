@@ -22,6 +22,17 @@ class ModelConfig(SQLModel, table=True):
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow, sa_column_kwargs={"onupdate": _utcnow})
 
+    __table_args__ = (
+        # Only one model may be marked as the runtime default.  SQLite's
+        # partial unique index still permits any number of non-default models.
+        Index(
+            "uq_models_single_default",
+            "is_default",
+            unique=True,
+            sqlite_where=text("is_default = 1"),
+        ),
+    )
+
 
 class PromptTemplate(SQLModel, table=True):
     __tablename__ = "prompt_templates"

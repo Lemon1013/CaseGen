@@ -18,9 +18,12 @@ from app.services.wiki_candidates import (
 from app.services.wiki_pages_parse import parse_json_flexible
 from app.services.wiki_plan import (
     PlanValidationError,
+    ReviewItem,
+    SourceSummary,
     StepAPlan,
     coerce_step_a_plan,
     merge_step_a_plans,
+    normalise_step_a_output,
     plan_to_legacy_analysis,
 )
 
@@ -37,6 +40,14 @@ _WINDOW_SYSTEM_APPENDIX = (
     "contradictions, page_operations, review_items；page_operations 只能使用 "
     "create/update/noop，不能使用 merge。digest_update 只总结当前窗口新增事实；"
     "不要输出旧版兼容字段或其他额外字段。"
+)
+
+_REPAIR_SYSTEM_APPENDIX = (
+    "\n\n【Step A 修复】上一轮输出已被后端校验拒绝。"
+    "请只修复 JSON 结构，不补充当前窗口之外的事实。"
+    "顶层必须是对象；page_operations 的每项只能包含 op、page_key、reason、"
+    "source_anchors、page_type、claim_ids、confidence；不要把页面正文对象放入 page_operations。"
+    "只输出合法 JSON，不要 Markdown 或解释。"
 )
 
 
@@ -424,16 +435,38 @@ def _window_anchor_context(window: Mapping[str, Any], source_windows: Iterable[A
     base = int(window.get("start", 0) or 0)
     end = int(window.get("end", 0) or 0)
     result: list[dict[str, Any]] = []
+    anchor_fields = {
+        "document_id",
+        "source_path",
+        "chunk_id",
+        "chunk_ids",
+        "page_start",
+        "page_end",
+        "section",
+        "clause_id",
+        "clause_ids",
+        "window_index",
+        "start_char",
+        "end_char",
+    }
     for raw in source_windows or ():
-        item = dict(raw) if isinstance(raw, Mapping) else {}
-        start = int(item.get("start", item.get("start_char", 0)) or 0)
-        finish = int(item.get("end", item.get("end_char", 0)) or 0)
+        original = dict(raw) if isinstance(raw, Mapping) else {}
+        start = int(original.get("start", original.get("start_char", 0)) or 0)
+        finish = int(original.get("end", original.get("end_char", 0)) or 0)
         if finish > base and start < end:
+            item = {key: original[key] for key in anchor_fields if key in original}
+            if "start_char" not in item and "start" in original:
+                item["start_char"] = original["start"]
+            if "end_char" not in item and "end" in original:
+                item["end_char"] = original["end"]
             item.setdefault("window_index", window.get("index"))
             result.append(item)
     if result:
         return result
-    return [{"index": window.get("index"), "start": base, "end": end}]
+    fallback = {"window_index": window.get("index")}
+    if end > base:
+        fallback.update({"start_char": base, "end_char": end})
+    return [fallback]
 
 
 def _plan_analysis(
@@ -445,8 +478,139 @@ def _plan_analysis(
     reference_page_keys: Iterable[str] | None,
     source_length: int,
 ) -> StepAPlan:
+    plan, _warnings = _plan_analysis_details(
+        raw,
+        source_path=source_path,
+        source_windows=source_windows,
+        existing_page_keys=existing_page_keys,
+        reference_page_keys=reference_page_keys,
+        source_length=source_length,
+    )
+    return plan
+
+
+def _plan_analysis_details(
+    raw: Mapping[str, Any],
+    *,
+    source_path: str,
+    source_windows: Iterable[Any] | None,
+    existing_page_keys: Iterable[str] | None,
+    reference_page_keys: Iterable[str] | None,
+    source_length: int,
+) -> tuple[StepAPlan, list[str]]:
+    normalised, warnings = normalise_step_a_output(
+        raw,
+        source_path=source_path,
+        existing_page_keys=existing_page_keys,
+    )
     try:
         return coerce_step_a_plan(
+            normalised,
+            source_path=source_path,
+            source_windows=source_windows,
+            existing_page_keys=existing_page_keys,
+            reference_page_keys=reference_page_keys,
+            source_length=source_length,
+        ), warnings
+    except PlanValidationError as exc:
+        raise LLMError(f"invalid Wiki Step A plan: {exc}") from exc
+
+
+def _degraded_window_plan(
+    window: Mapping[str, Any],
+    *,
+    source_path: str,
+    filename: str,
+    source_windows: Iterable[Any] | None,
+    reason: str,
+) -> StepAPlan:
+    """Keep a failed window traceable without inventing a Wiki mutation."""
+
+    anchors = _window_anchor_context(window, source_windows)
+    title = filename or source_path or "来源文档"
+    return StepAPlan(
+        source_summary=SourceSummary(
+            title=title,
+            summary=f"窗口 {window.get('index')} 未完成模型分析，原文已保留待人工复核。",
+            source_path=source_path or None,
+            filename=filename or None,
+        ),
+        review_items=[
+            ReviewItem(
+                kind="window_analysis_failed",
+                reason=(
+                    f"窗口 {window.get('index')}/{window.get('total')} 分析失败："
+                    f"{_head_tail(reason, 500)}"
+                ),
+                source_anchors=anchors,
+                severity="high",
+            )
+        ],
+    )
+
+
+def _unsafe_normalisation_reason(warnings: Iterable[str]) -> str | None:
+    unsafe = [str(item) for item in warnings if "已忽略" in str(item)]
+    if not unsafe:
+        return None
+    return "模型输出包含无法安全转换的字段：" + "；".join(unsafe[:4])
+
+
+def _repair_step_a_output(
+    *,
+    chat_fn: ChatFn,
+    system_prompt: str,
+    raw: Mapping[str, Any],
+    error: str,
+    window: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Ask the model to repair only a malformed Step A envelope."""
+
+    raw_json = json.dumps(raw, ensure_ascii=False, indent=2)
+    repair_cap = int(getattr(config, "WIKI_ANALYZE_REPAIR_CONTEXT_CHARS", 16000))
+    user_content = (
+        f"# 窗口 {window.get('index')}/{window.get('total')} 的结构修复\n"
+        f"# 校验错误\n{_head_tail(error, 3000)}\n\n"
+        f"# 原始 JSON（仅修复结构，不扩写事实）\n{_head_tail(raw_json, repair_cap)}"
+    )
+    repaired = _analyze_once(
+        chat_fn=chat_fn,
+        system_prompt=(system_prompt or "") + _REPAIR_SYSTEM_APPENDIX,
+        user_content=user_content,
+        # The outer recovery loop owns repair retries.  Keeping this call to a
+        # single attempt prevents one configured repair from multiplying into
+        # several hidden HTTP requests.
+        retries=0,
+    )
+    return repaired
+
+
+def _analyse_window_with_recovery(
+    *,
+    chat_fn: ChatFn,
+    system_prompt: str,
+    user_content: str,
+    window: Mapping[str, Any],
+    source_path: str,
+    filename: str,
+    source_windows: Iterable[Any] | None,
+    existing_page_keys: Iterable[str] | None,
+    reference_page_keys: Iterable[str] | None,
+    source_length: int,
+) -> tuple[StepAPlan, dict[str, Any], list[str], str | None]:
+    """Analyze one window, repair once, then degrade instead of aborting."""
+
+    raw: dict[str, Any] = {}
+    last_plan: StepAPlan | None = None
+    last_warnings: list[str] = []
+    last_raw: dict[str, Any] = {}
+    try:
+        raw = _analyze_once(
+            chat_fn=chat_fn,
+            system_prompt=system_prompt,
+            user_content=user_content,
+        )
+        plan, warnings = _plan_analysis_details(
             raw,
             source_path=source_path,
             source_windows=source_windows,
@@ -454,8 +618,60 @@ def _plan_analysis(
             reference_page_keys=reference_page_keys,
             source_length=source_length,
         )
-    except PlanValidationError as exc:
-        raise LLMError(f"invalid Wiki Step A plan: {exc}") from exc
+        last_plan = plan
+        last_warnings = list(warnings)
+        last_raw = raw
+        unsafe_reason = _unsafe_normalisation_reason(warnings)
+        if unsafe_reason:
+            raise LLMError(unsafe_reason)
+        return plan, raw, warnings, None
+    except (LLMError, ValueError, TypeError) as first_error:
+        last_error = str(first_error)
+        for _ in range(max(0, int(getattr(config, "WIKI_ANALYZE_REPAIR_RETRIES", 1)))):
+            try:
+                repaired = _repair_step_a_output(
+                    chat_fn=chat_fn,
+                    system_prompt=system_prompt,
+                    raw=raw,
+                    error=last_error,
+                    window=window,
+                )
+                plan, warnings = _plan_analysis_details(
+                    repaired,
+                    source_path=source_path,
+                    source_windows=source_windows,
+                    existing_page_keys=existing_page_keys,
+                    reference_page_keys=reference_page_keys,
+                    source_length=source_length,
+                )
+                last_plan = plan
+                last_warnings = list(warnings)
+                last_raw = repaired
+                unsafe_reason = _unsafe_normalisation_reason(warnings)
+                if unsafe_reason:
+                    raise LLMError(unsafe_reason)
+                warnings.insert(0, "模型输出经过结构修复后通过校验")
+                return plan, repaired, warnings, None
+            except (LLMError, ValueError, TypeError) as repair_error:
+                last_error = str(repair_error)
+        if last_plan is not None and _unsafe_normalisation_reason(last_warnings):
+            last_plan.review_items.append(
+                ReviewItem(
+                    kind="unsafe_model_output",
+                    reason=_head_tail(last_error, 800),
+                    source_anchors=_window_anchor_context(window, source_windows),
+                    severity="high",
+                )
+            )
+            return last_plan, last_raw, last_warnings, last_error
+        degraded = _degraded_window_plan(
+            window,
+            source_path=source_path,
+            filename=filename,
+            source_windows=source_windows,
+            reason=last_error,
+        )
+        return degraded, {}, [], last_error
 
 
 def _analyze_once(
@@ -574,6 +790,8 @@ def run_long_source_analyze(
     candidate_pages: Iterable[Any] | None = None,
     source_windows: Iterable[Any] | None = None,
     existing_page_keys: Iterable[str] | None = None,
+    resume_window_results: Iterable[Mapping[str, Any]] | None = None,
+    retry_window_indices: Iterable[int] | None = None,
 ) -> dict[str, Any]:
     """Analyze source text in a single pass or multi-window mode.
 
@@ -620,11 +838,12 @@ def run_long_source_analyze(
     planned_reference_keys = set(known_page_keys)
 
     def _do_single() -> dict[str, Any]:
+        single_window = {"index": 1, "total": 1, "start": 0, "end": len(text)}
         single_anchor_context = _window_anchor_context(
-            {"index": 1, "start": 0, "end": len(text)},
+            single_window,
             source_windows,
         )
-        raw_analysis = _analyze_once(
+        plan, raw_analysis, warnings, degraded_error = _analyse_window_with_recovery(
             chat_fn=chat_fn,
             system_prompt=analyze_system_prompt,
             user_content=_single_user_prompt(
@@ -639,10 +858,9 @@ def run_long_source_analyze(
                     ensure_ascii=False,
                 ),
             ),
-        )
-        plan = _plan_analysis(
-            raw_analysis,
+            window=single_window,
             source_path=source_path,
+            filename=filename,
             source_windows=single_anchor_context,
             existing_page_keys=known_page_keys or None,
             reference_page_keys=planned_reference_keys,
@@ -651,12 +869,29 @@ def run_long_source_analyze(
         analysis = plan_to_legacy_analysis(plan, raw_analysis)
         analysis["step_a_plan"] = plan.model_dump(mode="json")
         analysis["window_results"] = [
-            {"index": 1, "start": 0, "end": len(text), "plan": plan.model_dump(mode="json")}
+            {
+                "index": 1,
+                "start": 0,
+                "end": len(text),
+                "status": "degraded" if degraded_error else "ok",
+                "warnings": warnings,
+                "error": degraded_error,
+                "plan": plan.model_dump(mode="json"),
+            }
         ]
+        if degraded_error:
+            _emit(
+                on_step,
+                "wiki_analyze_window_degraded",
+                f"window 1/1 degraded: {degraded_error}",
+                index=1,
+                total=1,
+                error=degraded_error,
+            )
         _emit(
             on_step,
             "wiki_analyze",
-            "single-pass analyze complete",
+            "single-pass analyze complete" + (" with warnings" if degraded_error or warnings else ""),
             mode="single",
             chars=len(text),
             source_path=source_path,
@@ -669,6 +904,8 @@ def run_long_source_analyze(
             "step_a_plan": plan.model_dump(mode="json"),
             "window_results": analysis["window_results"],
             "window_count": 1,
+            "degraded_windows": [1] if degraded_error else [],
+            "warnings": warnings,
         }
 
     if len(text) <= single_budget:
@@ -699,33 +936,95 @@ def run_long_source_analyze(
     partials: list[dict[str, Any]] = []
     window_plans: list[StepAPlan] = []
     window_results: list[dict[str, Any]] = []
+    degraded_windows: list[int] = []
+    window_warnings: list[str] = []
+    reused_windows: list[int] = []
+    previous_results: dict[int, Mapping[str, Any]] = {}
+    for previous in resume_window_results or ():
+        if not isinstance(previous, Mapping):
+            continue
+        try:
+            previous_index = int(previous.get("index") or 0)
+        except (TypeError, ValueError):
+            continue
+        if previous_index > 0:
+            previous_results[previous_index] = previous
+    requested_retries = {
+        int(index)
+        for index in (retry_window_indices or ())
+        if str(index).strip().isdigit() and int(index) > 0
+    }
+    if retry_window_indices is None:
+        requested_retries = {
+            index
+            for index, previous in previous_results.items()
+            if str(previous.get("status") or "").lower() in {"degraded", "failed"}
+        }
 
     for w in windows:
-        partial = _analyze_once(
-            chat_fn=chat_fn,
-            system_prompt=system_multi,
-            user_content=_window_user_prompt(
-                w,
-                digest=digest,
+        window_source_anchors = _window_anchor_context(w, source_windows)
+        previous = previous_results.get(int(w["index"]))
+        plan: StepAPlan
+        partial: dict[str, Any]
+        warnings: list[str]
+        degraded_error: str | None
+        reused = False
+        if previous is not None and int(w["index"]) not in requested_retries:
+            try:
+                previous_plan = previous.get("plan")
+                if not isinstance(previous_plan, Mapping):
+                    raise PlanValidationError("previous window has no persisted plan")
+                plan, warnings = _plan_analysis_details(
+                    previous_plan,
+                    source_path=source_path,
+                    source_windows=window_source_anchors,
+                    existing_page_keys=known_page_keys or None,
+                    reference_page_keys=planned_reference_keys,
+                    source_length=len(text),
+                )
+                partial = plan_to_legacy_analysis(plan, previous_plan)
+                degraded_error = None
+                reused = True
+                reused_windows.append(int(w["index"]))
+                _emit(
+                    on_step,
+                    "wiki_analyze_window_reused",
+                    f"window {w['index']}/{w['total']} reused from previous run",
+                    index=w["index"],
+                    total=w["total"],
+                    start=w["start"],
+                    end=w["end"],
+                    source_path=source_path,
+                )
+            except (LLMError, PlanValidationError, ValueError, TypeError):
+                # A changed parser/source chunk layout invalidates the old
+                # anchors; re-analyze that window instead of trusting it.
+                previous = None
+        if not reused:
+            plan, partial, warnings, degraded_error = _analyse_window_with_recovery(
+                chat_fn=chat_fn,
+                system_prompt=system_multi,
+                user_content=_window_user_prompt(
+                    w,
+                    digest=digest,
+                    source_path=source_path,
+                    filename=filename,
+                    purpose=purpose_text,
+                    schema=schema_text,
+                    candidate_context=candidate_context,
+                    source_anchor_context=json.dumps(
+                        window_source_anchors,
+                        ensure_ascii=False,
+                    ),
+                ),
+                window=w,
                 source_path=source_path,
                 filename=filename,
-                purpose=purpose_text,
-                schema=schema_text,
-                candidate_context=candidate_context,
-                source_anchor_context=json.dumps(
-                    _window_anchor_context(w, source_windows),
-                    ensure_ascii=False,
-                ),
-            ),
-        )
-        plan = _plan_analysis(
-            partial,
-            source_path=source_path,
-            source_windows=[*(_window_anchor_context(w, source_windows))],
-            existing_page_keys=known_page_keys or None,
-            reference_page_keys=planned_reference_keys,
-            source_length=len(text),
-        )
+                source_windows=window_source_anchors,
+                existing_page_keys=known_page_keys or None,
+                reference_page_keys=planned_reference_keys,
+                source_length=len(text),
+            )
         planned_reference_keys.update(
             operation.page_key
             for operation in plan.page_operations
@@ -733,15 +1032,22 @@ def run_long_source_analyze(
         )
         partials.append(partial)
         window_plans.append(plan)
-        window_results.append(
-            {
-                "index": w["index"],
-                "start": w["start"],
-                "end": w["end"],
-                "source_windows": _window_anchor_context(w, source_windows),
-                "plan": plan.model_dump(mode="json"),
-            }
-        )
+        if degraded_error:
+            degraded_windows.append(int(w["index"]))
+        if warnings:
+            window_warnings.extend(
+                [f"窗口 {w['index']}: {warning}" for warning in warnings]
+            )
+        window_results.append({
+            "index": w["index"],
+            "start": w["start"],
+            "end": w["end"],
+            "status": "degraded" if degraded_error else ("reused" if reused else "ok"),
+            "warnings": warnings,
+            "error": degraded_error,
+            "source_windows": window_source_anchors,
+            "plan": plan.model_dump(mode="json"),
+        })
         update = str(partial.get("digest_update") or "").strip()
         if update:
             digest = trim_digest(
@@ -759,6 +1065,9 @@ def run_long_source_analyze(
             end=w["end"],
             source_path=source_path,
             window_result=window_results[-1],
+            status="degraded" if degraded_error else ("reused" if reused else "ok"),
+            warnings=warnings,
+            error=degraded_error,
         )
 
     merged_plan = merge_step_a_plans(
@@ -774,6 +1083,9 @@ def run_long_source_analyze(
     merged["window_count"] = len(partials)
     merged["coverage"] = {"chars": len(text), "windows": len(partials)}
     merged["window_results"] = window_results
+    merged["degraded_windows"] = degraded_windows
+    merged["warnings"] = window_warnings
+    merged["reused_windows"] = reused_windows
     merged["step_a_plan"] = merged_plan.model_dump(mode="json")
     _emit(
         on_step,
@@ -790,4 +1102,7 @@ def run_long_source_analyze(
         "step_a_plan": merged_plan.model_dump(mode="json"),
         "window_results": window_results,
         "window_count": len(partials),
+        "degraded_windows": degraded_windows,
+        "warnings": window_warnings,
+        "reused_windows": reused_windows,
     }

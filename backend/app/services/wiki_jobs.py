@@ -161,7 +161,12 @@ def _mark_job_failed(job_id: int, message: str) -> None:
     try:
         with Session(get_engine()) as session:
             job = session.get(IngestJob, job_id)
-            if job is None or job.status in ("success", "failed", "cancelled"):
+            if job is None or job.status in (
+                "success",
+                "success_with_warnings",
+                "failed",
+                "cancelled",
+            ):
                 return
             job.status = "failed"
             job.stage = "failed"
@@ -179,7 +184,7 @@ def run_ingest_job(job_id: int, *, chat_fn: Any = None) -> Optional[IngestJob]:
         job = session.get(IngestJob, job_id)
         if job is None:
             return None
-        if job.status in ("success", "failed", "cancelled"):
+        if job.status in ("success", "success_with_warnings", "failed", "cancelled"):
             return job
         if job.cancel_requested:
             return cancel_ingest_job(session, job_id)
@@ -208,7 +213,7 @@ def cancel_ingest_job(session: Session, job_id: int) -> Optional[IngestJob]:
     job = session.get(IngestJob, job_id)
     if job is None:
         return None
-    if job.status in ("success", "failed", "cancelled"):
+    if job.status in ("success", "success_with_warnings", "failed", "cancelled"):
         return job
 
     job.cancel_requested = True
@@ -227,6 +232,83 @@ def cancel_ingest_job(session: Session, job_id: int) -> Optional[IngestJob]:
     session.add(job)
     session.commit()
     session.refresh(job)
+    return job
+
+
+def retry_failed_windows(session: Session, job_id: int) -> Optional[IngestJob]:
+    """Queue a partial ingest again while reusing completed analyze windows."""
+
+    job = session.get(IngestJob, job_id)
+    if job is None:
+        return None
+    if job.status not in {"success_with_warnings", "failed"}:
+        raise ValueError("只有已完成但有提示或失败的任务可以重试窗口")
+
+    try:
+        payload = json.loads(job.plan_json or "{}")
+    except (TypeError, json.JSONDecodeError):
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+
+    results: list[dict[str, Any]] = []
+    raw_results = payload.get("window_results")
+    if isinstance(raw_results, list):
+        results.extend(item for item in raw_results if isinstance(item, dict))
+    if not results:
+        try:
+            step_log = json.loads(job.step_log_json or "[]")
+        except (TypeError, json.JSONDecodeError):
+            step_log = []
+        if isinstance(step_log, list):
+            for entry in step_log:
+                if not isinstance(entry, dict):
+                    continue
+                window_result = entry.get("window_result")
+                if isinstance(window_result, dict):
+                    results.append(window_result)
+    if not results:
+        raise ValueError("任务没有可恢复的分析窗口，请使用“重试”重新摄入全文")
+
+    retry_indices: list[int] = []
+    for result in results:
+        try:
+            index = int(result.get("index") or 0)
+        except (TypeError, ValueError):
+            continue
+        if index > 0 and str(result.get("status") or "").lower() in {"degraded", "failed"}:
+            retry_indices.append(index)
+    payload["window_results"] = results
+    payload["degraded_windows"] = retry_indices
+    payload["retry_failed_windows"] = True
+    job.plan_json = json.dumps(payload, ensure_ascii=False)
+    job.status = "queued"
+    job.stage = "queued"
+    job.progress = 0
+    job.cancel_requested = False
+    job.error_message = None
+    _append_step(
+        job,
+        "retry_requested",
+        f"已提交失败窗口重试（{len(retry_indices)} 个已标记窗口）",
+        retry_windows=retry_indices,
+    )
+    document = session.get(Document, job.document_id)
+    if document is not None:
+        document.status = "ingesting"
+        document.error_message = None
+        document.updated_at = _utcnow()
+        session.add(document)
+    job.updated_at = _utcnow()
+    session.add(job)
+    session.commit()
+    session.refresh(job)
+    try:
+        schedule_ingest_job(job.id)
+    except Exception:
+        logger.exception("could not schedule wiki retry job_id=%s", job.id)
+        _mark_job_failed(job.id, "无法调度失败窗口重试")
+        session.refresh(job)
     return job
 
 

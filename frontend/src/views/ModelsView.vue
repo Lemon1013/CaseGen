@@ -137,7 +137,7 @@ onMounted(load)
     <div class="page-header">
       <div>
         <h1 class="page-title">模型配置</h1>
-        <p class="page-subtitle">管理 OpenAI 兼容网关与默认推理模型</p>
+        <p class="page-subtitle">管理 OpenAI 兼容网关与默认推理模型；系统只允许一个默认模型</p>
       </div>
       <div class="page-actions">
         <el-button type="primary" @click="openCreate">新建模型</el-button>

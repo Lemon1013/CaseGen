@@ -84,7 +84,7 @@ def _resolve_generate_prompt(session: Session, task: GenerationTask) -> tuple[st
         select(PromptTemplate).where(
             PromptTemplate.type == "generate",
             PromptTemplate.is_active == True,  # noqa: E712
-        )
+        ).order_by(col(PromptTemplate.updated_at).desc(), col(PromptTemplate.id).desc())
     ).first()
     if active is None:
         raise RuntimeError("No active generate prompt template found")
@@ -98,11 +98,13 @@ def _resolve_model(session: Session, task: GenerationTask) -> ModelConfig:
             raise RuntimeError(f"ModelConfig id={task.model_id} not found")
         return row
     default = session.exec(
-        select(ModelConfig).where(ModelConfig.is_default == True)  # noqa: E712
+        select(ModelConfig)
+        .where(ModelConfig.is_default == True)  # noqa: E712
+        .order_by(col(ModelConfig.id).desc())
     ).first()
     if default is None:
         # Fall back to any model if no default is marked.
-        default = session.exec(select(ModelConfig).order_by(col(ModelConfig.id))).first()
+        default = session.exec(select(ModelConfig).order_by(col(ModelConfig.id).desc())).first()
     if default is None:
         raise RuntimeError("No ModelConfig available")
     return default
@@ -772,7 +774,7 @@ def _resolve_prompt_by_type(session: Session, prompt_type: str) -> PromptTemplat
         select(PromptTemplate).where(
             PromptTemplate.type == prompt_type,
             PromptTemplate.is_active == True,  # noqa: E712
-        )
+        ).order_by(col(PromptTemplate.updated_at).desc(), col(PromptTemplate.id).desc())
     ).first()
     if active is None:
         raise RuntimeError(f"No active {prompt_type} prompt template found")
@@ -879,23 +881,6 @@ def _build_optimize_messages(
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": "\n".join(user_parts)},
     ]
-
-
-def _deactivate_generate_siblings(
-    session: Session, keep_id: Optional[int] = None
-) -> None:
-    rows = session.exec(
-        select(PromptTemplate).where(
-            PromptTemplate.type == "generate",
-            PromptTemplate.is_active == True,  # noqa: E712
-        )
-    ).all()
-    for row in rows:
-        if keep_id is not None and row.id == keep_id:
-            continue
-        row.is_active = False
-        row.updated_at = _utcnow()
-        session.add(row)
 
 
 def _next_prompt_version(session: Session, prompt_type: str) -> int:
@@ -1266,6 +1251,9 @@ def run_optimize_prompt(
                 select(PromptTemplate).where(
                     PromptTemplate.type == "generate",
                     PromptTemplate.is_active == True,  # noqa: E712
+                ).order_by(
+                    col(PromptTemplate.updated_at).desc(),
+                    col(PromptTemplate.id).desc(),
                 )
             ).first()
             if active_gen is not None:
@@ -1356,7 +1344,6 @@ def apply_prompt(
             base = session.get(PromptTemplate, revision.base_prompt_id)
             if base is not None:
                 base_name = base.name
-        _deactivate_generate_siblings(session)
         version = _next_prompt_version(session, "generate")
         row = PromptTemplate(
             name=base_name,

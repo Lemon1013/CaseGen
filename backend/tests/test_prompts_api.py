@@ -8,7 +8,7 @@ from app.services import prompts_seed
 from app.services.prompts_seed import BUNDLED_PROMPT_VERSION, seed_default_prompts
 
 
-def test_only_one_active_prompt_per_type(tmp_app_data):
+def test_multiple_active_prompts_per_type(tmp_app_data):
     client = TestClient(create_app())
     r1 = client.post(
         "/api/prompts",
@@ -22,8 +22,8 @@ def test_only_one_active_prompt_per_type(tmp_app_data):
     assert r2.status_code == 200
     items = client.get("/api/prompts", params={"type": "generate"}).json()
     actives = [p for p in items if p["is_active"]]
-    assert len(actives) == 1
-    assert actives[0]["content"] == "B"
+    active_contents = {p["content"] for p in actives}
+    assert {"A", "B"}.issubset(active_contents)
 
 
 def test_default_prompts_seeded(tmp_app_data):
@@ -62,11 +62,12 @@ def test_seed_keeps_custom_active_prompt(tmp_app_data):
             select(PromptTemplate).where(
                 PromptTemplate.type == "generate",
                 PromptTemplate.is_active == True,  # noqa: E712
-            )
-        ).one()
+            ).order_by(PromptTemplate.id)
+        ).all()
 
-    assert active.id == created["id"]
-    assert active.content == "团队自定义提示词"
+    custom = next(item for item in active if item.id == created["id"])
+    assert custom.content == "团队自定义提示词"
+    assert any(item.name == "default_generate" for item in active)
 
 
 def test_seed_upgrades_recognized_bundled_prompt(tmp_app_data, monkeypatch):

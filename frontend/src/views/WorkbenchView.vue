@@ -24,10 +24,10 @@ async function loadOptions() {
   try {
     const [m, p] = await Promise.all([listModels(), listPrompts('generate')])
     models.value = m
-    prompts.value = p
+    prompts.value = p.filter((item) => item.is_active)
     const defaultModel = m.find((x) => x.is_default)
     if (defaultModel) form.model_id = defaultModel.id
-    const activePrompt = p.find((x) => x.is_active)
+    const activePrompt = prompts.value[0]
     if (activePrompt) form.prompt_template_id = activePrompt.id
   } catch (e) {
     ElMessage.error(`加载选项失败：${(e as Error).message}`)

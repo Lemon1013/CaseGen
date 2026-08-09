@@ -15,21 +15,6 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
-def _deactivate_siblings(session: Session, prompt_type: str, keep_id: Optional[int] = None) -> None:
-    rows = session.exec(
-        select(PromptTemplate).where(
-            PromptTemplate.type == prompt_type,
-            PromptTemplate.is_active == True,  # noqa: E712
-        )
-    ).all()
-    for row in rows:
-        if keep_id is not None and row.id == keep_id:
-            continue
-        row.is_active = False
-        row.updated_at = _utcnow()
-        session.add(row)
-
-
 def _next_version(session: Session, prompt_type: str) -> int:
     current = session.exec(
         select(func.max(PromptTemplate.version)).where(PromptTemplate.type == prompt_type)
@@ -55,9 +40,6 @@ def create_prompt(
     body: PromptCreate,
     session: Session = Depends(get_session),
 ) -> PromptTemplate:
-    if body.is_active:
-        _deactivate_siblings(session, body.type)
-
     row = PromptTemplate(
         name=body.name,
         type=body.type,
@@ -90,9 +72,6 @@ def update_prompt(
         raise HTTPException(status_code=404, detail="Prompt not found")
 
     data = body.model_dump(exclude_unset=True)
-    if data.get("is_active") is True:
-        _deactivate_siblings(session, row.type, keep_id=row.id)
-
     for key, value in data.items():
         setattr(row, key, value)
     row.updated_at = _utcnow()

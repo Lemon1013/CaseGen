@@ -13,6 +13,7 @@ import {
   listDocumentChunks,
   listDocuments,
   listIngestJobs,
+  retryFailedWindows,
   uploadDocument,
   type DocumentDiagnostics,
   type DocumentItem,
@@ -45,7 +46,7 @@ const previewDocument = ref<DocumentItem | null>(null)
 const previewContent = ref<DocumentPreview | null>(null)
 
 const activeJobStatuses = new Set(['queued', 'running'])
-const terminalJobStatuses = new Set(['success', 'failed', 'cancelled'])
+const terminalJobStatuses = new Set(['success', 'success_with_warnings', 'failed', 'cancelled'])
 
 function setJob(documentId: number, job: IngestJob | undefined) {
   jobs.value = { ...jobs.value, [documentId]: job }
@@ -228,6 +229,7 @@ function statusLabel(status: string) {
 
 function jobStatusTagType(status: string) {
   if (status === 'success') return 'success'
+  if (status === 'success_with_warnings') return 'warning'
   if (status === 'failed') return 'danger'
   if (status === 'cancelled') return 'info'
   return 'warning'
@@ -238,6 +240,7 @@ function jobStatusLabel(status: string) {
     queued: '排队中',
     running: '处理中',
     success: '已完成',
+    success_with_warnings: '已完成，有提示',
     failed: '失败',
     cancelled: '已取消',
   }
@@ -254,6 +257,7 @@ function stageLabel(stage: string) {
     applying: '写入 Wiki',
     indexing: '更新索引',
     ready: '处理完成',
+    success_with_warnings: '完成，部分窗口待复核',
     failed: '处理失败',
     cancelled: '已取消',
   }
@@ -295,6 +299,7 @@ function stepTime(step: IngestStep | undefined) {
 function jobErrorText(job: IngestJob | undefined | null) {
   if (!job) return ''
   if (job.error_message) return errorMessage(job.error_message, '任务失败')
+  if (job.status === 'success_with_warnings') return '摄入已完成，但部分窗口需要复核，可重试失败窗口。'
   if (job.status === 'failed') return '摄入失败，请查看任务日志并点击“重试”；若反复失败，请检查解析质量。'
   return ''
 }
@@ -320,6 +325,30 @@ async function startIngest(row: DocumentItem, force = false) {
   }
 }
 
+async function retryWindows(row: DocumentItem) {
+  const job = currentJob(row)
+  if (!job || job.status !== 'success_with_warnings') return
+
+  setActionLoading(row.id, true)
+  setJobError(row.id, '')
+  try {
+    const updated = await retryFailedWindows(job.id)
+    setJob(row.id, updated)
+    if (isActiveJob(updated)) {
+      ElMessage.info(`已提交失败窗口重试，任务 #${updated.id}`)
+      pollJob(row.id, updated.id)
+    } else {
+      await finishJob(row.id, updated, true)
+    }
+  } catch (error: unknown) {
+    const message = errorMessage(error, '失败窗口重试未发送成功')
+    setJobError(row.id, message)
+    ElMessage.error(`重试失败窗口失败：${message}`)
+  } finally {
+    setActionLoading(row.id, false)
+  }
+}
+
 async function finishJob(documentId: number, job: IngestJob, notify: boolean) {
   setJob(documentId, job)
   clearPoll(documentId)
@@ -328,6 +357,10 @@ async function finishJob(documentId: number, job: IngestJob, notify: boolean) {
   if (job.status === 'success') {
     setJobError(documentId, '')
     if (notify) ElMessage.success(`文档 #${documentId} 摄入完成`)
+  } else if (job.status === 'success_with_warnings') {
+    const message = jobErrorText(job)
+    setJobError(documentId, message)
+    if (notify) ElMessage.warning(`文档 #${documentId} 摄入完成，但部分窗口需要复核`)
   } else if (job.status === 'failed') {
     const message = jobErrorText(job)
     setJobError(documentId, message)
@@ -660,6 +693,15 @@ onUnmounted(() => {
               @click="cancelJob(row)"
             >
               取消
+            </el-button>
+            <el-button
+              v-else-if="currentJob(row)?.status === 'success_with_warnings'"
+              type="warning"
+              link
+              :loading="actionLoading[row.id]"
+              @click="retryWindows(row)"
+            >
+              重试失败窗口
             </el-button>
             <el-button
               v-else-if="currentJob(row)?.status === 'failed' || currentJob(row)?.status === 'cancelled'"

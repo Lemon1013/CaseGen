@@ -1,5 +1,6 @@
 import json
 
+from app.services.llm import LLMError
 from app.services.wiki_long_analyze import (
     split_analyze_windows,
     merge_analysis_partials,
@@ -155,3 +156,93 @@ def test_run_long_analyze_multi_window_sees_tail(monkeypatch):
     assert any(s["step"] == "wiki_analyze_plan" for s in steps)
     assert any(s["step"] == "wiki_analyze_window" for s in steps)
     assert any(s["step"] == "wiki_analyze_consolidate" for s in steps)
+
+
+def test_run_long_analyze_degrades_failed_window_and_continues(monkeypatch):
+    monkeypatch.setattr("app.services.wiki_long_analyze.config.WIKI_ANALYZE_SINGLE_PASS_CHARS", 120)
+    monkeypatch.setattr("app.services.wiki_long_analyze.config.WIKI_ANALYZE_WINDOW_CHARS", 80)
+    monkeypatch.setattr("app.services.wiki_long_analyze.config.WIKI_ANALYZE_WINDOW_OVERLAP", 10)
+    monkeypatch.setattr("app.services.wiki_long_analyze.config.WIKI_ANALYZE_WINDOW_RETRIES", 0)
+    monkeypatch.setattr("app.services.wiki_long_analyze.config.WIKI_ANALYZE_REPAIR_RETRIES", 0)
+
+    text = (
+        "前部规则。\n\n" * 20
+        + "故障窗口标记。\n\n"
+        + "后部规则。\n\n" * 20
+    )
+    calls: list[str] = []
+
+    def chat(messages):
+        user = messages[-1]["content"]
+        calls.append(user)
+        if "故障窗口标记" in user:
+            raise LLMError("temporary upstream failure")
+        return json.dumps(
+            {
+                "summary_title": "可用窗口",
+                "key_rules": ["窗口规则"],
+                "api_points": [],
+                "test_hints": [],
+                "entities": [],
+                "suggested_page_types": ["source_summary"],
+            },
+            ensure_ascii=False,
+        )
+
+    result = run_long_source_analyze(
+        text,
+        chat_fn=chat,
+        analyze_system_prompt="仅输出 JSON",
+        source_path="raw/failure.md",
+        filename="failure.md",
+    )
+
+    assert result["mode"] == "multi"
+    assert result["degraded_windows"]
+    assert len(result["window_results"]) > len(result["degraded_windows"])
+    assert any(item["status"] == "degraded" for item in result["window_results"])
+    assert any(item["status"] == "ok" for item in result["window_results"])
+    assert calls
+
+
+def test_run_long_analyze_reuses_completed_window(monkeypatch):
+    monkeypatch.setattr("app.services.wiki_long_analyze.config.WIKI_ANALYZE_SINGLE_PASS_CHARS", 100)
+    monkeypatch.setattr("app.services.wiki_long_analyze.config.WIKI_ANALYZE_WINDOW_CHARS", 70)
+    monkeypatch.setattr("app.services.wiki_long_analyze.config.WIKI_ANALYZE_WINDOW_OVERLAP", 5)
+    monkeypatch.setattr("app.services.wiki_long_analyze.config.WIKI_ANALYZE_WINDOW_RETRIES", 0)
+    monkeypatch.setattr("app.services.wiki_long_analyze.config.WIKI_ANALYZE_REPAIR_RETRIES", 0)
+
+    text = "段落规则。\n\n" * 30
+    calls: list[str] = []
+
+    def chat(messages):
+        calls.append(messages[-1]["content"])
+        return json.dumps(
+            {
+                "summary_title": "新窗口",
+                "key_rules": ["新规则"],
+                "api_points": [],
+                "test_hints": [],
+                "entities": [],
+                "suggested_page_types": ["source_summary"],
+            },
+            ensure_ascii=False,
+        )
+
+    result = run_long_source_analyze(
+        text,
+        chat_fn=chat,
+        analyze_system_prompt="仅输出 JSON",
+        source_path="raw/resume.md",
+        resume_window_results=[
+            {
+                "index": 1,
+                "status": "ok",
+                "plan": {"summary_title": "已完成窗口", "key_rules": ["旧规则"]},
+            }
+        ],
+        retry_window_indices=set(),
+    )
+
+    assert result["reused_windows"] == [1]
+    assert len(calls) == result["window_count"] - 1

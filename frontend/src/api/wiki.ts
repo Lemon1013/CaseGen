@@ -59,7 +59,7 @@ export interface RetrieveResponse {
   explain?: Record<string, unknown> | null
 }
 
-export type WikiReviewStatus = 'pending' | 'approved' | 'rejected'
+export type WikiReviewStatus = 'pending' | 'approved' | 'rejected' | 'acknowledged'
 
 export interface WikiReview {
   id: number
@@ -122,6 +122,8 @@ export interface WikiDiff {
   unified: string
   text: string
   changed: boolean
+  available: boolean
+  reason: string
 }
 
 export interface WikiReviewDetail extends WikiReview {
@@ -224,6 +226,13 @@ export function approveWikiReview(id: number, body: WikiReviewDecision = {}) {
 
 export function rejectWikiReview(id: number, body: WikiReviewDecision = {}) {
   return api<WikiReviewDetail>(`/api/wiki/reviews/${id}/reject`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  })
+}
+
+export function acknowledgeWikiReview(id: number, body: WikiReviewDecision = {}) {
+  return api<WikiReviewDetail>(`/api/wiki/reviews/${id}/acknowledge`, {
     method: 'POST',
     body: JSON.stringify(body),
   })

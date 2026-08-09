@@ -111,6 +111,35 @@ def test_review_list_filters_and_detail_diff(tmp_app_data):
     assert "-单笔申报上限为100万股。" in body["diff"]["unified"]
 
 
+def test_structural_review_has_no_content_diff_and_can_be_acknowledged(tmp_app_data):
+    _document_id, job_id, _page_id = _seed_page_and_job()
+    review_id = _review(
+        page_id=None,
+        job_id=job_id,
+        kind="needs_review",
+        candidate={"claim_ids": ["claim-1"], "severity": "medium"},
+        payload={"operation": "review", "risk_flags": ["needs_review"]},
+        content=None,
+    )
+    client = _client(tmp_app_data)
+
+    detail = client.get(f"/api/wiki/reviews/{review_id}")
+    assert detail.status_code == 200
+    body = detail.json()
+    assert body["diff"]["available"] is False
+    assert "结构化审核提醒" in body["diff"]["reason"]
+    assert body["candidate_available"] is False
+
+    acknowledged = client.post(
+        f"/api/wiki/reviews/{review_id}/acknowledge",
+        json={"reviewed_by": "tester", "decision_reason": "已核对来源"},
+    )
+    assert acknowledged.status_code == 200
+    assert acknowledged.json()["status"] == "acknowledged"
+    assert acknowledged.json()["diff"]["available"] is False
+    assert client.post(f"/api/wiki/reviews/{review_id}/acknowledge").status_code == 409
+
+
 def test_approve_applies_candidate_and_reject_is_one_shot(tmp_app_data):
     _document_id, job_id, page_id = _seed_page_and_job()
     review_id = _review(page_id=page_id, job_id=job_id)
