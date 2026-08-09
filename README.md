@@ -130,10 +130,14 @@ cp .env.example .env    # Windows 可用 copy .env.example .env
 | `APP_DATA_DIR` | 数据根目录（库、Wiki、上传原文） | 仓库根下 `data/` |
 | `LLM_DEFAULT_TIMEOUT_SEC` | 普通 LLM 超时（秒） | `180` |
 | `LLM_WIKI_TIMEOUT_SEC` | Wiki 编译相关超时（秒） | `300` |
+| `LLM_WIKI_STREAM` | Wiki 模型请求使用流式响应，避免代理空闲断开 | `true` |
+| `LLM_WIKI_MAX_TOKENS` | Wiki 单次模型输出上限 | `16384` |
+| `LLM_WIKI_THINKING` | Wiki 推理模式；`auto` 会关闭 DeepSeek V4 深度思考以保障 JSON 输出 | `auto` |
 | `RETRIEVE_TOP_K` | `/api/wiki/retrieve` 未指定 `top_k` 时的默认值 | `6` |
 | `MAX_WIKI_CONTEXT_CHARS` | 生成时 Wiki 上下文字符上限 | `12000` |
 | `FINAL_SCORE_THRESHOLD` | 终版评分门槛 | `80` |
-| `WIKI_ANALYZE_SINGLE_PASS_CHARS` | 长文单次分析字符上限 | `48000` |
+| `WIKI_ANALYZE_SINGLE_PASS_CHARS` | 长文单次分析字符上限 | `6000` |
+| `WIKI_ANALYZE_MAX_OPERATIONS` | 单份来源自动创建/更新的知识页上限（不含来源摘要） | `7` |
 
 > **不要**把 API Key 写进 `.env` 或提交任何 `.env`。模型密钥在前端 **模型配置** 页写入，保存在本地 SQLite。
 

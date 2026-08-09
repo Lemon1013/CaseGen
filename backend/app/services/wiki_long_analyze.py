@@ -442,6 +442,7 @@ def _plan_analysis(
     source_path: str,
     source_windows: Iterable[Any] | None,
     existing_page_keys: Iterable[str] | None,
+    reference_page_keys: Iterable[str] | None,
     source_length: int,
 ) -> StepAPlan:
     try:
@@ -450,6 +451,7 @@ def _plan_analysis(
             source_path=source_path,
             source_windows=source_windows,
             existing_page_keys=existing_page_keys,
+            reference_page_keys=reference_page_keys,
             source_length=source_length,
         )
     except PlanValidationError as exc:
@@ -615,6 +617,7 @@ def run_long_source_analyze(
     candidate_context = format_candidate_context(prompt_candidates)
     candidate_keys = [str(item.get("page_key")) for item in candidate_pages if isinstance(item, Mapping) and item.get("page_key")]
     known_page_keys = list(existing_page_keys) if existing_page_keys is not None else candidate_keys
+    planned_reference_keys = set(known_page_keys)
 
     def _do_single() -> dict[str, Any]:
         single_anchor_context = _window_anchor_context(
@@ -642,6 +645,7 @@ def run_long_source_analyze(
             source_path=source_path,
             source_windows=single_anchor_context,
             existing_page_keys=known_page_keys or None,
+            reference_page_keys=planned_reference_keys,
             source_length=len(text),
         )
         analysis = plan_to_legacy_analysis(plan, raw_analysis)
@@ -719,7 +723,13 @@ def run_long_source_analyze(
             source_path=source_path,
             source_windows=[*(_window_anchor_context(w, source_windows))],
             existing_page_keys=known_page_keys or None,
+            reference_page_keys=planned_reference_keys,
             source_length=len(text),
+        )
+        planned_reference_keys.update(
+            operation.page_key
+            for operation in plan.page_operations
+            if operation.op == "create"
         )
         partials.append(partial)
         window_plans.append(plan)
@@ -755,7 +765,9 @@ def run_long_source_analyze(
         window_plans,
         source_windows=source_windows,
         existing_page_keys=known_page_keys or None,
+        reference_page_keys=planned_reference_keys,
         source_length=len(text),
+        max_operations=int(config.WIKI_ANALYZE_MAX_OPERATIONS),
     )
     merged = plan_to_legacy_analysis(merged_plan, partials[0] if partials else {})
     merged["global_digest"] = digest or merged.get("global_digest") or ""

@@ -108,6 +108,14 @@ def ping_model(model_id: int, session: Session = Depends(get_session)) -> ModelP
             api_key=row.api_key,
             model=row.model_name,
             messages=[{"role": "user", "content": "ping"}],
+            stream=True,
+            max_tokens=32,
+            max_retries=1,
+            thinking=(
+                False
+                if row.model_name.lower().startswith("deepseek-v4-")
+                else None
+            ),
         )
     except LLMError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

@@ -46,6 +46,10 @@ def test_ping_model_success(tmp_app_data, monkeypatch):
     def fake_chat_completion(**kwargs):
         assert kwargs["messages"] == [{"role": "user", "content": "ping"}]
         assert kwargs["api_key"] == "sk-test-key"
+        assert kwargs["stream"] is True
+        assert kwargs["max_tokens"] == 32
+        assert kwargs["max_retries"] == 1
+        assert kwargs["thinking"] is None
         return "pong", {"prompt_tokens": 1}
 
     monkeypatch.setattr("app.api.models_cfg.chat_completion", fake_chat_completion)

@@ -279,9 +279,6 @@ def validate_source_anchor(
         raise PlanValidationError("source anchor end_char exceeds source length")
     if parsed.start_char is not None and parsed.end_char is None:
         raise PlanValidationError("source anchor with start_char must include end_char")
-    if parsed.window_index is not None and windows:
-        if not any(int(item.get("index", item.get("window_index", 0)) or 0) == parsed.window_index for item in windows):
-            raise PlanValidationError(f"source window does not exist: {parsed.window_index}")
     if not windows:
         return parsed
 
@@ -301,16 +298,50 @@ def validate_source_anchor(
         requested_chunks.add(str(parsed.chunk_id))
     if requested_chunks and (not known_chunks or not requested_chunks.issubset(known_chunks)):
         raise PlanValidationError("source anchor chunk is not present in source windows")
+    has_valid_chunks = bool(
+        requested_chunks and requested_chunks.issubset(known_chunks)
+    )
+    if parsed.window_index is not None:
+        window_exists = any(
+            int(item.get("index", item.get("window_index", 0)) or 0)
+            == parsed.window_index
+            for item in windows
+        )
+        if not window_exists:
+            if has_valid_chunks:
+                parsed.window_index = None
+            else:
+                raise PlanValidationError(
+                    f"source window does not exist: {parsed.window_index}"
+                )
     known_clauses = known_values("clause_ids") | known_values("clauses") | known_values("clause_id")
     requested_clauses = set(parsed.clause_ids)
     if parsed.clause_id:
         requested_clauses.add(parsed.clause_id)
     if requested_clauses and (not known_clauses or not requested_clauses.issubset(known_clauses)):
-        raise PlanValidationError("source anchor clause is not present in source windows")
+        # Clause extraction is best-effort and can miss a real heading in a
+        # parsed document.  When the same anchor already points to validated
+        # source chunks, keep that lossless evidence and discard only the
+        # unverified clause labels.  A clause-only anchor remains strict.
+        if has_valid_chunks:
+            parsed.clause_ids = [
+                clause for clause in parsed.clause_ids if clause in known_clauses
+            ]
+            if parsed.clause_id and parsed.clause_id not in known_clauses:
+                parsed.clause_id = None
+        else:
+            unknown = sorted(requested_clauses - known_clauses)
+            raise PlanValidationError(
+                "source anchor clause is not present in source windows: "
+                + ", ".join(unknown)
+            )
 
     known_sections = known_values("section")
     if parsed.section and (not known_sections or parsed.section not in known_sections):
-        raise PlanValidationError("source anchor section is not present in source windows")
+        if has_valid_chunks:
+            parsed.section = None
+        else:
+            raise PlanValidationError("source anchor section is not present in source windows")
 
     known_documents = known_values("document_id")
     if parsed.document_id is not None and known_documents and str(parsed.document_id) not in known_documents:
@@ -334,7 +365,11 @@ def validate_source_anchor(
             max(start, int(requested_start or 0)) <= min(end, int(requested_end or 0))
             for start, end in page_ranges
         ):
-            raise PlanValidationError("source anchor page is not present in source windows")
+            if has_valid_chunks:
+                parsed.page_start = None
+                parsed.page_end = None
+            else:
+                raise PlanValidationError("source anchor page is not present in source windows")
 
     if parsed.start_char is not None and parsed.end_char is not None:
         overlaps = False
@@ -345,7 +380,11 @@ def validate_source_anchor(
                 overlaps = True
                 break
         if not overlaps and any("start" in item or "start_char" in item for item in windows):
-            raise PlanValidationError("source anchor range does not overlap a source window")
+            if has_valid_chunks:
+                parsed.start_char = None
+                parsed.end_char = None
+            else:
+                raise PlanValidationError("source anchor range does not overlap a source window")
     return parsed
 
 
@@ -353,6 +392,7 @@ def validate_step_a_plan(
     value: StepAPlan | Mapping[str, Any],
     *,
     existing_page_keys: Iterable[str] | None = None,
+    reference_page_keys: Iterable[str] | None = None,
     source_windows: Iterable[Any] | None = None,
     source_length: int | None = None,
     max_operations: int = 64,
@@ -373,10 +413,32 @@ def validate_step_a_plan(
                 raise PlanValidationError(f"invalid existing page_key: {key}")
             known_keys.add(str(key))
 
+    allowed_references: set[str] | None = (
+        set(known_keys) if known_keys is not None else None
+    )
+    if reference_page_keys is not None:
+        if allowed_references is None:
+            allowed_references = set()
+        for key in reference_page_keys:
+            if not is_valid_page_key(str(key)):
+                raise PlanValidationError(f"invalid reference page_key: {key}")
+            allowed_references.add(str(key))
+    if allowed_references is not None:
+        allowed_references.update(
+            operation.page_key
+            for operation in plan.page_operations
+            if operation.op == "create"
+        )
+
     def check_key(key: str | None, label: str) -> None:
         if key and not is_valid_page_key(key):
             raise PlanValidationError(f"invalid {label} page_key: {key}")
-        if key and known_keys is not None and label in {"related", "contradiction", "review"} and key not in known_keys:
+        if (
+            key
+            and allowed_references is not None
+            and label in {"related", "contradiction", "review"}
+            and key not in allowed_references
+        ):
             raise PlanValidationError(f"{label} page_key does not exist: {key}")
 
     seen_ops: set[str] = set()
@@ -394,6 +456,19 @@ def validate_step_a_plan(
             validate_source_anchor(anchor, source_windows=source_windows, source_length=source_length)
         if operation.op in {"create", "update"} and not operation.source_anchors:
             raise PlanValidationError(f"{operation.op} requires at least one source anchor: {operation.page_key}")
+
+    if allowed_references is not None:
+        plan.related_pages = [
+            item
+            for item in plan.related_pages
+            if item.page_key in allowed_references
+        ]
+        for item in plan.contradictions:
+            if item.page_key and item.page_key not in allowed_references:
+                item.page_key = None
+        for item in plan.review_items:
+            if item.page_key and item.page_key not in allowed_references:
+                item.page_key = None
 
     for claim in plan.claims:
         for anchor in claim.source_anchors:
@@ -427,6 +502,7 @@ def coerce_step_a_plan(
     source_path: str = "",
     source_windows: Iterable[Any] | None = None,
     existing_page_keys: Iterable[str] | None = None,
+    reference_page_keys: Iterable[str] | None = None,
     source_length: int | None = None,
 ) -> StepAPlan:
     """Accept the pre-Task-6 analysis JSON while producing strict Step A."""
@@ -435,6 +511,7 @@ def coerce_step_a_plan(
         return validate_step_a_plan(
             raw,
             existing_page_keys=existing_page_keys,
+            reference_page_keys=reference_page_keys,
             source_windows=source_windows,
             source_length=source_length,
         )
@@ -487,6 +564,7 @@ def coerce_step_a_plan(
     return validate_step_a_plan(
         plan,
         existing_page_keys=existing_page_keys,
+        reference_page_keys=reference_page_keys,
         source_windows=source_windows,
         source_length=source_length,
     )
@@ -553,6 +631,7 @@ def merge_step_a_plans(
     *,
     source_windows: Iterable[Any] | None = None,
     existing_page_keys: Iterable[str] | None = None,
+    reference_page_keys: Iterable[str] | None = None,
     source_length: int | None = None,
     max_claims: int = 80,
     max_related_pages: int = 80,
@@ -565,6 +644,7 @@ def merge_step_a_plans(
             item,
             source_windows=source_windows,
             existing_page_keys=existing_page_keys,
+            reference_page_keys=reference_page_keys,
             source_length=source_length,
         )
         for item in plans
@@ -625,6 +705,29 @@ def merge_step_a_plans(
                 }
             )
 
+    operations = _bounded(operations, max_operations)
+    kept_create_keys = {
+        item.page_key for item in operations if item.op == "create"
+    }
+    final_reference_keys = {
+        str(key) for key in (existing_page_keys or ())
+    } | kept_create_keys
+    related = [
+        item for item in related if item.page_key in final_reference_keys
+    ]
+    contradictions = [
+        item
+        if not item.page_key or item.page_key in final_reference_keys
+        else item.model_copy(update={"page_key": None})
+        for item in contradictions
+    ]
+    reviews = [
+        item
+        if not item.page_key or item.page_key in final_reference_keys
+        else item.model_copy(update={"page_key": None})
+        for item in reviews
+    ]
+
     merged = StepAPlan(
         source_summary=summary,
         claims=_merge_claims(parsed, max_claims),
@@ -637,6 +740,7 @@ def merge_step_a_plans(
     return validate_step_a_plan(
         merged,
         existing_page_keys=existing_page_keys,
+        reference_page_keys=final_reference_keys,
         source_windows=source_windows,
         source_length=source_length,
         max_operations=max_operations,
