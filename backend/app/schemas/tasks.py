@@ -14,6 +14,9 @@ class TaskCreate(BaseModel):
     prompt_template_id: Optional[int] = None
     auto_review: bool = False
     run_generate: bool = False
+    # Compatibility clients may omit this; the API explicitly resolves the
+    # default space while the new frontend always sends it.
+    wiki_space_id: Optional[int] = Field(default=None, ge=1)
 
 
 class ReviewResultOut(BaseModel):
@@ -33,6 +36,8 @@ class TaskOut(BaseModel):
 
     id: int
     requirement_id: int
+    wiki_space_id: int
+    wiki_space_name: str = ""
     status: str
     model_id: Optional[int] = None
     prompt_template_id: Optional[int] = None
@@ -87,6 +92,8 @@ class TaskEventOut(BaseModel):
     message: str
     detail_json: Optional[str] = None
     created_at: datetime
+    wiki_space_id: Optional[int] = None
+    wiki_space_name: str = ""
 
 
 class ApplyPromptBody(BaseModel):

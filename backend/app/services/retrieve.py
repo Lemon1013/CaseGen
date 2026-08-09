@@ -5,7 +5,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from sqlmodel import Session, select
+from sqlmodel import Session, or_, select
 
 from app import config
 from app.db import get_engine
@@ -227,12 +227,26 @@ def _query_centered_snippet(text: str, query: str, limit: int = 200) -> str:
     return ("…" if start else "") + text[start:end] + ("…" if end < len(text) else "")
 
 
-def load_all_wiki_pages(session: Session | None = None) -> list[dict[str, Any]]:
-    """Load wiki_pages rows and attach on-disk markdown content."""
+def load_all_wiki_pages(
+    session: Session | None = None,
+    *,
+    space_id: int | None = None,
+) -> list[dict[str, Any]]:
+    """Load one space's pages and attach on-disk Markdown content.
 
-    def _read_rows(sess: Session) -> list[dict[str, Any]]:
-        rows = sess.exec(select(WikiPageRow)).all()
-        source_rows = sess.exec(select(WikiPageSource)).all()
+    ``space_id=None`` is a compatibility call that explicitly resolves to the
+    default space; it never means "all spaces".
+    """
+
+    from app.services.wiki_spaces import resolve_space_id, space_scope_clause
+
+    def _read_rows(sess: Session, sid: int) -> list[dict[str, Any]]:
+        rows = sess.exec(select(WikiPageRow).where(space_scope_clause(sess, WikiPageRow.space_id, sid))).all()
+        page_ids = [row.id for row in rows if row.id is not None]
+        source_statement = select(WikiPageSource)
+        if page_ids:
+            source_statement = source_statement.where(WikiPageSource.page_id.in_(page_ids))
+        source_rows = sess.exec(source_statement).all() if page_ids else []
         sources_by_page: dict[int, list[int]] = {}
         for source in source_rows:
             sources_by_page.setdefault(source.page_id, []).append(source.document_id)
@@ -283,11 +297,12 @@ def load_all_wiki_pages(session: Session | None = None) -> list[dict[str, Any]]:
                     "revision": row.revision,
                     "source_document_id": row.source_document_id,
                     "source_document_ids": source_document_ids,
+                    "space_id": row.space_id if row.space_id is not None else sid,
                 }
             )
         return pages
 
     if session is not None:
-        return _read_rows(session)
+        return _read_rows(session, resolve_space_id(session, space_id))
     with Session(get_engine()) as sess:
-        return _read_rows(sess)
+        return _read_rows(sess, resolve_space_id(sess, space_id))

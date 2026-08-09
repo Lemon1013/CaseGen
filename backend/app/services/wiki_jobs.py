@@ -46,6 +46,7 @@ def build_ingest_fingerprint(session: Session, document: Document) -> dict[str, 
     ).all()
     return {
         "source_sha256": document.sha256,
+        "space_id": int(document.space_id) if document.space_id is not None else None,
         "wiki_config_sha256": digest.hexdigest(),
         "prompts": [f"{p.type}:{p.id}:v{p.version}" for p in prompts],
     }

@@ -12,10 +12,11 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
-from sqlmodel import select
+from sqlmodel import Session, select
 
 from app import config
 from app.models.entities import WikiPageRow, WikiPageSource
+from app.services.wiki_spaces import space_scope_clause
 from app.services.wiki_schema import parse_wiki_page
 from app.services.wiki_repository import page_path
 
@@ -44,13 +45,28 @@ def _json_list(value: Any) -> list[Any]:
     return []
 
 
-def _source_maps(session: Any) -> tuple[dict[int, list[int]], dict[int, int]]:
+def _source_maps(session: Any, space_id: int | None = None) -> tuple[dict[int, list[int]], dict[int, int]]:
     ids: dict[int, list[int]] = {}
     counts: dict[int, int] = {}
     if session is None:
         return ids, counts
     try:
-        sources = session.exec(select(WikiPageSource)).all()
+        statement = select(WikiPageSource)
+        if space_id is not None:
+            page_ids = [
+                row.id
+                for row in session.exec(
+                    select(WikiPageRow).where(
+                        space_scope_clause(session, WikiPageRow.space_id, space_id)
+                    )
+                ).all()
+                if row.id is not None
+            ]
+            if page_ids:
+                statement = statement.where(WikiPageSource.page_id.in_(page_ids))
+            else:
+                return ids, counts
+        sources = session.exec(statement).all()
     except Exception:
         return ids, counts
     for source in sources:
@@ -132,6 +148,7 @@ def page_descriptor(
     *,
     source_ids: Mapping[int, list[int]] | None = None,
     source_counts: Mapping[int, int] | None = None,
+    space_id: int | None = None,
 ) -> dict[str, Any]:
     """Normalize a row, repository record, dict, or validated Wiki page."""
 
@@ -196,6 +213,7 @@ def page_descriptor(
         "source_count": max(0, source_count),
         "source_document_ids": document_ids,
         "content": content,
+        "space_id": _get(page, "space_id", default=space_id),
     }
 
 
@@ -210,10 +228,41 @@ def _coerce_pages(pages: Any, session: Any) -> tuple[list[Any], Any]:
     return list(pages), session
 
 
-def build_index_entries(pages: Iterable[Any] | None = None, session: Any = None) -> list[dict[str, Any]]:
+def build_index_entries(
+    pages: Iterable[Any] | None = None,
+    session: Any = None,
+    *,
+    space_id: int | None = None,
+) -> list[dict[str, Any]]:
+    if space_id is not None:
+        try:
+            from app.services.wiki_spaces import resolve_space_id
+            if isinstance(session, Session):
+                space_id = resolve_space_id(session, space_id)
+        except Exception:
+            pass
     pages, session = _coerce_pages(pages, session)
-    source_ids, source_counts = _source_maps(session)
-    entries = [page_descriptor(page, source_ids=source_ids, source_counts=source_counts) for page in pages]
+    if space_id is not None:
+        include_legacy_null = True
+        if isinstance(session, Session):
+            from app.services.wiki_spaces import resolve_space_id
+
+            include_legacy_null = space_id == resolve_space_id(session)
+        pages = [
+            page for page in pages
+            if _get(page, "space_id", default=None) == space_id
+            or (include_legacy_null and _get(page, "space_id", default=None) is None)
+        ]
+    source_ids, source_counts = _source_maps(session, space_id)
+    entries = [
+        page_descriptor(
+            page,
+            source_ids=source_ids,
+            source_counts=source_counts,
+            space_id=space_id,
+        )
+        for page in pages
+    ]
     return sorted(entries, key=lambda item: (item["domain"], item["page_type"], item["title"], item["page_key"]))
 
 
@@ -258,13 +307,22 @@ def rebuild_index(
     pages: Iterable[Any] | None = None,
     session: Any = None,
     index_path: Path | None = None,
+    space_id: int | None = None,
 ) -> str:
     """Rewrite ``index.md`` while retaining compatibility with ``rows`` callers."""
 
     config.ensure_data_dirs()
-    entries = build_index_entries(pages, session=session)
+    entries = build_index_entries(pages, session=session, space_id=space_id)
     content = render_index(entries)
-    target = Path(index_path or (config.WIKI_DIR / "index.md"))
+    if index_path is None and space_id is not None:
+        from app.services.wiki_spaces import resolve_space, space_root
+
+        if session is None:
+            target = space_root(str(space_id)) / "index.md"
+        else:
+            target = space_root(resolve_space(session, space_id)) / "index.md"
+    else:
+        target = Path(index_path or (config.WIKI_DIR / "index.md"))
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content, encoding="utf-8")
     return content

@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlmodel import Session, select
 
 from app import config
@@ -18,6 +18,7 @@ from app.models.entities import (
     WikiPageRevision,
     WikiPageRow,
     WikiReviewItem,
+    WikiSpace,
 )
 from app.schemas.documents import SourceChunkOut
 from app.schemas.wiki import (
@@ -51,8 +52,72 @@ from app.services.wiki_repository import (
     page_key_lock,
 )
 from app.services.wiki_schema import WikiFrontmatter, WikiPage, WikiSource
+from app.services.wiki_spaces import (
+    resolve_space,
+    resolve_space_id,
+    space_root,
+    space_scope_clause,
+)
 
 router = APIRouter(tags=["wiki"])
+
+
+def _space_for_row(session: Session, row: WikiPageRow):
+    try:
+        space = resolve_space(session, row.space_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if row.space_id is None:
+        row.space_id = space.id
+        session.add(row)
+    return space
+
+
+def _job_space(session: Session, job: IngestJob):
+    try:
+        space = resolve_space(session, job.space_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if job.space_id is None:
+        job.space_id = space.id
+        session.add(job)
+    return space
+
+
+def _job_out(session: Session, job: IngestJob) -> IngestJobOut:
+    space = _job_space(session, job)
+    return IngestJobOut.model_validate(
+        {
+            **job.model_dump(),
+            "space_id": int(space.id or 0),
+            "space_name": space.name,
+        }
+    )
+
+
+def _job_scope(session: Session, job: IngestJob, space_id: int) -> None:
+    """Treat legacy NULL jobs as default-space data only."""
+
+    default_space_id = resolve_space_id(session)
+    actual_space_id = int(job.space_id) if job.space_id is not None else default_space_id
+    if actual_space_id != int(space_id):
+        raise HTTPException(status_code=404, detail="Ingest job not found in this space")
+
+
+def _page_scope(session: Session, row: WikiPageRow, space_id: int | None) -> Any:
+    space = _space_for_row(session, row)
+    if space_id is not None and int(space.id or 0) != int(space_id):
+        raise HTTPException(status_code=404, detail="Wiki page not found in this space")
+    return space
+
+
+def _review_scope(session: Session, item: WikiReviewItem, space_id: int) -> None:
+    """Treat legacy NULL reviews as default-space data only."""
+
+    default_space_id = resolve_space_id(session)
+    actual_space_id = int(item.space_id) if item.space_id is not None else default_space_id
+    if actual_space_id != int(space_id):
+        raise HTTPException(status_code=404, detail="Wiki review item not found in this space")
 
 
 def _tags_from_row(row: WikiPageRow) -> list[str]:
@@ -91,10 +156,20 @@ def _read_page_content(row: WikiPageRow) -> str:
     return ""
 
 
-def _to_page_out(row: WikiPageRow, *, include_content: bool = False) -> WikiPageOut:
+def _to_page_out(
+    row: WikiPageRow,
+    *,
+    include_content: bool = False,
+    session: Session | None = None,
+) -> WikiPageOut:
+    space = None
+    if session is not None:
+        space = _space_for_row(session, row)
     return WikiPageOut(
         id=row.id,
         path=row.path,
+        space_id=int(space.id if space and space.id is not None else row.space_id or 0),
+        space_name=space.name if space else "",
         title=row.title,
         page_type=row.page_type,
         source_document_id=row.source_document_id,
@@ -177,11 +252,19 @@ def _candidate_meta(item: WikiReviewItem) -> dict[str, Any]:
     return _json_object(item.candidate_frontmatter_json)
 
 
-def _review_summary(item: WikiReviewItem) -> WikiReviewOut:
+def _review_summary(item: WikiReviewItem, session: Session | None = None) -> WikiReviewOut:
+    space = None
+    if session is not None:
+        try:
+            space = resolve_space(session, item.space_id)
+        except ValueError:
+            space = None
     return WikiReviewOut(
         id=int(item.id or 0),
         page_id=item.page_id,
         job_id=item.job_id,
+        space_id=item.space_id or (space.id if space else None),
+        space_name=space.name if space else "",
         kind=item.kind,
         status=item.status,
         reason=item.reason,
@@ -203,6 +286,7 @@ def _review_detail(session: Session, item: WikiReviewItem) -> WikiReviewDetailOu
     if not sources and item.job_id is not None:
         job = session.get(IngestJob, item.job_id)
         if job is not None:
+            _job_space(session, job)
             sources = [WikiSourceEvidenceOut(document_id=job.document_id)]
     candidate = WikiCandidateOut(
         page_key=page_key,
@@ -278,7 +362,7 @@ def _review_detail(session: Session, item: WikiReviewItem) -> WikiReviewDetailOu
         risk_flags=[str(value) for value in risks],
     )
     return WikiReviewDetailOut(
-        **_review_summary(item).model_dump(),
+        **_review_summary(item, session).model_dump(),
         old_version=old_out,
         new_candidate=candidate,
         reason_detail=reason_detail,
@@ -299,7 +383,14 @@ def _candidate_page(
     if operation == "update":
         if row is None or not row.page_key:
             raise ValueError("update candidate requires an existing page")
-        existing = WikiRepository(session).read(row.page_key)
+        space_id = row.space_id
+        if item.space_id is not None:
+            space_id = item.space_id
+        elif item.job_id is not None:
+            job_row = session.get(IngestJob, item.job_id)
+            if job_row is not None:
+                space_id = job_row.space_id
+        existing = WikiRepository(session, space_id=space_id).read(row.page_key)
         values = existing.frontmatter.model_dump(mode="python")
         page_key = row.page_key
     else:
@@ -383,11 +474,16 @@ def _best_effort_log(function: Any, **fields: Any) -> None:
         pass
 
 
-def _best_effort_rebuild_derived(session: Session) -> None:
+def _best_effort_rebuild_derived(session: Session, space_id: int | None = None) -> None:
     try:
-        rows = session.exec(select(WikiPageRow).order_by(WikiPageRow.id)).all()
-        rebuild_index(rows, session=session)
-        rebuild_overview(rows, session=session)
+        sid = resolve_space_id(session, space_id)
+        rows = session.exec(
+            select(WikiPageRow)
+            .where(space_scope_clause(session, WikiPageRow.space_id, sid))
+            .order_by(WikiPageRow.id)
+        ).all()
+        rebuild_index(rows, session=session, space_id=sid)
+        rebuild_overview(rows, session=session, space_id=sid)
     except OSError:
         # Derived navigation must not roll back an already committed review.
         pass
@@ -397,8 +493,9 @@ def _best_effort_rebuild_derived(session: Session) -> None:
 def list_ingest_jobs(
     status: Optional[str] = None,
     document_id: Optional[int] = None,
+    space_id: Optional[int] = None,
     session: Session = Depends(get_session),
-) -> list[IngestJob]:
+) -> list[IngestJobOut]:
     statement = select(IngestJob).order_by(IngestJob.id.desc())
     if status:
         statuses = [item.strip() for item in status.split(",") if item.strip()]
@@ -406,51 +503,88 @@ def list_ingest_jobs(
             statement = statement.where(IngestJob.status.in_(statuses))
     if document_id is not None:
         statement = statement.where(IngestJob.document_id == document_id)
-    return list(session.exec(statement).all())
+    if space_id is None:
+        space_id = resolve_space_id(session)
+    statement = statement.where(space_scope_clause(session, IngestJob.space_id, space_id))
+    rows = list(session.exec(statement).all())
+    for row in rows:
+        _job_space(session, row)
+    return [_job_out(session, row) for row in rows]
 
 
 @router.get("/api/ingest-jobs/{job_id}", response_model=IngestJobOut)
-def get_ingest_job(job_id: int, session: Session = Depends(get_session)) -> IngestJob:
+def get_ingest_job(
+    job_id: int,
+    space_id: Optional[int] = Query(default=None),
+    session: Session = Depends(get_session),
+) -> IngestJobOut:
     job = session.get(IngestJob, job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Ingest job not found")
-    return job
+    _job_scope(session, job, resolve_space_id(session, space_id))
+    return _job_out(session, job)
 
 
 @router.post("/api/ingest-jobs/{job_id}/cancel", response_model=IngestJobOut)
-def cancel_ingest(job_id: int, session: Session = Depends(get_session)) -> IngestJob:
+def cancel_ingest(
+    job_id: int,
+    space_id: Optional[int] = Query(default=None),
+    session: Session = Depends(get_session),
+) -> IngestJobOut:
+    existing = session.get(IngestJob, job_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Ingest job not found")
+    _job_scope(session, existing, resolve_space_id(session, space_id))
     job = cancel_ingest_job(session, job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Ingest job not found")
-    return job
+    return _job_out(session, job)
 
 
 @router.post("/api/ingest-jobs/{job_id}/retry-failed-windows", response_model=IngestJobOut)
 def retry_ingest_failed_windows(
     job_id: int,
+    space_id: Optional[int] = Query(default=None),
     session: Session = Depends(get_session),
-) -> IngestJob:
+) -> IngestJobOut:
+    existing = session.get(IngestJob, job_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Ingest job not found")
+    _job_scope(session, existing, resolve_space_id(session, space_id))
     try:
         job = retry_failed_windows(session, job_id)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     if job is None:
         raise HTTPException(status_code=404, detail="Ingest job not found")
-    return job
+    return _job_out(session, job)
 
 
 @router.get("/api/wiki/pages", response_model=List[WikiPageOut])
-def list_wiki_pages(session: Session = Depends(get_session)) -> list[WikiPageOut]:
-    rows = session.exec(select(WikiPageRow).order_by(WikiPageRow.id.desc())).all()
-    return [_to_page_out(r, include_content=False) for r in rows]
+def list_wiki_pages(
+    space_id: Optional[int] = Query(default=None),
+    session: Session = Depends(get_session),
+) -> list[WikiPageOut]:
+    sid = resolve_space_id(session, space_id)
+    rows = session.exec(
+        select(WikiPageRow)
+        .where(space_scope_clause(session, WikiPageRow.space_id, sid))
+        .order_by(WikiPageRow.id.desc())
+    ).all()
+    return [_to_page_out(r, include_content=False, session=session) for r in rows]
 
 
 @router.get("/api/wiki/pages/{page_id}", response_model=WikiPageOut)
-def get_wiki_page(page_id: int, session: Session = Depends(get_session)) -> WikiPageOut:
+def get_wiki_page(
+    page_id: int,
+    space_id: Optional[int] = Query(default=None),
+    session: Session = Depends(get_session),
+) -> WikiPageOut:
     row = session.get(WikiPageRow, page_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Wiki page not found")
-    return _to_page_out(row, include_content=True)
+    _page_scope(session, row, resolve_space_id(session, space_id))
+    return _to_page_out(row, include_content=True, session=session)
 
 
 @router.get("/api/wiki/reviews", response_model=list[WikiReviewOut])
@@ -459,6 +593,7 @@ def list_wiki_reviews(
     kind: Optional[str] = None,
     page_id: Optional[int] = None,
     job_id: Optional[int] = None,
+    space_id: Optional[int] = Query(default=None),
     session: Session = Depends(get_session),
 ) -> list[WikiReviewOut]:
     statement = select(WikiReviewItem).order_by(WikiReviewItem.id.desc())
@@ -470,16 +605,21 @@ def list_wiki_reviews(
         statement = statement.where(WikiReviewItem.page_id == page_id)
     if job_id is not None:
         statement = statement.where(WikiReviewItem.job_id == job_id)
-    return [_review_summary(item) for item in session.exec(statement).all()]
+    sid = resolve_space_id(session, space_id)
+    statement = statement.where(space_scope_clause(session, WikiReviewItem.space_id, sid))
+    return [_review_summary(item, session) for item in session.exec(statement).all()]
 
 
 @router.get("/api/wiki/reviews/{review_id}", response_model=WikiReviewDetailOut)
 def get_wiki_review(
-    review_id: int, session: Session = Depends(get_session)
+    review_id: int,
+    space_id: Optional[int] = Query(default=None),
+    session: Session = Depends(get_session),
 ) -> WikiReviewDetailOut:
     item = session.get(WikiReviewItem, review_id)
     if item is None:
         raise HTTPException(status_code=404, detail="Wiki review item not found")
+    _review_scope(session, item, resolve_space_id(session, space_id))
     return _review_detail(session, item)
 
 
@@ -487,6 +627,7 @@ def get_wiki_review(
 def approve_wiki_review(
     review_id: int,
     body: WikiReviewDecisionIn | None = None,
+    space_id: Optional[int] = Query(default=None),
     session: Session = Depends(get_session),
 ) -> WikiReviewDetailOut:
     item = session.get(WikiReviewItem, review_id)
@@ -494,6 +635,9 @@ def approve_wiki_review(
         raise HTTPException(status_code=404, detail="Wiki review item not found")
     if item.status != "pending":
         raise HTTPException(status_code=409, detail="Only pending review items can be approved")
+    sid = resolve_space_id(session, space_id)
+    _review_scope(session, item, sid)
+    item.space_id = item.space_id or sid
     if item.kind == "merge":
         raise HTTPException(status_code=409, detail="Merge candidates require manual review")
 
@@ -507,7 +651,7 @@ def approve_wiki_review(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     decision_reason = ((body.decision_reason if body else None) or (body.reason if body else None) or item.reason).strip()
-    with page_key_lock(f"review.item.{review_id}"), page_key_lock(page_key):
+    with page_key_lock(f"review.item.{review_id}", sid), page_key_lock(page_key, sid):
         session.refresh(item)
         if item.status != "pending":
             raise HTTPException(
@@ -518,14 +662,14 @@ def approve_wiki_review(
             if operation == "create":
                 if item.page_id is not None:
                     raise ValueError("create candidate cannot target an existing page")
-                record = WikiRepository(session).create(
+                record = WikiRepository(session, space_id=sid).create(
                     page, job_id=item.job_id, reason=decision_reason
                 )
                 item.page_id = record.id
             else:
                 if item.page_id is None:
                     raise ValueError("update candidate requires page_id")
-                record = WikiRepository(session).update(
+                record = WikiRepository(session, space_id=sid).update(
                     page_key, page, job_id=item.job_id, reason=decision_reason
                 )
         except (ValueError, WikiPageAlreadyExistsError, WikiPageNotFoundError) as exc:
@@ -546,7 +690,7 @@ def approve_wiki_review(
         revision=record.revision,
         reason=decision_reason,
     )
-    _best_effort_rebuild_derived(session)
+    _best_effort_rebuild_derived(session, sid)
     return _review_detail(session, item)
 
 
@@ -554,12 +698,15 @@ def approve_wiki_review(
 def reject_wiki_review(
     review_id: int,
     body: WikiReviewDecisionIn | None = None,
+    space_id: Optional[int] = Query(default=None),
     session: Session = Depends(get_session),
 ) -> WikiReviewDetailOut:
     item = session.get(WikiReviewItem, review_id)
     if item is None:
         raise HTTPException(status_code=404, detail="Wiki review item not found")
-    with page_key_lock(f"review.item.{review_id}"):
+    sid = resolve_space_id(session, space_id)
+    _review_scope(session, item, sid)
+    with page_key_lock(f"review.item.{review_id}", sid):
         session.refresh(item)
         if item.status != "pending":
             raise HTTPException(
@@ -585,6 +732,7 @@ def reject_wiki_review(
 def acknowledge_wiki_review(
     review_id: int,
     body: WikiReviewDecisionIn | None = None,
+    space_id: Optional[int] = Query(default=None),
     session: Session = Depends(get_session),
 ) -> WikiReviewDetailOut:
     """Close a structural reminder that has no page candidate to approve."""
@@ -592,6 +740,8 @@ def acknowledge_wiki_review(
     item = session.get(WikiReviewItem, review_id)
     if item is None:
         raise HTTPException(status_code=404, detail="Wiki review item not found")
+    sid = resolve_space_id(session, space_id)
+    _review_scope(session, item, sid)
     if item.status != "pending":
         raise HTTPException(status_code=409, detail="Only pending review items can be acknowledged")
     payload = _json_object(item.payload_json)
@@ -606,7 +756,7 @@ def acknowledge_wiki_review(
         or (body.reason if body else None)
         or "已确认结构化提醒"
     ).strip()
-    with page_key_lock(f"review.item.{review_id}"):
+    with page_key_lock(f"review.item.{review_id}", sid):
         session.refresh(item)
         if item.status != "pending":
             raise HTTPException(
@@ -630,10 +780,14 @@ def acknowledge_wiki_review(
 
 @router.get("/api/wiki/pages/{page_id}/revisions", response_model=list[WikiRevisionOut])
 def list_wiki_revisions(
-    page_id: int, session: Session = Depends(get_session)
+    page_id: int,
+    space_id: Optional[int] = Query(default=None),
+    session: Session = Depends(get_session),
 ) -> list[WikiRevisionOut]:
-    if session.get(WikiPageRow, page_id) is None:
+    page = session.get(WikiPageRow, page_id)
+    if page is None:
         raise HTTPException(status_code=404, detail="Wiki page not found")
+    _page_scope(session, page, resolve_space_id(session, space_id))
     rows = session.exec(
         select(WikiPageRevision)
         .where(WikiPageRevision.page_id == page_id)
@@ -644,10 +798,15 @@ def list_wiki_revisions(
 
 @router.get("/api/wiki/pages/{page_id}/revisions/{revision_id}", response_model=WikiRevisionOut)
 def get_wiki_revision(
-    page_id: int, revision_id: int, session: Session = Depends(get_session)
+    page_id: int,
+    revision_id: int,
+    space_id: Optional[int] = Query(default=None),
+    session: Session = Depends(get_session),
 ) -> WikiRevisionOut:
-    if session.get(WikiPageRow, page_id) is None:
+    page = session.get(WikiPageRow, page_id)
+    if page is None:
         raise HTTPException(status_code=404, detail="Wiki page not found")
+    _page_scope(session, page, resolve_space_id(session, space_id))
     row = session.get(WikiPageRevision, revision_id)
     if row is None or row.page_id != page_id:
         raise HTTPException(status_code=404, detail="Wiki revision not found")
@@ -659,10 +818,13 @@ def get_wiki_diff(
     page_id: int,
     from_revision: Optional[int] = None,
     to_revision: Optional[int] = None,
+    space_id: Optional[int] = Query(default=None),
     session: Session = Depends(get_session),
 ) -> WikiDiffOut:
-    if session.get(WikiPageRow, page_id) is None:
+    page = session.get(WikiPageRow, page_id)
+    if page is None:
         raise HTTPException(status_code=404, detail="Wiki page not found")
+    _page_scope(session, page, resolve_space_id(session, space_id))
     rows = session.exec(
         select(WikiPageRevision)
         .where(WikiPageRevision.page_id == page_id)
@@ -696,11 +858,14 @@ def get_wiki_diff(
 def rollback_wiki_page(
     page_id: int,
     body: WikiRollbackIn,
+    space_id: Optional[int] = Query(default=None),
     session: Session = Depends(get_session),
 ) -> WikiRollbackOut:
     row = session.get(WikiPageRow, page_id)
     if row is None or not row.page_key:
         raise HTTPException(status_code=404, detail="Wiki page not found")
+    sid = resolve_space_id(session, space_id)
+    _page_scope(session, row, sid)
     target_number = body.revision
     target = session.get(WikiPageRevision, body.revision_id) if body.revision_id else None
     if (target is None or target.page_id != page_id) and body.revision_id is not None:
@@ -720,7 +885,7 @@ def rollback_wiki_page(
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=422, detail=f"Historical revision is invalid: {exc}") from exc
     try:
-        record = WikiRepository(session).rollback(
+        record = WikiRepository(session, space_id=sid).rollback(
             row.page_key,
             page,
             job_id=body.job_id,
@@ -744,29 +909,42 @@ def rollback_wiki_page(
         reason=body.reason,
         reviewed_by=body.reviewed_by,
     )
-    _best_effort_rebuild_derived(session)
+    _best_effort_rebuild_derived(session, sid)
     return WikiRollbackOut(**_revision_out(created).model_dump())
 
 
 @router.get("/api/source-chunks/{chunk_id}", response_model=SourceChunkOut)
 def get_source_chunk(
-    chunk_id: int, session: Session = Depends(get_session)
+    chunk_id: int,
+    space_id: Optional[int] = Query(default=None),
+    session: Session = Depends(get_session),
 ) -> SourceChunk:
     row = session.get(SourceChunk, chunk_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Source chunk not found")
+    sid = resolve_space_id(session, space_id)
+    default_space_id = resolve_space_id(session)
+    actual_space_id = int(row.space_id) if row.space_id is not None else default_space_id
+    if actual_space_id != sid:
+        raise HTTPException(status_code=404, detail="Source chunk not found in this space")
+    if row.space_id is None:
+        row.space_id = sid
     return row
 
 
 @router.get("/api/wiki/index", response_model=WikiIndexOut)
-def get_wiki_index() -> WikiIndexOut:
+def get_wiki_index(
+    space_id: Optional[int] = Query(default=None),
+    session: Session = Depends(get_session),
+) -> WikiIndexOut:
     config.ensure_data_dirs()
-    index_path = config.WIKI_DIR / "index.md"
+    space = resolve_space(session, space_id)
+    index_path = space_root(space) / "index.md"
     if not index_path.exists():
         content = "# Wiki Index\n\n"
     else:
         content = index_path.read_text(encoding="utf-8", errors="replace")
-    return WikiIndexOut(content=content, path="wiki/index.md")
+    return WikiIndexOut(content=content, path=f"wiki/spaces/{space.slug}/index.md")
 
 
 @router.post("/api/wiki/retrieve", response_model=RetrieveResponse)
@@ -788,6 +966,7 @@ def retrieve_wiki(
         wiki_k=wiki_k,
         source_k=source_k,
         types=body.types,
+        space_id=resolve_space_id(session, body.space_id),
     )
 
     hits: list[RetrieveHit] = []
@@ -818,6 +997,7 @@ def retrieve_wiki(
                   revision=h.get("revision"),
                   aliases=list(h.get("aliases") or []),
                   source_document_ids=list(h.get("source_document_ids") or []),
+                  space_id=h.get("space_id"),
             )
         )
     return RetrieveResponse(

@@ -18,6 +18,7 @@ from app.models.entities import (
     TaskCitation,
     TaskEvent,
     WikiPageRow,
+    WikiSpace,
 )
 from app.schemas.tasks import (
     ApplyPromptBody,
@@ -45,6 +46,7 @@ from app.services.task_pipeline import (
     run_review,
 )
 from app.services.task_state import InvalidTransition, transition
+from app.services.wiki_spaces import resolve_space, resolve_space_id
 
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
 
@@ -163,10 +165,16 @@ def to_task_out(session: Session, task: GenerationTask) -> TaskOut:
 
     review_row = _latest_review_row(session, task.id)
     latest_review = _review_to_out(review_row) if review_row is not None else None
+    try:
+        space = resolve_space(session, task.wiki_space_id)
+    except ValueError:
+        space = None
 
     return TaskOut(
         id=task.id,
         requirement_id=task.requirement_id,
+        wiki_space_id=int(space.id if space and space.id is not None else task.wiki_space_id or 0),
+        wiki_space_name=space.name if space else "",
         status=task.status,
         model_id=task.model_id,
         prompt_template_id=task.prompt_template_id,
@@ -193,6 +201,10 @@ def create_task(
         description="If true (or chat hooks injected), run generate inline before responding",
     ),
 ) -> TaskOut:
+    try:
+        space = resolve_space(session, body.wiki_space_id, for_write=True)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     if body.prompt_template_id is not None:
         prompt = session.get(PromptTemplate, body.prompt_template_id)
         if prompt is None:
@@ -219,6 +231,7 @@ def create_task(
 
     task = GenerationTask(
         requirement_id=requirement.id,
+        wiki_space_id=space.id,
         status="draft",
         model_id=body.model_id,
         prompt_template_id=body.prompt_template_id,
@@ -465,6 +478,11 @@ def list_citations(
     task = session.get(GenerationTask, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
+    try:
+        task_space_id = int(resolve_space(session, task.wiki_space_id).id or 0)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    default_space_id = resolve_space_id(session)
     rows = session.exec(
         select(TaskCitation)
         .where(TaskCitation.task_id == task_id)
@@ -483,9 +501,17 @@ def list_citations(
         citation_type = getattr(r, "citation_type", None) or "wiki"
         target_available = False
         if citation_type == "source" and getattr(r, "source_chunk_id", None) is not None:
-            target_available = session.get(SourceChunk, r.source_chunk_id) is not None
+            chunk = session.get(SourceChunk, r.source_chunk_id)
+            chunk_space_id = (
+                int(chunk.space_id) if chunk is not None and chunk.space_id is not None else default_space_id
+            )
+            target_available = chunk is not None and chunk_space_id == task_space_id
         elif citation_type == "wiki" and r.wiki_page_id is not None:
-            target_available = session.get(WikiPageRow, r.wiki_page_id) is not None
+            page = session.get(WikiPageRow, r.wiki_page_id)
+            page_space_id = (
+                int(page.space_id) if page is not None and page.space_id is not None else default_space_id
+            )
+            target_available = page is not None and page_space_id == task_space_id
         legacy = not target_available
         out.append(
             TaskCitationOut(
@@ -513,7 +539,7 @@ def list_citations(
 
 
 @router.get("/{task_id}/events", response_model=List[TaskEventOut])
-def list_events(task_id: int, session: Session = Depends(get_session)) -> list[TaskEvent]:
+def list_events(task_id: int, session: Session = Depends(get_session)) -> list[TaskEventOut]:
     task = session.get(GenerationTask, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
@@ -522,7 +548,18 @@ def list_events(task_id: int, session: Session = Depends(get_session)) -> list[T
         .where(TaskEvent.task_id == task_id)
         .order_by(col(TaskEvent.id).asc())
     ).all()
-    return list(rows)
+    try:
+        space = resolve_space(session, task.wiki_space_id)
+    except ValueError:
+        space = None
+    return [
+        TaskEventOut(
+            **row.model_dump(),
+            wiki_space_id=task.wiki_space_id,
+            wiki_space_name=space.name if space else "",
+        )
+        for row in rows
+    ]
 
 
 @router.get("/{task_id}/reviews", response_model=List[ReviewResultOut])

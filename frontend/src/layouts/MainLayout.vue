@@ -2,14 +2,15 @@
 import { computed, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import {
-  Collection,
+    Collection,
   CircleCheck,
   Cpu,
   Document,
   EditPen,
   List,
   Monitor,
-  Reading,
+    Reading,
+    FolderOpened,
 } from '@element-plus/icons-vue'
 import { listModels, type ModelConfig } from '../api/models'
 
@@ -22,6 +23,7 @@ const menuItems = [
   { path: '/documents', label: '文档管理', icon: Document },
   { path: '/wiki', label: 'Wiki', icon: Reading },
   { path: '/wiki/reviews', label: 'Wiki 审核', icon: CircleCheck },
+  { path: '/wiki-spaces', label: 'Wiki 空间', icon: FolderOpened },
   { path: '/prompts', label: '提示词', icon: EditPen },
   { path: '/models', label: '模型配置', icon: Cpu },
 ]

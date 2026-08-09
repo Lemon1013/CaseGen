@@ -6,6 +6,7 @@ DATA_DIR = Path(os.getenv("APP_DATA_DIR", ROOT / "data"))
 RAW_DIR = DATA_DIR / "raw" / "sources"
 WIKI_DIR = DATA_DIR / "wiki"
 WIKI_PAGES_DIR = WIKI_DIR / "pages"
+WIKI_SPACES_DIR = WIKI_DIR / "spaces"
 META_DIR = DATA_DIR / "meta"
 DB_PATH = META_DIR / "app.db"
 BUNDLED_WIKI_DIR = Path(__file__).resolve().parent / "default_wiki"
@@ -44,7 +45,7 @@ ALLOWED_EXTENSIONS = {".md", ".txt", ".pdf", ".docx"}
 
 
 def ensure_data_dirs() -> None:
-    for p in (RAW_DIR, WIKI_PAGES_DIR, META_DIR):
+    for p in (RAW_DIR, WIKI_PAGES_DIR, WIKI_SPACES_DIR, META_DIR):
         p.mkdir(parents=True, exist_ok=True)
 
     for filename in ("purpose.md", "schema.md"):

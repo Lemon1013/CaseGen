@@ -43,12 +43,22 @@ def _validate_page_type(page_type: str) -> str:
     return page_type
 
 
-def relative_page_path(page_type: str, page_key: str) -> Path:
+def relative_page_path(
+    page_type: str,
+    page_key: str,
+    *,
+    space_slug: str | None = None,
+) -> Path:
     """Return the backend-owned relative path for a stable page identity."""
 
     page_type = _validate_page_type(page_type)
     page_key = validate_page_key(page_key)
-    return Path(PAGE_TYPE_DIRECTORIES[page_type]) / f"{page_key}.md"
+    relative = Path(PAGE_TYPE_DIRECTORIES[page_type]) / f"{page_key}.md"
+    if space_slug:
+        from app.services.wiki_spaces import normalize_space_slug
+
+        relative = Path("spaces") / normalize_space_slug(space_slug) / "pages" / relative
+    return relative
 
 
 def _assert_inside(root: Path, candidate: Path) -> Path:
@@ -74,7 +84,12 @@ class StagedWikiPage:
 class WikiStaging:
     """Context manager for one isolated Wiki candidate operation."""
 
-    def __init__(self, operation_id: str | None = None) -> None:
+    def __init__(
+        self,
+        operation_id: str | None = None,
+        *,
+        space_slug: str | None = None,
+    ) -> None:
         config.ensure_data_dirs()
         self.root = Path(config.WIKI_DIR) / ".staging"
         self.root.mkdir(parents=True, exist_ok=True)
@@ -84,6 +99,7 @@ class WikiStaging:
         self.operation_dir = self.root / operation_name
         _assert_inside(self.root, self.operation_dir)
         self.operation_dir.mkdir(parents=True, exist_ok=False)
+        self.space_slug = space_slug
         self._cleaned = False
 
     @property
@@ -144,7 +160,7 @@ class WikiStaging:
             _validate_page_type(page_type)
             validate_page_key(page_key)
 
-        relative = relative_page_path(page_type, page_key)
+        relative = relative_page_path(page_type, page_key, space_slug=self.space_slug)
         candidate = self.operation_dir / relative
         _assert_inside(self.operation_dir, candidate)
         candidate.parent.mkdir(parents=True, exist_ok=True)
@@ -174,8 +190,12 @@ class WikiStaging:
             raise ValueError("staged Wiki page type does not match its destination")
         if page_key is not None and page.page_key != validate_page_key(page_key):
             raise ValueError("staged Wiki page key does not match its destination")
-        expected = relative_page_path(page.type, page.page_key).as_posix()
-        actual = candidate.relative_to(self.operation_dir).as_posix()
+        expected = relative_page_path(
+            page.type,
+            page.page_key,
+            space_slug=self.space_slug,
+        ).as_posix()
+        actual = candidate.relative_to(self.operation_dir.resolve()).as_posix()
         if actual != expected:
             raise ValueError("staged Wiki page path does not match its page identity")
         return StagedWikiPage(

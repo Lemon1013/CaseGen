@@ -366,6 +366,10 @@ onUnmounted(stopPolling)
               <span class="meta">更新于 {{ formatTime(task?.updated_at || '') }}</span>
             </div>
           </template>
+          <div v-if="task" class="space-banner">
+            <span class="meta">Wiki 空间</span>
+            <el-tag type="info" effect="plain">{{ task.wiki_space_name || `空间 #${task.wiki_space_id}` }}</el-tag>
+          </div>
           <div class="req-desc">{{ task?.description || '-' }}</div>
           <div v-if="task?.focus_tags?.length" class="tags">
             <el-tag
@@ -409,6 +413,7 @@ onUnmounted(stopPolling)
           <CitationList
             :citations="citations"
             :count="citations.length || task?.citation_count || 0"
+            :space-id="task?.wiki_space_id"
           />
         </el-card>
 
@@ -528,6 +533,15 @@ onUnmounted(stopPolling)
   white-space: pre-wrap;
   line-height: 1.6;
   color: var(--cg-text);
+}
+
+.space-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--cg-border);
 }
 
 .tags {

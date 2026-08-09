@@ -7,11 +7,12 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
-from sqlmodel import select
+from sqlmodel import Session, select
 
 from app import config
 from app.models.entities import WikiReviewItem
 from app.services.wiki_index import build_index_entries
+from app.services.wiki_spaces import space_scope_clause
 
 
 def _value(item: Any, name: str, default: Any = None) -> Any:
@@ -28,13 +29,18 @@ def _review_conflict(item: Any) -> bool:
     )
 
 
-def _reviews(session: Any, supplied: Iterable[Any] | None) -> list[Any]:
+def _reviews(session: Any, supplied: Iterable[Any] | None, space_id: int | None = None) -> list[Any]:
     if supplied is not None:
         return list(supplied)
     if session is None:
         return []
     try:
-        return list(session.exec(select(WikiReviewItem).order_by(WikiReviewItem.id)).all())
+        statement = select(WikiReviewItem).order_by(WikiReviewItem.id)
+        if space_id is not None:
+            statement = statement.where(
+                space_scope_clause(session, WikiReviewItem.space_id, space_id)
+            )
+        return list(session.exec(statement).all())
     except Exception:
         return []
 
@@ -44,8 +50,9 @@ def collect_overview(
     *,
     session: Any = None,
     review_items: Iterable[Any] | None = None,
+    space_id: int | None = None,
 ) -> dict[str, Any]:
-    entries = build_index_entries(pages, session=session)
+    entries = build_index_entries(pages, session=session, space_id=space_id)
     by_id = {entry.get("id"): entry for entry in entries if entry.get("id") is not None}
     domains: dict[str, dict[str, Any]] = {}
     for entry in entries:
@@ -65,7 +72,7 @@ def collect_overview(
         for entry in rules[:50]
     ]
     conflicts: list[dict[str, Any]] = []
-    for item in _reviews(session, review_items):
+    for item in _reviews(session, review_items, space_id):
         if not _review_conflict(item):
             continue
         entry = by_id.get(_value(item, "page_id"))
@@ -136,10 +143,23 @@ def rebuild_overview(
     session: Any = None,
     review_items: Iterable[Any] | None = None,
     overview_path: Path | None = None,
+    space_id: int | None = None,
 ) -> str:
     config.ensure_data_dirs()
-    content = render_overview(collect_overview(pages, session=session, review_items=review_items))
-    target = Path(overview_path or (config.WIKI_DIR / "overview.md"))
+    content = render_overview(
+        collect_overview(
+            pages,
+            session=session,
+            review_items=review_items,
+            space_id=space_id,
+        )
+    )
+    if overview_path is None and space_id is not None:
+        from app.services.wiki_spaces import resolve_space, space_root
+
+        target = space_root(resolve_space(session, space_id)) / "overview.md"
+    else:
+        target = Path(overview_path or (config.WIKI_DIR / "overview.md"))
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content, encoding="utf-8")
     return content

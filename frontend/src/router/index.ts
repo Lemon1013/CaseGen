@@ -58,6 +58,15 @@ const router = createRouter({
       },
     },
     {
+      path: '/wiki-spaces',
+      name: 'wiki-spaces',
+      component: () => import('../views/WikiSpacesView.vue'),
+      meta: {
+        title: 'Wiki 空间',
+        description: '按项目管理隔离的 Wiki 文档、页面与审核空间',
+      },
+    },
+    {
       path: '/prompts',
       name: 'prompts',
       component: () => import('../views/PromptsView.vue'),

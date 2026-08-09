@@ -9,6 +9,8 @@ class IngestJobOut(BaseModel):
 
     id: int
     document_id: int
+    space_id: int
+    space_name: str = ""
     status: str
     stage: str = "queued"
     progress: int = 0
@@ -27,6 +29,8 @@ class WikiPageOut(BaseModel):
 
     id: int
     path: str
+    space_id: int
+    space_name: str = ""
     title: str
     page_type: str
     source_document_id: Optional[int] = None
@@ -48,6 +52,7 @@ class WikiIndexOut(BaseModel):
 
 class RetrieveRequest(BaseModel):
     query: str
+    space_id: Optional[int] = Field(default=None, ge=1)
     top_k: Optional[int] = None
     types: Optional[List[str]] = None
 
@@ -76,6 +81,7 @@ class RetrieveHit(BaseModel):
     revision: Optional[int] = None
     aliases: List[str] = Field(default_factory=list)
     source_document_ids: List[int] = Field(default_factory=list)
+    space_id: Optional[int] = None
 
 
 class RetrieveResponse(BaseModel):
@@ -124,6 +130,8 @@ class WikiReviewOut(BaseModel):
     id: int
     page_id: Optional[int] = None
     job_id: Optional[int] = None
+    space_id: Optional[int] = None
+    space_name: str = ""
     kind: str
     status: str
     reason: str

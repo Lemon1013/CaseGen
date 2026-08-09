@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref } from 'vue'
-import { useRoute } from 'vue-router'
+import { onMounted, onUnmounted, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import type { UploadRequestOptions } from 'element-plus'
 import { Refresh, UploadFilled } from '@element-plus/icons-vue'
@@ -22,9 +22,14 @@ import {
   type IngestStep,
   type SourceChunk,
 } from '../api/documents'
+import { listWikiSpaces, type WikiSpace } from '../api/wikiSpaces'
+import { chooseSpace, rememberAndRoute, spaceIdFromQuery } from '../utils/wikiSpace'
 
 const loading = ref(false)
 const route = useRoute()
+const router = useRouter()
+const spaces = ref<WikiSpace[]>([])
+const currentSpace = ref<WikiSpace | null>(null)
 const documents = ref<DocumentItem[]>([])
 const jobs = ref<Record<number, IngestJob | undefined>>({})
 const jobErrors = ref<Record<number, string>>({})
@@ -112,8 +117,13 @@ function currentJob(row: DocumentItem) {
   return jobs.value[row.id]
 }
 
+function changeSpace(id: number) {
+  void rememberAndRoute(router, id, '/documents')
+}
+
 async function loadDocumentsOnly() {
-  documents.value = await listDocuments()
+  if (!currentSpace.value) return
+  documents.value = await listDocuments(currentSpace.value.id)
 }
 
 async function loadQualityPreview(row: DocumentItem) {
@@ -124,7 +134,7 @@ async function loadQualityPreview(row: DocumentItem) {
   }
 
   setQualityLoading(row.id, true)
-  const request = getDocumentPreview(row.id, 50000)
+  const request = getDocumentPreview(row.id, 50000, currentSpace.value?.id)
     .then((preview) => {
       setQualityPreview(row.id, preview)
       setQualityError(row.id, '')
@@ -147,7 +157,7 @@ function loadQualityPreviews(rows: DocumentItem[]) {
 async function restoreJobs(rows: DocumentItem[]) {
   let allJobs: IngestJob[]
   try {
-    allJobs = await listIngestJobs()
+    allJobs = await listIngestJobs(undefined, currentSpace.value?.id)
   } catch (error: unknown) {
     ElMessage.warning(`摄入任务加载失败：${errorMessage(error, '请点击刷新重试')}`)
     return
@@ -174,7 +184,19 @@ async function restoreJobs(rows: DocumentItem[]) {
 async function load() {
   loading.value = true
   try {
-    const rows = await listDocuments()
+    if (!spaces.value.length) spaces.value = await listWikiSpaces()
+    const requested = spaceIdFromQuery(route.query)
+    currentSpace.value = chooseSpace(spaces.value, requested)
+    if (!currentSpace.value) {
+      documents.value = []
+      return
+    }
+    if (requested !== currentSpace.value.id) {
+      await rememberAndRoute(router, currentSpace.value.id, '/documents')
+    } else {
+      localStorage.setItem('casegen:last-wiki-space-id', String(currentSpace.value.id))
+    }
+    const rows = await listDocuments(currentSpace.value.id)
     documents.value = rows
     void loadQualityPreviews(rows)
     await restoreJobs(rows)
@@ -188,7 +210,10 @@ async function load() {
 async function customUpload(options: UploadRequestOptions) {
   try {
     const file = options.file as File
-    const document = await uploadDocument(file)
+    if (!currentSpace.value || currentSpace.value.status !== 'active') {
+      throw new Error('当前空间已归档，不能上传文档')
+    }
+    const document = await uploadDocument(file, currentSpace.value.id)
     ElMessage.success(`上传成功：${file.name}，已完成基础解析`)
     options.onSuccess?.(document as never)
     await load()
@@ -308,7 +333,7 @@ async function startIngest(row: DocumentItem, force = false) {
   setActionLoading(row.id, true)
   setJobError(row.id, '')
   try {
-    const job = await ingestDocument(row.id, force)
+    const job = await ingestDocument(row.id, force, currentSpace.value?.id)
     setJob(row.id, job)
     if (isActiveJob(job)) {
       ElMessage.info(`${force ? '已提交重试' : '已开始摄入'}，任务 #${job.id}`)
@@ -332,7 +357,7 @@ async function retryWindows(row: DocumentItem) {
   setActionLoading(row.id, true)
   setJobError(row.id, '')
   try {
-    const updated = await retryFailedWindows(job.id)
+    const updated = await retryFailedWindows(job.id, currentSpace.value?.id)
     setJob(row.id, updated)
     if (isActiveJob(updated)) {
       ElMessage.info(`已提交失败窗口重试，任务 #${updated.id}`)
@@ -383,7 +408,7 @@ async function refreshJob(documentId: number, jobId: number) {
   if (pollingDocuments.has(documentId)) return
   pollingDocuments.add(documentId)
   try {
-    const job = await getIngestJob(jobId)
+    const job = await getIngestJob(jobId, currentSpace.value?.id)
     setJob(documentId, job)
     if (isTerminalJob(job)) {
       await finishJob(documentId, job, true)
@@ -418,7 +443,7 @@ async function cancelJob(row: DocumentItem) {
 
   setActionLoading(row.id, true)
   try {
-    const updated = await cancelIngestJob(job.id)
+    const updated = await cancelIngestJob(job.id, currentSpace.value?.id)
     setJob(row.id, updated)
     if (isActiveJob(updated)) {
       setJobError(row.id, '已提交取消请求，当前步骤结束后会停止任务。')
@@ -508,7 +533,7 @@ async function openChunks(row: DocumentItem) {
   chunkLoading.value = true
   chunks.value = []
   try {
-    chunks.value = await listDocumentChunks(row.id)
+    chunks.value = await listDocumentChunks(row.id, currentSpace.value?.id)
   } catch (error: unknown) {
     ElMessage.error(`加载原文块失败：${errorMessage(error, '请刷新后重试')}`)
   } finally {
@@ -521,7 +546,7 @@ async function openOriginalPreview(row: DocumentItem) {
   previewDrawerVisible.value = true
   previewLoading.value = true
   try {
-    const preview = await getDocumentPreview(row.id, 200000)
+    const preview = await getDocumentPreview(row.id, 200000, currentSpace.value?.id)
     previewContent.value = preview
     setQualityPreview(row.id, preview)
   } catch (error: unknown) {
@@ -542,6 +567,13 @@ onMounted(async () => {
   }
 })
 
+watch(
+  () => route.query.space_id,
+  () => {
+    void load()
+  },
+)
+
 onUnmounted(() => {
   for (const documentId of pollTimers.keys()) {
     clearPoll(documentId)
@@ -554,9 +586,24 @@ onUnmounted(() => {
     <div class="page-header">
       <div>
         <h1 class="page-title">文档管理</h1>
-        <p class="page-subtitle">上传源文档，查看解析质量，并将内容摄入 Wiki 供生成检索使用</p>
+        <p class="page-subtitle">上传源文档，查看解析质量，并将内容摄入当前空间的 Wiki</p>
       </div>
-      <div class="page-actions">
+      <div class="page-actions document-toolbar">
+        <el-select
+          v-if="spaces.length"
+          :model-value="currentSpace?.id"
+          class="space-select"
+          placeholder="选择 Wiki 空间"
+          @change="changeSpace"
+        >
+          <el-option
+            v-for="space in spaces"
+            :key="space.id"
+            :label="`${space.name} · ${space.document_count} 文档 / ${space.page_count} 页${space.status === 'archived' ? ' · 已归档' : ''}`"
+            :value="space.id"
+          />
+        </el-select>
+        <el-tag v-if="currentSpace?.status === 'archived'" type="info">只读空间</el-tag>
         <el-button :icon="Refresh" @click="load">刷新</el-button>
       </div>
     </div>
@@ -566,11 +613,12 @@ onUnmounted(() => {
       drag
       :http-request="customUpload"
       :show-file-list="false"
+      :disabled="!currentSpace || currentSpace.status !== 'active'"
       accept=".md,.txt,.pdf,.docx"
     >
       <div class="upload-inner">
         <el-icon class="upload-icon" :size="36"><UploadFilled /></el-icon>
-        <div class="upload-title">拖拽文件到此处，或点击上传</div>
+        <div class="upload-title">{{ currentSpace?.status === 'active' ? '拖拽文件到此处，或点击上传' : '当前空间已归档，无法上传' }}</div>
         <div class="upload-hint">支持 md / txt / pdf / docx · 上传后自动检查解析质量，再点击「摄入 Wiki」</div>
       </div>
     </el-upload>

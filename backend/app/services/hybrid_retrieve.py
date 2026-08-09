@@ -142,6 +142,7 @@ def _one_hop_expand(
     *,
     limit: int,
     types: list[str] | None,
+    space_id: int | None = None,
 ) -> list[dict[str, Any]]:
     """Expand direct Wiki hits once through wikilinks or shared provenance."""
     if not direct or limit <= 0:
@@ -156,6 +157,8 @@ def _one_hop_expand(
         if seed.get("source_document_id") is not None:
             source_ids.add(seed["source_document_id"])
         for candidate in pages:
+            if space_id is not None and candidate.get("space_id") not in {None, space_id}:
+                continue
             candidate_id = candidate.get("id")
             if candidate_id in direct_ids or candidate.get("status") == "archived":
                 continue
@@ -195,18 +198,19 @@ def _fts_rankings(
     *,
     wiki_limit: int,
     source_limit: int,
+    space_id: int,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str, str | None]:
     """Search the rebuildable FTS projection and enrich hits from canonical rows."""
     try:
         from app.services.wiki_fts import index_counts, rebuild_fts, search_source_chunks, search_wiki
 
-        counts = index_counts(session)
+        counts = index_counts(session, space_id=space_id)
         if not counts.get("available"):
             return [], [], "heuristic_fallback", counts.get("reason")
         if counts.get("wiki_pages") != len(pages) or counts.get("source_chunks") != len(chunks):
-            rebuild_fts(session, pages, chunks)
-        wiki_raw = search_wiki(session, query, limit=max(wiki_limit * 3, 12))
-        source_raw = search_source_chunks(session, query, limit=max(source_limit * 3, 12))
+            rebuild_fts(session, pages, chunks, space_id=space_id)
+        wiki_raw = search_wiki(session, query, limit=max(wiki_limit * 3, 12), space_id=space_id)
+        source_raw = search_source_chunks(session, query, limit=max(source_limit * 3, 12), space_id=space_id)
         if wiki_raw.error or source_raw.error:
             return [], [], "heuristic_fallback", wiki_raw.error or source_raw.error
         page_by_id = {page.get("id"): page for page in pages}
@@ -226,6 +230,7 @@ def hybrid_retrieve(
     wiki_k: Optional[int] = None,
     source_k: Optional[int] = None,
     types: Optional[list[str]] = None,
+    space_id: Optional[int] = None,
 ) -> dict[str, Any]:
     """
     Returns {
@@ -237,9 +242,12 @@ def hybrid_retrieve(
     wiki_k = wiki_k if wiki_k is not None else config.RETRIEVE_WIKI_TOP_K
     source_k = source_k if source_k is not None else config.RETRIEVE_SOURCE_TOP_K
 
-    all_pages = load_all_wiki_pages(session)
+    from app.services.wiki_spaces import resolve_space_id
+
+    resolved_space_id = resolve_space_id(session, space_id)
+    all_pages = load_all_wiki_pages(session, space_id=resolved_space_id)
     pages = [page for page in all_pages if page.get("status") != "archived"]
-    chunks = load_all_source_chunks(session)
+    chunks = load_all_source_chunks(session, space_id=resolved_space_id)
     clause_index = build_clause_index(chunks)
 
     legacy_wiki = rank_pages(query, pages, top_k=max(wiki_k * 3, 12), types=types)
@@ -251,11 +259,18 @@ def hybrid_retrieve(
         chunks,
         wiki_limit=wiki_k,
         source_limit=source_k,
+        space_id=resolved_space_id,
     )
     if types:
         fts_wiki = [hit for hit in fts_wiki if hit.get("page_type") in types]
     wiki_hits = _fuse_rankings(fts_wiki, legacy_wiki, limit=max(wiki_k * 2, wiki_k))
-    wiki_hits = _one_hop_expand(wiki_hits, pages, limit=wiki_k, types=types)
+    wiki_hits = _one_hop_expand(
+        wiki_hits,
+        pages,
+        limit=wiki_k,
+        types=types,
+        space_id=resolved_space_id,
+    )
     for h in wiki_hits:
         h["citation_type"] = "wiki"
         h["clause_ids"] = extract_clause_ids(

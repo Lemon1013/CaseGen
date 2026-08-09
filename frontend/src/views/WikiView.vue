@@ -12,6 +12,8 @@ import {
   type RetrieveHit,
   type WikiPage,
 } from '../api/wiki'
+import { listWikiSpaces, type WikiSpace } from '../api/wikiSpaces'
+import { chooseSpace, rememberAndRoute, spaceIdFromQuery } from '../utils/wikiSpace'
 
 type ListItem = {
   id: number | null
@@ -39,6 +41,8 @@ type ListItem = {
 
 const route = useRoute()
 const router = useRouter()
+const spaces = ref<WikiSpace[]>([])
+const currentSpace = ref<WikiSpace | null>(null)
 
 const loading = ref(false)
 const pages = ref<WikiPage[]>([])
@@ -175,7 +179,7 @@ function expansionLabel(explain?: Record<string, unknown> | null) {
 async function loadPages() {
   loading.value = true
   try {
-    pages.value = await listWikiPages()
+    pages.value = currentSpace.value ? await listWikiPages(currentSpace.value.id) : []
   } catch (e) {
     ElMessage.error(`加载 Wiki 页面失败：${(e as Error).message}`)
   } finally {
@@ -186,7 +190,7 @@ async function loadPages() {
 async function loadIndex() {
   previewLoading.value = true
   try {
-    const index = await getWikiIndex()
+    const index = await getWikiIndex(currentSpace.value?.id)
     selectedKey.value = null
     previewKind.value = 'index'
     previewDocumentId.value = null
@@ -249,7 +253,7 @@ async function openWikiPage(id: number | null | undefined, fallbackTitle?: strin
   previewDocumentId.value = null
   previewMeta.value = ''
   try {
-    const page = await getWikiPage(id)
+    const page = await getWikiPage(id, currentSpace.value?.id)
     previewTitle.value = page.title || fallbackTitle || `页面 #${id}`
     previewContent.value = page.content || '（无内容）'
   } catch (e) {
@@ -271,7 +275,7 @@ async function openSourceChunk(item: ListItem) {
   try {
     // Prefer live API; fall back to retrieve payload content/snippet
     try {
-      const chunk = await getSourceChunk(chunkId)
+      const chunk = await getSourceChunk(chunkId, currentSpace.value?.id)
       previewTitle.value = chunk.title || item.title || `原文块 #${chunkId}`
       previewDocumentId.value = chunk.document_id
       previewMeta.value = `文档 #${chunk.document_id} · 块 #${chunk.chunk_index} · ${chunk.start_char}–${chunk.end_char}`
@@ -313,7 +317,7 @@ async function search() {
   }
   searching.value = true
   try {
-    const res = await retrieveWiki(q, 20)
+    const res = await retrieveWiki(q, 20, currentSpace.value?.id)
     hits.value = res.hits
     retrievalMode.value = res.retrieval_mode || ''
     if (!res.hits.length) {
@@ -429,13 +433,42 @@ async function openFromRouteQuery() {
   return true
 }
 
+async function changeSpace(id: number) {
+  await rememberAndRoute(router, id, '/wiki')
+  hits.value = null
+  selectedKey.value = null
+  await loadPages()
+  await loadIndex()
+}
+
 onMounted(async () => {
+  spaces.value = await listWikiSpaces()
+  const requested = spaceIdFromQuery(route.query)
+  currentSpace.value = chooseSpace(spaces.value, requested)
+  if (!currentSpace.value) return
+  if (requested !== currentSpace.value.id) {
+    await rememberAndRoute(router, currentSpace.value.id, '/wiki')
+  }
   await loadPages()
   const opened = await openFromRouteQuery()
   if (!opened) {
     await loadIndex()
   }
 })
+
+watch(
+  () => route.query.space_id,
+  async () => {
+    if (!spaces.value.length) return
+    const next = chooseSpace(spaces.value, spaceIdFromQuery(route.query))
+    if (!next || next.id === currentSpace.value?.id) return
+    currentSpace.value = next
+    hits.value = null
+    selectedKey.value = null
+    await loadPages()
+    await loadIndex()
+  },
+)
 
 watch(
   () => route.query.page,
@@ -453,9 +486,23 @@ watch(
     <div class="page-header">
       <div>
         <h1 class="page-title">Wiki 浏览</h1>
-        <p class="page-subtitle">检索知识页与原文块，确认生成可用的业务上下文</p>
+        <p class="page-subtitle">在当前空间检索知识页与原文块，确认生成可用的业务上下文</p>
       </div>
       <div class="page-actions">
+        <el-select
+          v-if="spaces.length"
+          :model-value="currentSpace?.id"
+          class="space-select"
+          placeholder="选择 Wiki 空间"
+          @change="changeSpace"
+        >
+          <el-option
+            v-for="space in spaces"
+            :key="space.id"
+            :label="`${space.name} · ${space.page_count} 页${space.status === 'archived' ? ' · 已归档' : ''}`"
+            :value="space.id"
+          />
+        </el-select>
         <el-input
           v-model="query"
           clearable
@@ -466,7 +513,7 @@ watch(
         <el-button type="primary" :loading="searching" @click="search">检索</el-button>
         <el-button v-if="hits" @click="clearSearch">显示全部</el-button>
         <el-button @click="loadIndex">查看 Index</el-button>
-        <el-button type="warning" plain @click="router.push('/wiki/reviews')">审核中心</el-button>
+        <el-button type="warning" plain @click="router.push({ path: '/wiki/reviews', query: { space_id: String(currentSpace?.id || '') } })">审核中心</el-button>
         <el-button @click="loadPages">刷新列表</el-button>
       </div>
     </div>
@@ -586,7 +633,7 @@ watch(
             v-if="previewKind === 'source' && previewDocumentId != null"
             type="primary"
             link
-            @click="router.push({ path: '/documents', query: { document: previewDocumentId } })"
+            @click="router.push({ path: '/documents', query: { document: previewDocumentId, space_id: String(currentSpace?.id || '') } })"
           >
             打开完整原文
           </el-button>

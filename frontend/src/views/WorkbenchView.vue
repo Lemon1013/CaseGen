@@ -1,15 +1,20 @@
 <script setup lang="ts">
 import { onMounted, reactive, ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { listModels, type ModelConfig } from '../api/models'
 import { listPrompts, type PromptTemplate } from '../api/prompts'
 import { createTask, generateTask } from '../api/tasks'
+import { listWikiSpaces, type WikiSpace } from '../api/wikiSpaces'
+import { chooseSpace, rememberAndRoute, spaceIdFromQuery } from '../utils/wikiSpace'
 
 const router = useRouter()
+const route = useRoute()
 const submitting = ref(false)
 const models = ref<ModelConfig[]>([])
 const prompts = ref<PromptTemplate[]>([])
+const spaces = ref<WikiSpace[]>([])
+const currentSpace = ref<WikiSpace | null>(null)
 
 const form = reactive({
   title: '',
@@ -18,17 +23,24 @@ const form = reactive({
   model_id: null as number | null,
   prompt_template_id: null as number | null,
   auto_review: false,
+  wiki_space_id: null as number | null,
 })
 
 async function loadOptions() {
   try {
-    const [m, p] = await Promise.all([listModels(), listPrompts('generate')])
+    const [m, p, s] = await Promise.all([listModels(), listPrompts('generate'), listWikiSpaces()])
     models.value = m
     prompts.value = p.filter((item) => item.is_active)
     const defaultModel = m.find((x) => x.is_default)
     if (defaultModel) form.model_id = defaultModel.id
     const activePrompt = prompts.value[0]
     if (activePrompt) form.prompt_template_id = activePrompt.id
+    spaces.value = s
+    currentSpace.value = chooseSpace(s, spaceIdFromQuery(route.query))
+    form.wiki_space_id = currentSpace.value?.id || null
+    if (currentSpace.value && spaceIdFromQuery(route.query) !== currentSpace.value.id) {
+      await rememberAndRoute(router, currentSpace.value.id, '/')
+    }
   } catch (e) {
     ElMessage.error(`加载选项失败：${(e as Error).message}`)
   }
@@ -41,9 +53,19 @@ function parseFocusTags(text: string): string[] {
     .filter(Boolean)
 }
 
+function changeSpace(id: number) {
+  currentSpace.value = spaces.value.find((space) => space.id === id) || null
+  form.wiki_space_id = currentSpace.value?.id || null
+  void rememberAndRoute(router, id, '/')
+}
+
 async function submit() {
   if (!form.title.trim() || !form.description.trim()) {
     ElMessage.warning('请填写标题和需求描述')
+    return
+  }
+  if (!form.wiki_space_id || !currentSpace.value || currentSpace.value.status !== 'active') {
+    ElMessage.warning('请选择活动 Wiki 空间')
     return
   }
   submitting.value = true
@@ -57,6 +79,7 @@ async function submit() {
       prompt_template_id: form.prompt_template_id,
       auto_review: form.auto_review,
       run_generate: false,
+      wiki_space_id: form.wiki_space_id,
     })
 
     // 2) 触发后台生成（接口立即返回 retrieving/generating），不在此页空转等待
@@ -131,6 +154,22 @@ onMounted(loadOptions)
             placeholder="多个标签用逗号或空格分隔，如：余额校验, 限价单"
           />
         </el-form-item>
+        <el-form-item label="Wiki 空间" required>
+          <el-select
+            v-model="form.wiki_space_id"
+            style="width: 100%"
+            placeholder="选择活动 Wiki 空间"
+            @change="changeSpace"
+          >
+            <el-option
+              v-for="space in spaces.filter((item) => item.status === 'active')"
+              :key="space.id"
+              :label="`${space.name} · ${space.document_count} 文档 / ${space.page_count} 页面`"
+              :value="space.id"
+            />
+          </el-select>
+          <div class="field-hint">任务创建后空间会固定，生成与引用不会跨空间。</div>
+        </el-form-item>
         <el-form-item label="模型">
           <el-select v-model="form.model_id" clearable placeholder="使用默认模型" style="width: 100%">
             <el-option
@@ -192,5 +231,12 @@ onMounted(loadOptions)
 .hint {
   color: var(--cg-text-muted);
   font-size: 13px;
+}
+
+.field-hint {
+  margin-top: 5px;
+  color: var(--cg-text-muted);
+  font-size: 12px;
+  line-height: 1.5;
 }
 </style>

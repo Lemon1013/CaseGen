@@ -13,6 +13,8 @@ class DocumentOut(BaseModel):
     content_type: str
     sha256: str
     status: str
+    space_id: int
+    space_name: str = ""
     char_count: int
     error_message: Optional[str] = None
     created_at: datetime
@@ -24,6 +26,7 @@ class SourceChunkOut(BaseModel):
 
     id: int
     document_id: int
+    space_id: int
     chunk_index: int
     title: str
     text: str

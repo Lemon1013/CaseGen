@@ -7,6 +7,8 @@ export interface DocumentItem {
   content_type: string
   sha256: string
   status: string
+  space_id: number
+  space_name: string
   char_count: number
   error_message: string | null
   created_at: string
@@ -50,6 +52,8 @@ export interface IngestJob {
   error_message: string | null
   created_at: string
   updated_at: string
+  space_id: number
+  space_name: string
 }
 
 export interface IngestStep {
@@ -63,6 +67,7 @@ export interface IngestStep {
 export interface SourceChunk {
   id: number
   document_id: number
+  space_id: number
   chunk_index: number
   title: string
   text: string
@@ -76,45 +81,59 @@ export interface SourceChunk {
   created_at: string
 }
 
-export function listDocuments() {
-  return api<DocumentItem[]>('/api/documents')
+export function listDocuments(spaceId?: number) {
+  const query = spaceId ? `?space_id=${spaceId}` : ''
+  return api<DocumentItem[]>(`/api/documents${query}`)
 }
 
-export function uploadDocument(file: File) {
+export function uploadDocument(file: File, spaceId?: number) {
   const form = new FormData()
   form.append('file', file)
+  if (spaceId !== undefined) form.append('space_id', String(spaceId))
   return api<DocumentItem>('/api/documents', {
     method: 'POST',
     body: form,
   })
 }
 
-export function getDocumentPreview(id: number, maxChars = 50000) {
-  return api<DocumentPreview>(`/api/documents/${id}/preview?max_chars=${maxChars}`)
+export function getDocumentPreview(id: number, maxChars = 50000, spaceId?: number) {
+  const params = new URLSearchParams({ max_chars: String(maxChars) })
+  if (spaceId !== undefined) params.set('space_id', String(spaceId))
+  return api<DocumentPreview>(`/api/documents/${id}/preview?${params.toString()}`)
 }
 
-export function listDocumentChunks(id: number) {
-  return api<SourceChunk[]>(`/api/documents/${id}/chunks`)
+export function listDocumentChunks(id: number, spaceId?: number) {
+  const query = spaceId ? `?space_id=${spaceId}` : ''
+  return api<SourceChunk[]>(`/api/documents/${id}/chunks${query}`)
 }
 
-export function ingestDocument(id: number, force = false) {
-  const query = force ? '?force=true' : ''
+export function ingestDocument(id: number, force = false, spaceId?: number) {
+  const params = new URLSearchParams()
+  if (force) params.set('force', 'true')
+  if (spaceId !== undefined) params.set('space_id', String(spaceId))
+  const query = params.toString() ? `?${params.toString()}` : ''
   return api<IngestJob>(`/api/documents/${id}/ingest${query}`, { method: 'POST' })
 }
 
-export function listIngestJobs(status?: string) {
-  const query = status ? `?status=${encodeURIComponent(status)}` : ''
+export function listIngestJobs(status?: string, spaceId?: number) {
+  const params = new URLSearchParams()
+  if (status) params.set('status', status)
+  if (spaceId !== undefined) params.set('space_id', String(spaceId))
+  const query = params.toString() ? `?${params.toString()}` : ''
   return api<IngestJob[]>(`/api/ingest-jobs${query}`)
 }
 
-export function getIngestJob(id: number) {
-  return api<IngestJob>(`/api/ingest-jobs/${id}`)
+export function getIngestJob(id: number, spaceId?: number) {
+  const query = spaceId ? `?space_id=${spaceId}` : ''
+  return api<IngestJob>(`/api/ingest-jobs/${id}${query}`)
 }
 
-export function cancelIngestJob(id: number) {
-  return api<IngestJob>(`/api/ingest-jobs/${id}/cancel`, { method: 'POST' })
+export function cancelIngestJob(id: number, spaceId?: number) {
+  const query = spaceId ? `?space_id=${spaceId}` : ''
+  return api<IngestJob>(`/api/ingest-jobs/${id}/cancel${query}`, { method: 'POST' })
 }
 
-export function retryFailedWindows(id: number) {
-  return api<IngestJob>(`/api/ingest-jobs/${id}/retry-failed-windows`, { method: 'POST' })
+export function retryFailedWindows(id: number, spaceId?: number) {
+  const query = spaceId ? `?space_id=${spaceId}` : ''
+  return api<IngestJob>(`/api/ingest-jobs/${id}/retry-failed-windows${query}`, { method: 'POST' })
 }
