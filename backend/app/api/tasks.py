@@ -11,6 +11,7 @@ from app.models.entities import (
     CaseDraft,
     GenerationTask,
     PromptRevision,
+    PromptTemplate,
     Requirement,
     ReviewResult,
     SourceChunk,
@@ -192,6 +193,21 @@ def create_task(
         description="If true (or chat hooks injected), run generate inline before responding",
     ),
 ) -> TaskOut:
+    if body.prompt_template_id is not None:
+        prompt = session.get(PromptTemplate, body.prompt_template_id)
+        if prompt is None:
+            raise HTTPException(status_code=422, detail="Prompt template not found")
+        if prompt.type != "generate":
+            raise HTTPException(
+                status_code=422,
+                detail="Only generate prompt templates can be selected",
+            )
+        if not prompt.is_active:
+            raise HTTPException(
+                status_code=422,
+                detail="Only active generate prompt templates can be selected",
+            )
+
     requirement = Requirement(
         title=body.title,
         description=body.description,

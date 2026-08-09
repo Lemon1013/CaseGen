@@ -1,3 +1,5 @@
+import json
+
 from fastapi.testclient import TestClient
 from sqlmodel import Session
 
@@ -155,7 +157,7 @@ def test_recover_resets_running_and_schedules_durable_jobs(tmp_app_data):
         set_scheduler(previous)
 
 
-def test_failed_job_allows_a_new_attempt(tmp_app_data, monkeypatch):
+def test_partial_job_is_reused_and_force_starts_new_attempt(tmp_app_data, monkeypatch):
     def fail_chat(messages):
         raise LLMError("injected failure")
 
@@ -164,6 +166,54 @@ def test_failed_job_allows_a_new_attempt(tmp_app_data, monkeypatch):
     document_id = _upload(client)
     first = client.post(f"/api/documents/{document_id}/ingest").json()
     second = client.post(f"/api/documents/{document_id}/ingest").json()
-    assert first["status"] == "failed"
-    assert second["status"] == "failed"
-    assert second["id"] != first["id"]
+    assert first["status"] == "success_with_warnings"
+    assert second["status"] == "success_with_warnings"
+    assert second["id"] == first["id"]
+    forced = client.post(f"/api/documents/{document_id}/ingest?force=true").json()
+    assert forced["status"] == "success_with_warnings"
+    assert forced["id"] != first["id"]
+
+
+def test_retry_failed_windows_queues_existing_partial_job(tmp_app_data):
+    scheduler = RecordingScheduler()
+    previous = set_scheduler(scheduler)
+    try:
+        client = TestClient(create_app())
+        document_id = _upload(client, "partial.md")
+        with Session(get_engine()) as session:
+            document = session.get(Document, document_id)
+            job = IngestJob(
+                document_id=document_id,
+                status="success_with_warnings",
+                stage="ready",
+                progress=100,
+                plan_json=json.dumps(
+                    {
+                        "window_results": [
+                            {"index": 1, "status": "ok", "plan": {"source_summary": {}}},
+                            {"index": 2, "status": "degraded", "plan": {"source_summary": {}}},
+                        ],
+                        "degraded_windows": [2],
+                    },
+                    ensure_ascii=False,
+                ),
+                step_log_json="[]",
+            )
+            document.status = "ready"
+            session.add(document)
+            session.add(job)
+            session.commit()
+            session.refresh(job)
+            job_id = int(job.id)
+
+        response = client.post(f"/api/ingest-jobs/{job_id}/retry-failed-windows")
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["status"] == "queued"
+        assert payload["stage"] == "queued"
+        assert scheduler.scheduled == [job_id]
+        plan = json.loads(payload["plan_json"])
+        assert plan["retry_failed_windows"] is True
+        assert plan["degraded_windows"] == [2]
+    finally:
+        set_scheduler(previous)

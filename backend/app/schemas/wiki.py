@@ -103,6 +103,8 @@ class WikiDiffOut(BaseModel):
     # diff format; ``unified`` remains the canonical field.
     text: str = ""
     changed: bool = False
+    available: bool = True
+    reason: str = ""
 
 
 class WikiRevisionOut(BaseModel):

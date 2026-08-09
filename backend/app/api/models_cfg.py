@@ -22,6 +22,30 @@ def mask_api_key(api_key: str) -> str:
     return "***" + api_key[-4:]
 
 
+def _clear_default_siblings(session: Session, keep_id: int | None = None) -> None:
+    rows = session.exec(
+        select(ModelConfig).where(ModelConfig.is_default == True)  # noqa: E712
+    ).all()
+    for row in rows:
+        if keep_id is not None and row.id == keep_id:
+            continue
+        row.is_default = False
+        row.updated_at = _utcnow()
+        session.add(row)
+
+
+def _promote_latest_model(session: Session) -> None:
+    replacement = session.exec(
+        select(ModelConfig)
+        .where(ModelConfig.is_default == False)  # noqa: E712
+        .order_by(ModelConfig.id.desc())
+    ).first()
+    if replacement is not None:
+        replacement.is_default = True
+        replacement.updated_at = _utcnow()
+        session.add(replacement)
+
+
 def to_model_out(row: ModelConfig) -> ModelOut:
     return ModelOut(
         id=row.id,
@@ -40,6 +64,10 @@ def create_model(
     body: ModelCreate,
     session: Session = Depends(get_session),
 ) -> ModelOut:
+    if body.is_default:
+        _clear_default_siblings(session)
+        session.flush()
+
     row = ModelConfig(
         name=body.name,
         base_url=body.base_url,
@@ -78,6 +106,9 @@ def update_model(
         raise HTTPException(status_code=404, detail="Model not found")
 
     data = body.model_dump(exclude_unset=True)
+    if data.get("is_default") is True:
+        _clear_default_siblings(session, keep_id=row.id)
+        session.flush()
     for key, value in data.items():
         setattr(row, key, value)
     row.updated_at = _utcnow()
@@ -92,7 +123,11 @@ def delete_model(model_id: int, session: Session = Depends(get_session)) -> dict
     row = session.get(ModelConfig, model_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Model not found")
+    was_default = row.is_default
     session.delete(row)
+    session.flush()
+    if was_default:
+        _promote_latest_model(session)
     session.commit()
     return {"ok": True}
 

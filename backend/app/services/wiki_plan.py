@@ -251,6 +251,228 @@ class StepAPlan(_StrictModel):
         return _strings(value)
 
 
+_SOURCE_ANCHOR_FIELDS = {
+    "document_id",
+    "source_path",
+    "chunk_id",
+    "chunk_ids",
+    "page_start",
+    "page_end",
+    "section",
+    "clause_id",
+    "clause_ids",
+    "window_index",
+    "start_char",
+    "end_char",
+    "start",
+    "end",
+}
+
+
+def _listify(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, Mapping):
+        return [value]
+    if isinstance(value, (str, bytes, bytearray)):
+        return [value]
+    try:
+        return list(value)
+    except TypeError:
+        return [value]
+
+
+def _normalise_anchor_mapping(value: Any) -> dict[str, Any] | None:
+    """Extract only source-locator fields from a model-produced object."""
+
+    if isinstance(value, BaseModel):
+        value = value.model_dump(mode="python")
+    if not isinstance(value, Mapping):
+        return None
+    raw = dict(value)
+    if isinstance(raw.get("document"), Mapping):
+        raw = {**dict(raw["document"]), **raw}
+    if isinstance(raw.get("source"), Mapping):
+        raw = {**dict(raw["source"]), **raw}
+    if "document_id" not in raw and raw.get("source_document_id") is not None:
+        raw["document_id"] = raw["source_document_id"]
+    if "chunk_ids" not in raw and raw.get("chunks") is not None:
+        raw["chunk_ids"] = raw["chunks"]
+    if "clause_ids" not in raw and raw.get("clauses") is not None:
+        raw["clause_ids"] = raw["clauses"]
+    anchor = {key: raw[key] for key in _SOURCE_ANCHOR_FIELDS if key in raw}
+    if "clauses" in raw and "clause_ids" not in anchor:
+        anchor["clause_ids"] = raw["clauses"]
+    if "chunk_ids" in anchor and isinstance(anchor["chunk_ids"], str):
+        anchor["chunk_ids"] = [int(item) for item in re.findall(r"\d+", anchor["chunk_ids"])]
+    if "clause_ids" in anchor and isinstance(anchor["clause_ids"], str):
+        anchor["clause_ids"] = [item.strip() for item in re.split(r"[,，\s]+", anchor["clause_ids"]) if item.strip()]
+    return anchor or None
+
+
+def _normalise_operation_anchors(item: Mapping[str, Any]) -> list[dict[str, Any]]:
+    raw_anchors = item.get("source_anchors")
+    if raw_anchors is None:
+        raw_anchors = item.get("anchors")
+    if raw_anchors is None:
+        raw_anchors = item.get("sources")
+    anchors: list[dict[str, Any]] = []
+    for value in _listify(raw_anchors):
+        anchor = _normalise_anchor_mapping(value)
+        if anchor is not None:
+            anchors.append(anchor)
+    if not anchors:
+        # Some models flatten the source locator beside the page fields.
+        anchor = _normalise_anchor_mapping(item)
+        if anchor is not None:
+            anchors.append(anchor)
+    return anchors
+
+
+def _normalise_page_operations(
+    value: Any,
+    *,
+    existing_page_keys: Iterable[str] | None = None,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Tolerate page candidates accidentally returned as Step A operations.
+
+    The result is still validated by the strict Pydantic contract. This helper
+    only removes harmless presentation fields such as title/tags/sources and
+    maps the common ``operation``/``type`` aliases to the Step A vocabulary.
+    Unsafe entries (missing key or source anchor) are dropped and reported so
+    the caller can put the window into review instead of writing guessed data.
+    """
+
+    known = {str(key) for key in (existing_page_keys or ())}
+    operations: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    for position, raw_value in enumerate(_listify(value), start=1):
+        if isinstance(raw_value, BaseModel):
+            raw_value = raw_value.model_dump(mode="python")
+        if not isinstance(raw_value, Mapping):
+            warnings.append(f"page_operations[{position}] 不是对象，已忽略")
+            continue
+        item = dict(raw_value)
+        page_key = str(item.get("page_key") or item.get("key") or "").strip()
+        if not page_key:
+            warnings.append(f"page_operations[{position}] 缺少 page_key，已忽略")
+            continue
+        raw_op = str(
+            item.get("op")
+            or item.get("operation")
+            or item.get("action")
+            or item.get("change_type")
+            or ""
+        ).strip().lower()
+        raw_op = {
+            "add": "create",
+            "insert": "create",
+            "new": "create",
+            "modify": "update",
+            "edit": "update",
+            "replace": "update",
+            "same": "noop",
+            "no_change": "noop",
+        }.get(raw_op, raw_op)
+        if raw_op not in {"create", "update", "noop"}:
+            if not raw_op and (item.get("title") or item.get("body") or item.get("content_md")):
+                raw_op = "update" if page_key in known else "create"
+            else:
+                warnings.append(
+                    f"page_operations[{position}] 操作 {raw_op or '未知'} 不安全，已忽略"
+                )
+                continue
+        anchors = _normalise_operation_anchors(item)
+        if raw_op in {"create", "update"} and not anchors:
+            warnings.append(
+                f"page_operations[{position}] {page_key} 缺少来源锚点，已忽略"
+            )
+            continue
+        operation: dict[str, Any] = {
+            "op": raw_op,
+            "page_key": page_key,
+            "reason": str(item.get("reason") or item.get("title") or "").strip(),
+            "source_anchors": anchors,
+        }
+        page_type = item.get("page_type") or item.get("type")
+        if page_type:
+            operation["page_type"] = page_type
+        if item.get("claim_ids") is not None:
+            operation["claim_ids"] = item.get("claim_ids")
+        if item.get("confidence") is not None:
+            operation["confidence"] = item.get("confidence")
+        operations.append(operation)
+    return operations, warnings
+
+
+def _normalise_source_summary(value: Any) -> Any:
+    """Keep the summary fields when a model returns a full page-shaped object."""
+
+    if isinstance(value, BaseModel):
+        value = value.model_dump(mode="python")
+    if not isinstance(value, Mapping):
+        return value
+    item = dict(value)
+    summary = item.get("summary") or item.get("description") or item.get("body") or item.get("content_md")
+    result = {
+        key: item[key]
+        for key in ("title", "summary", "source_path", "filename", "domain", "tags")
+        if key in item
+    }
+    if "summary" not in result and summary:
+        result["summary"] = str(summary)
+    return result
+
+
+def normalise_step_a_output(
+    raw: StepAPlan | Mapping[str, Any],
+    *,
+    source_path: str = "",
+    existing_page_keys: Iterable[str] | None = None,
+) -> tuple[dict[str, Any] | StepAPlan, list[str]]:
+    """Return a tolerant Step A shape plus non-fatal normalization warnings."""
+
+    if isinstance(raw, StepAPlan):
+        return raw, []
+    if not isinstance(raw, Mapping):
+        return raw, ["Step A 输出不是 JSON 对象"]
+    data = dict(raw)
+    warnings: list[str] = []
+    if not any(
+        key in data
+        for key in (
+            "source_summary",
+            "claims",
+            "entities",
+            "related_pages",
+            "contradictions",
+            "page_operations",
+            "review_items",
+        )
+    ):
+        nested = data.get("data") or data.get("result") or data.get("output")
+        if isinstance(nested, Mapping):
+            data = dict(nested)
+            warnings.append("模型输出包含外层 data/result/output，已展开")
+    if "page_operations" not in data:
+        for alias in ("operations", "page_candidates", "pages"):
+            if alias in data and isinstance(data[alias], (list, tuple, Mapping)):
+                data["page_operations"] = data[alias]
+                data.pop(alias, None)
+                warnings.append(f"模型输出使用 {alias} 字段，已转换为 page_operations")
+                break
+    if "page_operations" in data:
+        operations, operation_warnings = _normalise_page_operations(
+            data.get("page_operations"),
+            existing_page_keys=existing_page_keys,
+        )
+        data["page_operations"] = operations
+        warnings.extend(operation_warnings)
+    if "source_summary" in data:
+        data["source_summary"] = _normalise_source_summary(data["source_summary"])
+    return data, warnings
+
+
 def _window_list(source_windows: Iterable[Any] | None) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     for raw in source_windows or ():
@@ -517,7 +739,12 @@ def coerce_step_a_plan(
         )
     if not isinstance(raw, Mapping):
         raise PlanValidationError("Step A output must be a JSON object")
-    data = dict(raw)
+    normalised, _warnings = normalise_step_a_output(
+        raw,
+        source_path=source_path,
+        existing_page_keys=existing_page_keys,
+    )
+    data = dict(normalised) if isinstance(normalised, Mapping) else dict(raw)
     is_new_shape = any(key in data for key in ("source_summary", "claims", "related_pages", "contradictions", "page_operations", "review_items"))
     if not is_new_shape:
         data = {

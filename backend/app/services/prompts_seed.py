@@ -74,27 +74,41 @@ def seed_default_prompts(session: Session) -> None:
     for ptype in PROMPT_TYPES:
         path = DEFAULT_PROMPTS_DIR / f"{ptype}.md"
         content = path.read_text(encoding="utf-8")
-        active = session.exec(
+        active_rows = session.exec(
             select(PromptTemplate).where(
                 PromptTemplate.type == ptype,
                 PromptTemplate.is_active == True,  # noqa: E712
+            ).order_by(col(PromptTemplate.id).desc())
+        ).all()
+
+        if any(row.content == content for row in active_rows):
+            continue
+
+        custom_active = [
+            row
+            for row in active_rows
+            if not (
+                row.name == f"default_{ptype}"
+                and _content_hash(row.content) in _LEGACY_DEFAULT_HASHES[ptype]
             )
-        ).first()
-
-        if active is not None and active.content == content:
+        ]
+        if custom_active:
+            # Multiple active templates are intentional.  A custom active
+            # template must not be disabled or hidden by startup seeding.
             continue
 
-        can_upgrade = (
-            active is not None
-            and active.name == f"default_{ptype}"
-            and _content_hash(active.content) in _LEGACY_DEFAULT_HASHES[ptype]
-        )
-        if active is not None and not can_upgrade:
+        legacy_active = [
+            row
+            for row in active_rows
+            if row.name == f"default_{ptype}"
+            and _content_hash(row.content) in _LEGACY_DEFAULT_HASHES[ptype]
+        ]
+        if active_rows and not legacy_active:
             continue
 
-        if active is not None:
-            active.is_active = False
-            session.add(active)
+        for row in legacy_active:
+            row.is_active = False
+            session.add(row)
 
         session.add(
             PromptTemplate(

@@ -90,6 +90,41 @@ def test_strict_plan_accepts_create_update_noop_and_rejects_merge():
         )
 
 
+def test_coerce_strips_full_page_fields_from_model_operation():
+    plan = coerce_step_a_plan(
+        {
+            "source_summary": {"title": "交易规则", "summary": "摘要"},
+            "claims": [],
+            "page_operations": [
+                {
+                    "op": "create",
+                    "page_key": "rule.order.auction",
+                    "title": "集合竞价",
+                    "type": "rule",
+                    "domain": "交易",
+                    "aliases": ["开盘竞价"],
+                    "tags": ["竞价"],
+                    "sources": [
+                        {"document_id": 1, "chunk_ids": [7], "clauses": ["3.5.2"]}
+                    ],
+                    "status": "published",
+                    "revision": 2,
+                    "updated_at": "2026-08-09T00:00:00Z",
+                }
+            ],
+        },
+        existing_page_keys=set(),
+        source_windows=[
+            {"chunk_ids": [7], "clause_ids": ["3.5.2"], "start": 0, "end": 50}
+        ],
+    )
+    operation = plan.page_operations[0]
+    assert operation.op == "create"
+    assert operation.page_type == "rule"
+    assert operation.source_anchors[0].chunk_ids == [7]
+    assert operation.source_anchors[0].clause_ids == ["3.5.2"]
+
+
 def test_plan_rejects_invalid_key_missing_anchor_and_unknown_target():
     with pytest.raises(PlanValidationError):
         validate_step_a_plan(

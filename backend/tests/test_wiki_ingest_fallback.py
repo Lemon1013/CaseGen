@@ -92,7 +92,7 @@ def test_ingest_falls_back_when_wiki_write_returns_502(tmp_app_data, monkeypatch
     assert len(ret.json()["hits"]) >= 1
 
 
-def test_ingest_fails_when_analyze_fails(tmp_app_data, monkeypatch):
+def test_ingest_degrades_when_analyze_fails(tmp_app_data, monkeypatch):
     def always_fail(messages):
         raise LLMError("LLM HTTP 502 (http://example/v1/chat/completions): ")
 
@@ -103,6 +103,8 @@ def test_ingest_fails_when_analyze_fails(tmp_app_data, monkeypatch):
         files={"file": ("x.md", b"# hi", "text/markdown")},
     ).json()["id"]
     job = client.post(f"/api/documents/{doc_id}/ingest").json()
-    assert job["status"] == "failed"
-    assert "502" in (job["error_message"] or "")
-    assert client.get(f"/api/documents/{doc_id}").json()["status"] == "failed"
+    assert job["status"] == "success_with_warnings"
+    assert "窗口" in (job["error_message"] or "")
+    assert client.get(f"/api/documents/{doc_id}").json()["status"] == "ready"
+    plan = json.loads(job["plan_json"])
+    assert plan["degraded_windows"] == [1]

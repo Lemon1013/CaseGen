@@ -46,6 +46,29 @@ def test_update_missing_model_404(tmp_app_data):
     assert r.status_code == 404
 
 
+def test_only_one_model_can_be_default_and_delete_promotes_replacement(tmp_app_data):
+    client = TestClient(create_app())
+    first = _create(client, name="first", is_default=True)
+    second = _create(client, name="second", is_default=True)
+
+    rows = client.get("/api/models").json()
+    defaults = [row for row in rows if row["is_default"]]
+    assert [row["id"] for row in defaults] == [second["id"]]
+    assert next(row for row in rows if row["id"] == first["id"])["is_default"] is False
+
+    switched = client.put(f"/api/models/{first['id']}", json={"is_default": True})
+    assert switched.status_code == 200
+    rows = client.get("/api/models").json()
+    assert next(row for row in rows if row["id"] == first["id"])["is_default"] is True
+    assert next(row for row in rows if row["id"] == second["id"])["is_default"] is False
+
+    deleted = client.delete(f"/api/models/{first['id']}")
+    assert deleted.status_code == 200
+    replacement = client.get(f"/api/models/{second['id']}")
+    assert replacement.status_code == 200
+    assert replacement.json()["is_default"] is True
+
+
 def test_delete_missing_model_404(tmp_app_data):
     client = TestClient(create_app())
     r = client.delete("/api/models/99999")

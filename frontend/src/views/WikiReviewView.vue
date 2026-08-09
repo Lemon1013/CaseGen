@@ -5,6 +5,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { formatDateTime as formatTime } from '../utils/datetime'
 import {
   approveWikiReview,
+  acknowledgeWikiReview,
   getWikiDiff,
   getWikiReview,
   listWikiReviews,
@@ -44,6 +45,7 @@ function statusLabel(status: string) {
   if (status === 'pending') return '待审核'
   if (status === 'approved') return '已批准'
   if (status === 'rejected') return '已拒绝'
+  if (status === 'acknowledged') return '已确认'
   return status || '未知'
 }
 
@@ -70,6 +72,15 @@ function kindLabel(kind: string) {
 
 function contentOrEmpty(content: string | null | undefined) {
   return content?.trim() || '（暂无内容）'
+}
+
+function isWritableCandidate(value: WikiReviewDetail | null) {
+  return Boolean(value?.diff.available)
+}
+
+function canAcknowledge(value: WikiReviewDetail | null) {
+  if (!value || value.status !== 'pending' || isWritableCandidate(value)) return false
+  return !['create', 'update', 'merge'].includes(value.reason_detail.operation || '')
 }
 
 function sourceLabel(documentId: number, chunkIds: number[], clauses: string[]) {
@@ -181,7 +192,7 @@ async function loadRevisions(pageId: number) {
 
 async function approve() {
   const current = detail.value
-  if (!current || current.status !== 'pending') return
+  if (!current || current.status !== 'pending' || !isWritableCandidate(current)) return
   try {
     await ElMessageBox.confirm(
       `确认批准候选「${current.reason_detail.page_key || current.new_candidate.title || `审核项 #${current.id}`}」？批准后会写入 Wiki，并生成新的 revision。`,
@@ -233,6 +244,34 @@ async function reject() {
     await loadReviews()
   } catch (error) {
     ElMessage.error(actionableError('拒绝审核项', error))
+  } finally {
+    actionLoading.value = false
+  }
+}
+
+async function acknowledge() {
+  const current = detail.value
+  if (!current) return
+  if (!canAcknowledge(current)) return
+  try {
+    await ElMessageBox.confirm(
+      `确认已核对提醒「${current.reason_detail.page_key || current.reason || `审核项 #${current.id}`}」？此操作不会写入 Wiki。`,
+      '确认处理',
+      { type: 'info', confirmButtonText: '标记已处理', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  actionLoading.value = true
+  try {
+    await acknowledgeWikiReview(current.id, {
+      reviewed_by: reviewedBy.value.trim() || undefined,
+      decision_reason: decisionReason.value.trim() || undefined,
+    })
+    ElMessage.success('提醒已标记为已处理')
+    await loadReviews()
+  } catch (error) {
+    ElMessage.error(actionableError('确认审核提醒', error))
   } finally {
     actionLoading.value = false
   }
@@ -368,6 +407,15 @@ onMounted(loadReviews)
                 {{ statusLabel(detail.status) }}
               </el-tag>
               <el-button
+                v-if="canAcknowledge(detail)"
+                type="success"
+                plain
+                :loading="actionLoading"
+                @click="acknowledge"
+              >
+                标记已处理
+              </el-button>
+              <el-button
                 v-if="detail.status === 'pending'"
                 type="danger"
                 plain
@@ -377,13 +425,20 @@ onMounted(loadReviews)
                 拒绝
               </el-button>
               <el-button
-                v-if="detail.status === 'pending'"
+                v-if="detail.status === 'pending' && isWritableCandidate(detail)"
                 type="primary"
-                :disabled="detail.kind === 'merge'"
                 :loading="actionLoading"
                 @click="approve"
               >
-                {{ detail.kind === 'merge' ? '合并候选需人工处理' : '批准并写入' }}
+                批准并写入
+              </el-button>
+              <el-button
+                v-if="detail.status === 'pending' && detail.kind === 'merge'"
+                type="warning"
+                plain
+                disabled
+              >
+                合并候选需人工处理
               </el-button>
             </div>
           </div>
@@ -462,10 +517,18 @@ onMounted(loadReviews)
           <section class="section-block">
             <div class="section-heading">
               <div class="section-title">内容 Diff</div>
-              <el-tag v-if="detail.diff.changed" type="warning" size="small" effect="plain">有变更</el-tag>
-              <el-tag v-else type="info" size="small" effect="plain">无内容变更</el-tag>
+              <el-tag v-if="detail.diff.available && detail.diff.changed" type="warning" size="small" effect="plain">有变更</el-tag>
+              <el-tag v-else-if="detail.diff.available" type="info" size="small" effect="plain">无内容变更</el-tag>
+              <el-tag v-else type="info" size="small" effect="plain">不适用</el-tag>
             </div>
-            <el-tabs v-model="diffTab">
+            <el-alert
+              v-if="!detail.diff.available"
+              type="info"
+              :closable="false"
+              show-icon
+              :title="detail.diff.reason || '这是结构化审核提醒，不包含待写入的页面候选内容。'"
+            />
+            <el-tabs v-else v-model="diffTab">
               <el-tab-pane label="统一 Diff" name="unified">
                 <pre class="code-block diff-block">{{ detail.diff.text || '（没有可显示的 Diff）' }}</pre>
               </el-tab-pane>

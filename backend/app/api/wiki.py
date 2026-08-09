@@ -40,7 +40,7 @@ from app.schemas.wiki import (
 )
 from app.services.retrieve import load_all_wiki_pages, rank_pages
 from app.services.source_chunks_store import load_all_source_chunks, rank_source_chunks
-from app.services.wiki_jobs import cancel_ingest_job
+from app.services.wiki_jobs import cancel_ingest_job, retry_failed_windows
 from app.services.wiki_index import rebuild_index
 from app.services.wiki_log import log_review, log_rollback
 from app.services.wiki_overview import rebuild_overview
@@ -234,15 +234,37 @@ def _review_detail(session: Session, item: WikiReviewItem) -> WikiReviewDetailOu
     old_out = _revision_out(old_revision) if old_revision is not None else None
     old_content = old_out.content_md if old_out is not None else ""
     new_content = item.candidate_content_md or ""
-    unified = "".join(
-        difflib.unified_diff(
-            old_content.splitlines(True),
-            new_content.splitlines(True),
-            fromfile="old Wiki revision",
-            tofile="candidate Wiki revision",
-        )
+    operation = str(payload.get("operation") or "")
+    is_writable_candidate = (
+        operation in {"create", "update"}
+        and bool(new_content.strip())
+        and bool(meta)
     )
-    operation = payload.get("operation")
+    if is_writable_candidate:
+        unified = "".join(
+            difflib.unified_diff(
+                old_content.splitlines(True),
+                new_content.splitlines(True),
+                fromfile="old Wiki revision",
+                tofile="candidate Wiki revision",
+            )
+        )
+        diff = WikiDiffOut(
+            from_revision=old_out.revision if old_out else None,
+            to_revision=None,
+            unified=unified,
+            text=unified,
+            changed=old_content != new_content,
+            available=True,
+        )
+    else:
+        diff = WikiDiffOut(
+            available=False,
+            reason=(
+                "这是结构化审核提醒，不包含待写入的页面候选内容；"
+                "请结合来源证据确认后标记为已处理。"
+            ),
+        )
     risks = payload.get("risk_flags")
     if isinstance(risks, str):
         risks = [risks]
@@ -251,7 +273,7 @@ def _review_detail(session: Session, item: WikiReviewItem) -> WikiReviewDetailOu
     reason_detail = WikiReviewReasonOut(
         summary=item.reason,
         kind=item.kind,
-        operation=str(operation) if operation else None,
+        operation=operation or None,
         page_key=page_key,
         risk_flags=[str(value) for value in risks],
     )
@@ -262,13 +284,7 @@ def _review_detail(session: Session, item: WikiReviewItem) -> WikiReviewDetailOu
         reason_detail=reason_detail,
         payload=payload,
         source_evidence=sources,
-        diff=WikiDiffOut(
-            from_revision=old_out.revision if old_out else None,
-            to_revision=None,
-            unified=unified,
-            text=unified,
-            changed=old_content != new_content,
-        ),
+        diff=diff,
     )
 
 
@@ -404,6 +420,20 @@ def get_ingest_job(job_id: int, session: Session = Depends(get_session)) -> Inge
 @router.post("/api/ingest-jobs/{job_id}/cancel", response_model=IngestJobOut)
 def cancel_ingest(job_id: int, session: Session = Depends(get_session)) -> IngestJob:
     job = cancel_ingest_job(session, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Ingest job not found")
+    return job
+
+
+@router.post("/api/ingest-jobs/{job_id}/retry-failed-windows", response_model=IngestJobOut)
+def retry_ingest_failed_windows(
+    job_id: int,
+    session: Session = Depends(get_session),
+) -> IngestJob:
+    try:
+        job = retry_failed_windows(session, job_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     if job is None:
         raise HTTPException(status_code=404, detail="Ingest job not found")
     return job
@@ -551,6 +581,53 @@ def reject_wiki_review(
     return _review_detail(session, item)
 
 
+@router.post("/api/wiki/reviews/{review_id}/acknowledge", response_model=WikiReviewDetailOut)
+def acknowledge_wiki_review(
+    review_id: int,
+    body: WikiReviewDecisionIn | None = None,
+    session: Session = Depends(get_session),
+) -> WikiReviewDetailOut:
+    """Close a structural reminder that has no page candidate to approve."""
+
+    item = session.get(WikiReviewItem, review_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Wiki review item not found")
+    if item.status != "pending":
+        raise HTTPException(status_code=409, detail="Only pending review items can be acknowledged")
+    payload = _json_object(item.payload_json)
+    operation = str(payload.get("operation") or "")
+    if operation in {"create", "update", "merge"} or item.candidate_content_md:
+        raise HTTPException(
+            status_code=409,
+            detail="Writable candidates must be approved or rejected, not acknowledged",
+        )
+    decision_reason = (
+        (body.decision_reason if body else None)
+        or (body.reason if body else None)
+        or "已确认结构化提醒"
+    ).strip()
+    with page_key_lock(f"review.item.{review_id}"):
+        session.refresh(item)
+        if item.status != "pending":
+            raise HTTPException(
+                status_code=409,
+                detail="Only pending review items can be acknowledged",
+            )
+        item.status = "acknowledged"
+        item.reviewed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        item.reviewed_by = body.reviewed_by if body else None
+        item.decision_reason = decision_reason
+        session.add(item)
+        session.commit()
+    _best_effort_log(
+        log_review,
+        review_id=review_id,
+        action="acknowledge",
+        reason=decision_reason,
+    )
+    return _review_detail(session, item)
+
+
 @router.get("/api/wiki/pages/{page_id}/revisions", response_model=list[WikiRevisionOut])
 def list_wiki_revisions(
     page_id: int, session: Session = Depends(get_session)
@@ -611,6 +688,7 @@ def get_wiki_diff(
         unified=unified,
         text=unified,
         changed=before.content_md != after.content_md,
+        available=True,
     )
 
 

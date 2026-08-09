@@ -9,7 +9,14 @@ from typing import Any, Callable, Optional
 from sqlmodel import Session, select
 
 from app import config
-from app.models.entities import Document, IngestJob, ModelConfig, PromptTemplate, WikiPageRow
+from app.models.entities import (
+    Document,
+    IngestJob,
+    ModelConfig,
+    PromptTemplate,
+    SourceChunk,
+    WikiPageRow,
+)
 from app.services.llm import LLMError, chat_completion
 from app.services.parse_document import parse_document
 from app.services.wiki_index import rebuild_index
@@ -62,6 +69,80 @@ def _append_step(job: IngestJob, step: str, message: str, **extra: Any) -> None:
     log.append(entry)
     job.step_log_json = json.dumps(log, ensure_ascii=False)
     job.updated_at = _utcnow()
+
+
+def _retry_window_state(job: IngestJob) -> tuple[list[dict[str, Any]], set[int] | None]:
+    """Read a retry request without making the normal ingest path stateful."""
+
+    try:
+        payload = json.loads(job.plan_json or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return [], None
+    if not isinstance(payload, dict) or not payload.get("retry_failed_windows"):
+        return [], None
+
+    results: list[dict[str, Any]] = []
+    raw_results = payload.get("window_results")
+    if isinstance(raw_results, list):
+        results.extend(item for item in raw_results if isinstance(item, dict))
+    if not results:
+        try:
+            step_log = json.loads(job.step_log_json or "[]")
+        except (TypeError, json.JSONDecodeError):
+            step_log = []
+        if isinstance(step_log, list):
+            for entry in step_log:
+                if not isinstance(entry, dict):
+                    continue
+                window_result = entry.get("window_result")
+                if isinstance(window_result, dict):
+                    results.append(window_result)
+
+    retry_indices: set[int] = set()
+    raw_degraded = payload.get("degraded_windows")
+    if isinstance(raw_degraded, list):
+        for value in raw_degraded:
+            try:
+                index = int(value)
+            except (TypeError, ValueError):
+                continue
+            if index > 0:
+                retry_indices.add(index)
+    for result in results:
+        try:
+            index = int(result.get("index") or 0)
+        except (TypeError, ValueError):
+            continue
+        if index > 0 and str(result.get("status") or "").lower() in {"degraded", "failed"}:
+            retry_indices.add(index)
+    return results, retry_indices
+
+
+def _is_retry_requested(job: IngestJob) -> bool:
+    try:
+        payload = json.loads(job.plan_json or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return False
+    return isinstance(payload, dict) and bool(payload.get("retry_failed_windows"))
+
+
+def _load_reusable_chunks(
+    session: Session,
+    document_id: int,
+    text_length: int,
+) -> list[SourceChunk] | None:
+    rows = list(
+        session.exec(
+            select(SourceChunk)
+            .where(SourceChunk.document_id == document_id)
+            .order_by(SourceChunk.chunk_index)
+        ).all()
+    )
+    if not rows or int(rows[0].start_char or 0) != 0:
+        return None
+    if int(rows[-1].end_char or 0) < int(text_length):
+        return None
+    return rows
 
 
 def _set_stage(
@@ -124,6 +205,9 @@ def _load_active_prompt(session: Session, prompt_type: str) -> PromptTemplate:
         select(PromptTemplate).where(
             PromptTemplate.type == prompt_type,
             PromptTemplate.is_active == True,  # noqa: E712
+        ).order_by(
+            PromptTemplate.updated_at.desc(),
+            PromptTemplate.id.desc(),
         )
     ).first()
     if row is None:
@@ -144,7 +228,9 @@ def _call_chat(chat_fn: ChatFn, messages: list[dict[str, str]]) -> str:
 
 def _default_chat_fn(session: Session) -> ChatFn:
     model = session.exec(
-        select(ModelConfig).where(ModelConfig.is_default == True)  # noqa: E712
+        select(ModelConfig)
+        .where(ModelConfig.is_default == True)  # noqa: E712
+        .order_by(ModelConfig.id.desc())
     ).first()
     if model is None:
         model = session.exec(select(ModelConfig).order_by(ModelConfig.id.desc())).first()
@@ -324,13 +410,28 @@ def ingest_document(
 
         # 1b) Verbatim source chunks (lossless layer for hybrid retrieve)
         _set_stage(session, job, "chunking", 20)
-        chunk_rows = replace_chunks_for_document(
-            session,
-            document_id,
-            parsed,
-            chunk_chars=config.SOURCE_CHUNK_CHARS,
-            overlap_chars=config.SOURCE_CHUNK_OVERLAP,
+        retry_requested = _is_retry_requested(job)
+        reusable_chunks = (
+            _load_reusable_chunks(session, document_id, len(text))
+            if retry_requested
+            else None
         )
+        if reusable_chunks is not None:
+            chunk_rows = reusable_chunks
+            _append_step(
+                job,
+                "source_chunks_reused",
+                f"Reused {len(chunk_rows)} source chunk(s) for window retry",
+                chunk_count=len(chunk_rows),
+            )
+        else:
+            chunk_rows = replace_chunks_for_document(
+                session,
+                document_id,
+                parsed,
+                chunk_chars=config.SOURCE_CHUNK_CHARS,
+                overlap_chars=config.SOURCE_CHUNK_OVERLAP,
+            )
         job.progress = 25
         _append_step(
             job,
@@ -396,6 +497,7 @@ def ingest_document(
             session.commit()
             _raise_if_cancelled(session, job, doc)
 
+        resume_window_results, retry_window_indices = _retry_window_state(job)
         analyze_result = run_long_source_analyze(
             text,
             chat_fn=chat_fn,
@@ -410,8 +512,11 @@ def ingest_document(
                 if item.get("page_key")
             ],
             source_windows=source_anchor_windows,
+            resume_window_results=resume_window_results or None,
+            retry_window_indices=retry_window_indices,
         )
         analysis = analyze_result["analysis"]
+        ingest_warnings = list(analyze_result.get("warnings") or [])
         try:
             persisted_plan = json.loads(job.plan_json or "{}")
         except json.JSONDecodeError:
@@ -427,6 +532,10 @@ def ingest_document(
                 ],
                 "step_a_plan": analyze_result.get("step_a_plan") or {},
                 "window_results": analyze_result.get("window_results") or [],
+                "degraded_windows": analyze_result.get("degraded_windows") or [],
+                "reused_windows": analyze_result.get("reused_windows") or [],
+                "warnings": analyze_result.get("warnings") or [],
+                "retry_failed_windows": False,
             }
         )
         job.plan_json = json.dumps(persisted_plan, ensure_ascii=False)
@@ -500,6 +609,35 @@ def ingest_document(
                         max_pages=MAX_WIKI_PAGES_PER_DOC,
                         allow_legacy_markdown=False,
                     )
+                    allowed_candidate_keys = {
+                        str(operation.get("page_key"))
+                        for operation in strict_operations
+                        if isinstance(operation, dict)
+                        and operation.get("op") != "noop"
+                        and operation.get("page_key")
+                    }
+                    unexpected_candidate_keys = [
+                        str(candidate.get("page_key"))
+                        for candidate in candidates
+                        if str(candidate.get("page_key")) not in allowed_candidate_keys
+                    ]
+                    if unexpected_candidate_keys:
+                        candidates = [
+                            candidate
+                            for candidate in candidates
+                            if str(candidate.get("page_key")) in allowed_candidate_keys
+                        ]
+                        warning = (
+                            "Step B 返回了未被 Step A 请求的页面，已忽略："
+                            + ", ".join(unexpected_candidate_keys[:8])
+                        )
+                        ingest_warnings.append(warning)
+                        _append_step(
+                            job,
+                            "wiki_write_sanitized",
+                            warning,
+                            ignored_page_keys=unexpected_candidate_keys[:8],
+                        )
                 except (LLMError, ValueError) as write_exc:
                     write_mode = "deterministic_fallback"
                     _append_step(
@@ -599,10 +737,40 @@ def ingest_document(
         doc.char_count = len(text)
         doc.error_message = None
         doc.updated_at = _utcnow()
-        job.status = "success"
+        if ingest_warnings:
+            try:
+                final_plan = json.loads(job.plan_json or "{}")
+            except (TypeError, json.JSONDecodeError):
+                final_plan = {}
+            if not isinstance(final_plan, dict):
+                final_plan = {}
+            final_plan["warnings"] = ingest_warnings
+            job.plan_json = json.dumps(final_plan, ensure_ascii=False)
+        degraded_windows = [
+            int(index)
+            for index in (analyze_result.get("degraded_windows") or [])
+            if str(index).strip().isdigit()
+        ]
+        if degraded_windows or ingest_warnings:
+            warning_parts: list[str] = []
+            if degraded_windows:
+                warning_parts.append(
+                    f"{len(degraded_windows)} 个分析窗口未通过模型校验"
+                )
+            if ingest_warnings and not degraded_windows:
+                warning_parts.append("模型写入结果已按安全白名单整理")
+            job.error_message = (
+                "摄入已完成，但 "
+                + "；".join(warning_parts)
+                + "；"
+                "原文已保留并标记待复核，可重试失败窗口。"
+            )
+            job.status = "success_with_warnings"
+        else:
+            job.status = "success"
+            job.error_message = None
         job.stage = "ready"
         job.progress = 100
-        job.error_message = None
         job.updated_at = _utcnow()
         session.add(doc)
         session.add(job)
@@ -612,8 +780,9 @@ def ingest_document(
                 {
                     "job_id": job.id,
                     "document_id": document_id,
-                    "status": "success",
+                    "status": job.status,
                     "stage": job.stage,
+                    "degraded_windows": degraded_windows,
                     "applied_pages": (
                         strict_apply_result.applied_page_keys
                         if strict_apply_result is not None

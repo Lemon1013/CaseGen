@@ -50,16 +50,53 @@ def _migrate_sqlite_columns(engine) -> None:
             conn.execute(text(sql))
 
 
+def _migrate_model_defaults(engine) -> None:
+    """Normalize legacy duplicate defaults and install the DB constraint."""
+    with engine.begin() as conn:
+        columns = conn.execute(text('PRAGMA table_info("models")')).fetchall()
+        names = {str(row[1]) for row in columns}
+        if not columns or "is_default" not in names:
+            return
+
+        defaults = conn.execute(
+            text(
+                'SELECT id FROM "models" '
+                'WHERE is_default = 1 ORDER BY id DESC'
+            )
+        ).fetchall()
+        if len(defaults) > 1:
+            keep_id = int(defaults[0][0])
+            conn.execute(
+                text(
+                    'UPDATE "models" SET is_default = 0 '
+                    'WHERE is_default = 1 AND id <> :keep_id'
+                ),
+                {"keep_id": keep_id},
+            )
+
+        conn.execute(
+            text(
+                'CREATE UNIQUE INDEX IF NOT EXISTS "uq_models_single_default" '
+                'ON "models" ("is_default") WHERE "is_default" = 1'
+            )
+        )
+
+
 def init_db() -> None:
     from app.models import entities  # noqa: F401
-    from app.services.wiki_migrate import migrate_wiki_schema
+    from app.services.wiki_migrate import backup_before_wiki_migration, migrate_wiki_schema
 
     engine = get_engine()
+    # Clean legacy duplicate defaults before SQLModel.metadata.create_all
+    # attempts to create the partial unique index on an existing database.
+    backup_before_wiki_migration(engine)
+    _migrate_model_defaults(engine)
     # Wiki migration performs its backup before any create/alter/backfill
     # operation.  It also calls create_all so the new Wiki tables are present
     # before the remaining compatibility migration runs.
     migrate_wiki_schema(engine)
     _migrate_sqlite_columns(engine)
+    _migrate_model_defaults(engine)
 
 
 def get_session():

@@ -196,6 +196,17 @@ def test_structured_step_b_create_is_applied_with_job_revision(tmp_app_data, mon
                         "sources": [],
                         "body": "3.5.2 集合竞价按最大成交量确定成交价格。",
                         "reason": "新增成交原则",
+                    },
+                    {
+                        "operation": "create",
+                        "page_key": "source_summary.hallucinated",
+                        "title": "模型额外生成的页面",
+                        "type": "source",
+                        "aliases": [],
+                        "tags": [],
+                        "sources": [],
+                        "body": "这页不在 Step A 计划中。",
+                        "reason": "未请求的额外页面",
                     }
                 ]
             },
@@ -215,11 +226,12 @@ def test_structured_step_b_create_is_applied_with_job_revision(tmp_app_data, mon
     )
     job = client.post(f"/api/documents/{uploaded.json()['id']}/ingest").json()
 
-    assert job["status"] == "success", job
+    assert job["status"] == "success_with_warnings", job
     log = json.loads(job["step_log_json"])
     apply_step = next(item for item in log if item["step"] == "wiki_apply")
     assert "rule.order.auction-price" in apply_step["applied_page_keys"]
     assert apply_step["source_summary_key"].startswith("source.document.")
+    assert any(item["step"] == "wiki_write_sanitized" for item in log)
     with Session(get_engine()) as session:
         revisions = session.exec(select(WikiPageRevision)).all()
         assert len(revisions) == 2

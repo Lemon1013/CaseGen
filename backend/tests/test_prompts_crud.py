@@ -33,14 +33,14 @@ def test_get_update_prompt(tmp_app_data):
     assert body["name"] == "custom-gen-v2"
     assert body["is_active"] is True
 
-    # Only one active generate prompt
+    # Bundled and custom generate prompts may both remain active.
     actives = [
         p
         for p in client.get("/api/prompts", params={"type": "generate"}).json()
         if p["is_active"]
     ]
-    assert len(actives) == 1
-    assert actives[0]["id"] == pid
+    assert any(prompt["id"] == pid for prompt in actives)
+    assert any(prompt["name"] == "default_generate" for prompt in actives)
 
 
 def test_list_filter_by_type(tmp_app_data):
