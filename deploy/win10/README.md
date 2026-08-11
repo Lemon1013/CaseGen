@@ -22,8 +22,11 @@ CaseGen/                     # 解压后的项目源码
 
 ### 前置要求
 
-1. 安装 **Python 3.12**（官网 python.org 下载，安装时务必勾选
+1. 安装 **Python 3.11**（官网 python.org 下载，安装时务必勾选
    **"Add python.exe to PATH"**）。
+   > 本包附带的后端依赖（`backend_wheels/`）为 **cp311 / win_amd64** 版本，
+   > 已针对 Python 3.11 预下载。若改用 3.12/3.13，需在可联网机器上重新下载 wheel
+   > （命令见文末"更换 Python 版本"）。
 2. 将整个压缩包解压到目标机器（路径不要含中文或空格更稳妥，例如 `D:\CaseGen`）。
 
 ### 第一步：安装依赖（只需一次）
@@ -49,18 +52,20 @@ CaseGen/                     # 解压后的项目源码
   上传文档后需重新「编译/摄入」到 Wiki。
 - **停止服务**：在 run.bat 窗口按 `Ctrl+C` 或直接关闭窗口。
 - **修改端口**：编辑 `run.bat`，把 `--port 8000` 改成其它端口。
-- 本方案后端依赖针对 **Python 3.12（cp312 / win_amd64）** 预下载；
-  若目标机器是其它 Python 版本（如 3.11），需要在可联网的 Windows 机器上重新执行：
+- **更换 Python 版本**（如改用 3.12）：在可联网的 Windows 机器上重新下载对应版本 wheel：
 
   ```
   cd backend
-  pip download -r requirements.txt --platform win_amd64 --python-version 3.11 --implementation cp --only-binary=:all: -d ..\deploy\win10\backend_wheels
+  pip download -r requirements.txt --platform win_amd64 --python-version 3.12 --implementation cp --only-binary=:all: -d ..\deploy\win10\backend_wheels
   ```
 
-  并把 `requirements.txt` 中 `uvicorn[standard]` 改为 `uvicorn`（uvloop 不支持 Windows）。
+  并把 `requirements.txt` 中 `uvicorn[standard]` 改为 `uvicorn`（uvloop 不支持 Windows），
+  同时清空 `backend_wheels\` 后再下载，避免新旧版本混用。
 
 ## 本机验证记录
 
-- 后端 pytest：`167 passed`
-- 前端 `npm run build`：通过
+- 后端 pytest：`185 passed`（含 Wiki spaces）
+- 前端 `npm run build`：通过（含 WikiSpacesView）
 - 单进程模式（后端托管 dist）：健康检查、首页、SPA 路由、静态资源、API 全部 200
+- Python 3.11.14 实机验证：`185 passed`，uvicorn 启动与静态托管正常（后端 `backend/.venv311` 与 Win10 同步）
+- 版本基线：`be11151`（含 Wiki spaces 2.0 与静态托管）
