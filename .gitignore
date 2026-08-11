@@ -13,6 +13,8 @@ venv/
 !.env.example
 frontend/dist/
 node_modules/
+# Offline wheel cache for Windows deploy (regenerable via pip download)
+deploy/win10/backend_wheels/
 **/secrets/
 *.pem
 
