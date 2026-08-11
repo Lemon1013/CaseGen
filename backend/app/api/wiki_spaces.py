@@ -7,8 +7,13 @@ from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from app.db import get_session
-from app.models.entities import Document, WikiPageRow, WikiReviewItem, WikiSpace
-from app.schemas.wiki_spaces import WikiSpaceCreate, WikiSpaceOut, WikiSpaceUpdate
+from app.models.entities import Document, IngestJob, WikiPageRow, WikiReviewItem, WikiSpace
+from app.schemas.wiki_spaces import (
+    WikiSpaceCreate,
+    WikiSpaceOut,
+    WikiSpaceStatusUpdate,
+    WikiSpaceUpdate,
+)
 from app.services.wiki_spaces import (
     ACTIVE_SPACE_STATUS,
     ARCHIVED_SPACE_STATUS,
@@ -32,6 +37,48 @@ def _get(session: Session, space_id: int) -> WikiSpace:
     if row is None:
         raise HTTPException(status_code=404, detail="Wiki space not found")
     return row
+
+
+def _set_status(
+    session: Session,
+    row: WikiSpace,
+    next_status: str,
+) -> WikiSpaceOut:
+    if next_status == row.status:
+        return _out(session, row)
+    if next_status == ARCHIVED_SPACE_STATUS:
+        if row.slug == DEFAULT_SPACE_SLUG:
+            raise HTTPException(
+                status_code=409,
+                detail="The default Wiki space cannot be archived",
+            )
+        active_job = session.exec(
+            select(IngestJob)
+            .where(
+                IngestJob.space_id == row.id,
+                IngestJob.status.in_(["queued", "running"]),
+            )
+            .order_by(IngestJob.id.desc())
+        ).first()
+        if active_job is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Wiki space has active ingest job #{active_job.id}; "
+                    "cancel it before archiving"
+                ),
+            )
+    elif next_status == ACTIVE_SPACE_STATUS:
+        ensure_space_dirs(row)
+    else:  # The request schema should reject this; keep the service boundary strict.
+        raise HTTPException(status_code=422, detail="Unsupported Wiki space status")
+
+    row.status = next_status
+    row.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    session.add(row)
+    session.commit()
+    session.refresh(row)
+    return _out(session, row)
 
 
 @router.get("", response_model=list[WikiSpaceOut])
@@ -110,13 +157,13 @@ def archive_wiki_space(
     session: Session = Depends(get_session),
 ) -> WikiSpaceOut:
     row = _get(session, space_id)
-    if row.slug == DEFAULT_SPACE_SLUG:
-        raise HTTPException(status_code=409, detail="The default Wiki space cannot be archived")
-    if row.status == ARCHIVED_SPACE_STATUS:
-        return _out(session, row)
-    row.status = ARCHIVED_SPACE_STATUS
-    row.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
-    session.add(row)
-    session.commit()
-    session.refresh(row)
-    return _out(session, row)
+    return _set_status(session, row, ARCHIVED_SPACE_STATUS)
+
+
+@router.patch("/{space_id}/status", response_model=WikiSpaceOut)
+def update_wiki_space_status(
+    space_id: int,
+    body: WikiSpaceStatusUpdate,
+    session: Session = Depends(get_session),
+) -> WikiSpaceOut:
+    return _set_status(session, _get(session, space_id), body.status)

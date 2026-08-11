@@ -86,6 +86,16 @@ export function listDocuments(spaceId?: number) {
   return api<DocumentItem[]>(`/api/documents${query}`)
 }
 
+export interface DocumentDeleteResult {
+  document_id: number
+  chunks_deleted: number
+  pages_archived: string[]
+  pages_detached: string[]
+  reviews_closed: number
+  source_file_removed: boolean
+  warnings: string[]
+}
+
 export function uploadDocument(file: File, spaceId?: number) {
   const form = new FormData()
   form.append('file', file)
@@ -126,6 +136,11 @@ export function listIngestJobs(status?: string, spaceId?: number) {
 export function getIngestJob(id: number, spaceId?: number) {
   const query = spaceId ? `?space_id=${spaceId}` : ''
   return api<IngestJob>(`/api/ingest-jobs/${id}${query}`)
+}
+
+export function deleteDocument(id: number, spaceId?: number) {
+  const query = spaceId ? `?space_id=${spaceId}` : ''
+  return api<DocumentDeleteResult>(`/api/documents/${id}${query}`, { method: 'DELETE' })
 }
 
 export function cancelIngestJob(id: number, spaceId?: number) {

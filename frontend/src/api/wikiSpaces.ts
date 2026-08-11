@@ -20,6 +20,8 @@ export interface WikiSpaceInput {
   description?: string
 }
 
+export type WikiSpaceStatus = 'active' | 'archived'
+
 export function listWikiSpaces() {
   return api<WikiSpace[]>('/api/wiki-spaces')
 }
@@ -44,4 +46,11 @@ export function updateWikiSpace(id: number, body: Partial<WikiSpaceInput>) {
 
 export function archiveWikiSpace(id: number) {
   return api<WikiSpace>(`/api/wiki-spaces/${id}/archive`, { method: 'POST' })
+}
+
+export function updateWikiSpaceStatus(id: number, status: WikiSpaceStatus) {
+  return api<WikiSpace>(`/api/wiki-spaces/${id}/status`, {
+    method: 'PATCH',
+    body: JSON.stringify({ status }),
+  })
 }

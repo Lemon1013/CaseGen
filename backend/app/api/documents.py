@@ -11,8 +11,15 @@ from app import config
 from app.config import ALLOWED_EXTENSIONS, MAX_UPLOAD_BYTES, ensure_data_dirs
 from app.db import get_session
 from app.models.entities import Document, IngestJob, SourceChunk
-from app.schemas.documents import DocumentOut, DocumentPreviewOut, RechunkOut, SourceChunkOut
+from app.schemas.documents import (
+    DocumentDeleteOut,
+    DocumentOut,
+    DocumentPreviewOut,
+    RechunkOut,
+    SourceChunkOut,
+)
 from app.schemas.wiki import IngestJobOut
+from app.services.document_delete import delete_document
 from app.services.parse_document import parse_document
 from app.services.paths import make_raw_filename, raw_path_for, relative_raw_stored_path
 from app.services.source_chunks_store import replace_chunks_for_document
@@ -28,6 +35,13 @@ router = APIRouter(prefix="/api/documents", tags=["documents"])
 
 # Optional injectable chat_fn for tests: set via monkeypatch on this module attr.
 _INGEST_CHAT_FN = None
+
+
+def _document_or_404(session: Session, document_id: int) -> Document:
+    document = session.get(Document, document_id)
+    if document is None or document.status == "deleted":
+        raise HTTPException(status_code=404, detail="Document not found")
+    return document
 
 
 def _space_for_document(
@@ -156,7 +170,10 @@ def list_documents(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     rows = session.exec(
         select(Document)
-        .where(space_scope_clause(session, Document.space_id, sid))
+        .where(
+            space_scope_clause(session, Document.space_id, sid),
+            Document.status != "deleted",
+        )
         .order_by(Document.id.desc())
     ).all()
     return [_document_out(session, row) for row in rows]
@@ -168,11 +185,39 @@ def get_document(
     space_id: int | None = Query(default=None),
     session: Session = Depends(get_session),
 ) -> DocumentOut:
-    doc = session.get(Document, document_id)
-    if doc is None:
-        raise HTTPException(status_code=404, detail="Document not found")
+    doc = _document_or_404(session, document_id)
     _space_for_document(session, doc, resolve_space_id(session, space_id))
     return _document_out(session, doc)
+
+
+@router.delete("/{document_id}", response_model=DocumentDeleteOut)
+def remove_document(
+    document_id: int,
+    space_id: int | None = Query(default=None),
+    session: Session = Depends(get_session),
+) -> DocumentDeleteOut:
+    doc = _document_or_404(session, document_id)
+    space = _space_for_document(
+        session,
+        doc,
+        resolve_space_id(session, space_id),
+        for_write=True,
+    )
+    try:
+        result = delete_document(session, doc, space_id=int(space.id or 0))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return DocumentDeleteOut(
+        document_id=result.document_id,
+        chunks_deleted=result.chunks_deleted,
+        pages_archived=result.pages_archived,
+        pages_detached=result.pages_detached,
+        reviews_closed=result.reviews_closed,
+        source_file_removed=result.source_file_removed,
+        warnings=result.warnings,
+    )
 
 
 @router.get("/{document_id}/preview", response_model=DocumentPreviewOut)
@@ -183,9 +228,7 @@ def preview_document(
     session: Session = Depends(get_session),
 ) -> DocumentPreviewOut:
     """Parse the immutable upload on demand for quality display and preview."""
-    doc = session.get(Document, document_id)
-    if doc is None:
-        raise HTTPException(status_code=404, detail="Document not found")
+    doc = _document_or_404(session, document_id)
     _space_for_document(session, doc, resolve_space_id(session, space_id))
     stored = Path((doc.stored_path or "").replace("\\", "/"))
     path = stored if stored.is_absolute() else config.DATA_DIR / stored
@@ -232,9 +275,7 @@ def start_ingest(
     force: bool = Query(False, description="Force a new ingest after a previous terminal job"),
     space_id: int | None = Query(default=None),
 ) -> IngestJobOut:
-    doc = session.get(Document, document_id)
-    if doc is None:
-        raise HTTPException(status_code=404, detail="Document not found")
+    doc = _document_or_404(session, document_id)
     # The SQLite row is the durable queue.  A second request for the same
     # document returns the existing active job and cannot start concurrent
     # page replacement/LLM work.
@@ -302,9 +343,7 @@ def list_document_chunks(
     space_id: int | None = Query(default=None),
     session: Session = Depends(get_session),
 ) -> list[SourceChunk]:
-    doc = session.get(Document, document_id)
-    if doc is None:
-        raise HTTPException(status_code=404, detail="Document not found")
+    doc = _document_or_404(session, document_id)
     space = _space_for_document(session, doc, resolve_space_id(session, space_id))
     rows = session.exec(
         select(SourceChunk)
@@ -327,9 +366,7 @@ def rechunk_document(
     session: Session = Depends(get_session),
 ) -> RechunkOut:
     """Rebuild verbatim source chunks without re-running LLM wiki compile."""
-    doc = session.get(Document, document_id)
-    if doc is None:
-        raise HTTPException(status_code=404, detail="Document not found")
+    doc = _document_or_404(session, document_id)
     space = _space_for_document(
         session, doc, resolve_space_id(session, space_id), for_write=True
     )

@@ -11,8 +11,16 @@ from sqlmodel import Session
 
 from app.models.entities import WikiReviewItem
 from app.services.wiki_plan import PageOperation, StepAPlan, coerce_step_a_plan
-from app.services.wiki_repository import WikiPageNotFoundError, WikiRepository
+from app.services.wiki_repository import (
+    WikiAtomicApplyError,
+    WikiPageAlreadyExistsError,
+    WikiPageCorruptError,
+    WikiPageFileError,
+    WikiPageNotFoundError,
+    WikiRepository,
+)
 from app.services.wiki_schema import WikiFrontmatter, WikiPage, WikiSource, validate_page_key
+from app.services.wiki_titles import display_title
 
 
 MAX_APPLY_PAGES = 8
@@ -25,11 +33,26 @@ class WikiApplyResult:
     applied_page_keys: list[str] = field(default_factory=list)
     noop_page_keys: list[str] = field(default_factory=list)
     review_item_ids: list[int] = field(default_factory=list)
+    skipped_page_keys: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
     source_summary_key: str = ""
 
 
 def _unique(values: Iterable[str]) -> list[str]:
     return list(dict.fromkeys(str(value).strip() for value in values if str(value).strip()))
+
+
+def _string_values(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, Mapping):
+        return []
+    try:
+        return [str(item) for item in value]
+    except TypeError:
+        return [str(value)]
 
 
 def _anchors_to_source(operation: PageOperation, document_id: int) -> WikiSource:
@@ -64,47 +87,46 @@ def _candidate_page(
     document_id: int,
     existing: WikiPage | None = None,
 ) -> WikiPage:
-    key = validate_page_key(str(raw.get("page_key") or operation.page_key))
-    if key != operation.page_key:
-        raise ValueError(f"candidate key does not match operation: {key}")
-    declared_operation = str(raw.get("operation") or "").strip()
-    if declared_operation and declared_operation != operation.op:
-        raise ValueError(
-            f"candidate operation does not match plan for {key}: {declared_operation}"
-        )
-    page_type = str(raw.get("type") or raw.get("page_type") or operation.page_type or "").strip()
+    # Identity belongs to the server-side plan.  Step B can only contribute
+    # human-facing text and metadata; mismatched model fields are ignored.
+    key = validate_page_key(operation.page_key)
+    page_type = str(operation.page_type or "").strip()
     if existing is not None:
-        page_type = page_type or existing.type
-        if page_type != existing.type:
-            raise ValueError(f"page type cannot change during update: {key}")
+        page_type = existing.type
     if not page_type:
-        page_type = "source" if key.startswith("source.") else "rule"
+        raw_type = str(raw.get("type") or raw.get("page_type") or "").strip()
+        page_type = raw_type if raw_type in {
+            "source", "rule", "entity", "scenario", "regression", "synthesis"
+        } else ("source" if key.startswith("source.") else "rule")
     body = str(raw.get("body") or "").strip()
     if not body:
         raise ValueError(f"candidate body must not be empty: {key}")
 
-    raw_sources = raw.get("sources") or []
-    if isinstance(raw_sources, Mapping):
-        raw_sources = [raw_sources]
-    parsed_sources: list[WikiSource] = []
-    for item in raw_sources if isinstance(raw_sources, list) else []:
-        if isinstance(item, Mapping) and item.get("document_id") is not None:
-            parsed_sources.append(WikiSource.model_validate(item))
-    parsed_sources = _merge_sources(parsed_sources, [_anchors_to_source(operation, document_id)])
+    # Source evidence is bound from the actual analyze window.  Never trust a
+    # model-provided document/chunk id at the repository boundary.
+    parsed_sources = [_anchors_to_source(operation, document_id)]
     if existing is not None:
         parsed_sources = _merge_sources(existing.frontmatter.sources, parsed_sources)
 
-    aliases = _unique(raw.get("aliases") or [])
-    tags = _unique(raw.get("tags") or [])
+    aliases = _unique(_string_values(raw.get("aliases")))
+    tags = _unique(_string_values(raw.get("tags")))
     if existing is not None:
         aliases = _unique([*existing.frontmatter.aliases, *aliases])
         tags = _unique([*existing.frontmatter.tags, *tags])
         if not bool(raw.get("replace_existing")) and existing.body.strip() not in body:
             body = existing.body.strip() + "\n\n## 增量补充\n\n" + body
 
+    title = display_title(
+        str(raw.get("title") or (existing.title if existing else "")),
+        page_key=key,
+        page_type=page_type,
+        body=body,
+        hints=[operation.reason, *_string_values(raw.get("title_hints"))],
+    )
+
     frontmatter = WikiFrontmatter(
         page_key=key,
-        title=str(raw.get("title") or (existing.title if existing else key)).strip(),
+        title=title,
         type=page_type,
         domain=raw.get("domain") if raw.get("domain") is not None else (
             existing.frontmatter.domain if existing else None
@@ -112,7 +134,10 @@ def _candidate_page(
         aliases=aliases,
         tags=tags,
         sources=parsed_sources,
-        status=str(raw.get("status") or "published"),
+        status=str(
+            raw.get("status")
+            or (existing.frontmatter.status if existing else "published")
+        ),
         revision=existing.frontmatter.revision if existing else 1,
     )
     return WikiPage(frontmatter=frontmatter, body=body)
@@ -132,13 +157,20 @@ def _fallback_candidate(
     ]
     if not selected:
         selected = [claim.statement for claim in plan.claims]
-    body = "\n".join([f"# {operation.page_key}", "", *[f"- {item}" for item in selected]])
+    page_type = existing.type if existing else (operation.page_type or "rule")
+    title = display_title(
+        existing.title if existing else "",
+        page_key=operation.page_key,
+        page_type=page_type,
+        hints=[operation.reason, *selected],
+    )
+    body = "\n".join([f"# {title}", "", *[f"- {item}" for item in selected]])
     if not selected:
         body += "\n- 本来源未提取到可自动发布的规则，请人工复核。"
     return {
         "page_key": operation.page_key,
-        "title": existing.title if existing else operation.page_key,
-        "type": existing.type if existing else (operation.page_type or "rule"),
+        "title": title,
+        "type": page_type,
         "aliases": [],
         "tags": list(plan.entities[:8]),
         "sources": [_anchors_to_source(operation, document_id).model_dump(mode="json")],
@@ -156,7 +188,13 @@ def build_source_summary_candidate(plan: StepAPlan, document_id: int) -> tuple[P
         reason="ensure source summary",
         source_anchors=[],
     )
-    lines = [f"# {plan.source_summary.title or key}", ""]
+    title = display_title(
+        plan.source_summary.title,
+        page_key=key,
+        page_type="source",
+        hints=[plan.source_summary.summary, *(claim.statement for claim in plan.claims[:3])],
+    )
+    lines = [f"# {title}", ""]
     if plan.source_summary.summary:
         lines.extend([plan.source_summary.summary, ""])
     if plan.claims:
@@ -164,7 +202,7 @@ def build_source_summary_candidate(plan: StepAPlan, document_id: int) -> tuple[P
         lines.extend(f"- {claim.statement}" for claim in plan.claims[:40])
     return operation, {
         "page_key": key,
-        "title": plan.source_summary.title or key,
+        "title": title,
         "type": "source",
         "aliases": [],
         "tags": list(plan.entities[:8]),
@@ -179,6 +217,26 @@ def _validate_wikilinks(body: str, known_keys: set[str]) -> None:
         key = validate_page_key(raw_key.strip())
         if key not in known_keys:
             raise ValueError(f"wikilink target does not exist: {key}")
+
+
+def _sanitize_wikilinks(body: str, known_keys: set[str]) -> tuple[str, list[str]]:
+    warnings: list[str] = []
+
+    def replace(match: re.Match[str]) -> str:
+        raw = match.group(0)
+        raw_key = match.group(1).strip()
+        display = raw[2:-2].split("|", 1)[1].strip() if "|" in raw[2:-2] else raw_key
+        try:
+            key = validate_page_key(raw_key)
+        except ValueError:
+            warnings.append(f"非法 Wiki 链接 {raw_key!r} 已转换为普通文本")
+            return display
+        if key not in known_keys:
+            warnings.append(f"未知 Wiki 链接 {key} 已转换为普通文本")
+            return display
+        return raw
+
+    return _WIKILINK_RE.sub(replace, str(body or "")), warnings
 
 
 def _risk_flags(
@@ -224,18 +282,11 @@ def _review_candidate(
         [*existing.frontmatter.aliases, *incoming_aliases]
     )
     candidate["tags"] = _unique([*existing.frontmatter.tags, *incoming_tags])
-    parsed_sources: list[WikiSource] = []
-    raw_sources = candidate.get("sources") or []
-    if isinstance(raw_sources, Mapping):
-        raw_sources = [raw_sources]
-    for source in raw_sources if isinstance(raw_sources, list) else []:
-        if isinstance(source, Mapping) and source.get("document_id") is not None:
-            parsed_sources.append(WikiSource.model_validate(source))
     candidate["sources"] = [
         source.model_dump(mode="json")
         for source in _merge_sources(
             existing.frontmatter.sources,
-            [*parsed_sources, _anchors_to_source(operation, document_id)],
+            [_anchors_to_source(operation, document_id)],
         )
     ]
     return candidate
@@ -308,52 +359,73 @@ def apply_wiki_plan(
     max_pages: int = MAX_APPLY_PAGES,
     space_id: int | None = None,
 ) -> WikiApplyResult:
-    """Apply safe candidates and queue high-risk updates for review."""
+    """Apply each safe page independently and isolate model-level failures."""
 
     repository = WikiRepository(session, space_id=space_id) if space_id is not None else WikiRepository(session)
     existing_rows = repository.list_rows(include_archived=True)
     existing_keys = {row.page_key for row in existing_rows if row.page_key}
-    parsed_plan = coerce_step_a_plan(plan, existing_page_keys=existing_keys)
+    parsed_plan = coerce_step_a_plan(
+        plan,
+        existing_page_keys=existing_keys,
+        max_operations=max_pages,
+    )
+    result = WikiApplyResult()
     candidate_list = list(candidates)
     if len(candidate_list) > max_pages:
-        raise ValueError(f"too many Wiki candidates: {len(candidate_list)}")
+        result.warnings.append(
+            f"Step B 返回 {len(candidate_list)} 个候选，已裁剪为 {max_pages} 个"
+        )
+        candidate_list = candidate_list[:max_pages]
     by_key: dict[str, Mapping[str, Any]] = {}
-    for candidate in candidate_list:
-        key = validate_page_key(str(candidate.get("page_key") or ""))
+    for position, candidate in enumerate(candidate_list, start=1):
+        try:
+            key = validate_page_key(str(candidate.get("page_key") or ""))
+        except ValueError:
+            result.warnings.append(f"Step B 候选 {position} page_key 无效，已忽略")
+            continue
         if key in by_key:
-            raise ValueError(f"duplicate Wiki candidate: {key}")
+            result.warnings.append(f"Step B 重复候选 {key} 已忽略")
+            continue
         by_key[key] = candidate
 
     operations = list(parsed_plan.page_operations)
     planned_keys = {operation.page_key for operation in operations if operation.op != "noop"}
     unexpected_keys = set(by_key) - planned_keys
     if unexpected_keys:
-        raise ValueError(
-            "candidate pages were not requested by Step A: "
-            + ", ".join(sorted(unexpected_keys))
+        result.warnings.append(
+            "Step B 计划外页面已忽略：" + ", ".join(sorted(unexpected_keys))
         )
-    summary_candidates = [item for item in by_key.values() if (item.get("type") or item.get("page_type")) == "source"]
-    summary_key = str(summary_candidates[0].get("page_key")) if summary_candidates else ""
-    if not summary_key:
-        summary_operation, summary_candidate = build_source_summary_candidate(parsed_plan, document_id)
-        if summary_operation.page_key in existing_keys:
-            summary_operation.op = "update"
+        by_key = {key: value for key, value in by_key.items() if key in planned_keys}
+
+    summary_operation, summary_candidate = build_source_summary_candidate(parsed_plan, document_id)
+    summary_key = summary_operation.page_key
+    result.source_summary_key = summary_key
+    if summary_key in existing_keys:
+        summary_operation.op = "update"
+    existing_summary_index = next(
+        (index for index, item in enumerate(operations) if item.page_key == summary_key),
+        None,
+    )
+    if existing_summary_index is None:
         operations.insert(0, summary_operation)
-        by_key[summary_operation.page_key] = summary_candidate
-        summary_key = summary_operation.page_key
+    else:
+        operations.pop(existing_summary_index)
+        operations.insert(0, summary_operation)
+    by_key.setdefault(summary_key, summary_candidate)
 
     if len(operations) > max_pages:
-        raise ValueError(f"too many Wiki operations: {len(operations)}")
-    known_keys = existing_keys | set(by_key)
-    # Validate every model-provided link before the first repository commit so
-    # an invalid later candidate cannot leave an earlier page applied.
-    for operation in operations:
-        raw = by_key.get(operation.page_key)
-        if raw is not None:
-            _validate_wikilinks(str(raw.get("body") or ""), known_keys)
-    result = WikiApplyResult(source_summary_key=summary_key)
+        result.warnings.append(
+            f"Wiki 操作共 {len(operations)} 条，已保留来源摘要和其余 {max_pages - 1} 条"
+        )
+        operations = [operations[0], *operations[1:max_pages]]
+    known_keys = existing_keys | {item.page_key for item in operations}
     row_ids = {row.page_key: row.id for row in existing_rows if row.page_key}
-    for item in parsed_plan.review_items:
+    seen_review_keys: set[str] = set()
+    for item in parsed_plan.review_items[:20]:
+        dedupe_key = f"{item.kind}|{item.page_key}|{item.reason}"
+        if dedupe_key in seen_review_keys:
+            continue
+        seen_review_keys.add(dedupe_key)
         review_id = _queue_review(
             session,
             operation="merge" if item.kind == "merge" else "review",
@@ -370,7 +442,7 @@ def apply_wiki_plan(
         )
         result.review_item_ids.append(review_id)
     operation_keys = {operation.page_key for operation in operations}
-    for contradiction in parsed_plan.contradictions:
+    for contradiction in parsed_plan.contradictions[:20]:
         if contradiction.page_key in operation_keys:
             continue
         review_id = _queue_review(
@@ -389,6 +461,17 @@ def apply_wiki_plan(
         if operation.op == "noop":
             result.noop_page_keys.append(operation.page_key)
             continue
+        live_exists = operation.page_key in existing_keys
+        if live_exists and operation.op == "create":
+            operation = operation.model_copy(update={"op": "update"})
+            result.warnings.append(
+                f"{operation.page_key} 已存在，写入阶段自动改为 update"
+            )
+        elif not live_exists and operation.op == "update":
+            operation = operation.model_copy(update={"op": "create"})
+            result.warnings.append(
+                f"{operation.page_key} 不存在，写入阶段自动改为 create"
+            )
         old_record = None
         old_page = None
         if operation.op == "update":
@@ -396,27 +479,59 @@ def apply_wiki_plan(
                 old_record = repository.read(operation.page_key)
                 old_page = old_record.page
             except WikiPageNotFoundError:
-                raise
-            except Exception as exc:
+                operation = operation.model_copy(update={"op": "create"})
+                result.warnings.append(
+                    f"{operation.page_key} 在写入前消失，已改为 create"
+                )
+            except (WikiPageCorruptError, WikiPageFileError) as exc:
+                fallback = _fallback_candidate(
+                    parsed_plan,
+                    operation,
+                    document_id=document_id,
+                )
                 review_id = _queue_review(
                     session,
                     operation="update",
-                    page_id=None,
+                    page_id=row_ids.get(operation.page_key),
                     page_key=operation.page_key,
                     job_id=job_id,
-                    reason=f"existing page cannot be safely read: {exc}",
-                    risks=["legacy_or_corrupt_page"],
+                    reason=f"现有页面不可读取，已隔离等待修复：{exc}",
+                    risks=["existing_page_unreadable"],
+                    candidate=fallback,
                     space_id=repository.space_id,
                 )
                 result.review_item_ids.append(review_id)
+                result.skipped_page_keys.append(operation.page_key)
+                result.warnings.append(
+                    f"{operation.page_key} 现有页面不可读取，已转为审核项"
+                )
                 continue
-        raw = by_key.get(operation.page_key) or _fallback_candidate(
-            parsed_plan,
-            operation,
-            document_id=document_id,
-            existing=old_page,
+            except WikiAtomicApplyError:
+                raise
+
+        raw = dict(by_key.get(operation.page_key) or {})
+        if not raw:
+            raw = _fallback_candidate(
+                parsed_plan,
+                operation,
+                document_id=document_id,
+                existing=old_page,
+            )
+            result.warnings.append(
+                f"{operation.page_key} 缺少可用 Step B 正文，已使用确定性正文"
+            )
+        raw["title_hints"] = [
+            claim.statement
+            for claim in parsed_plan.claims
+            if not operation.claim_ids or claim.claim_id in operation.claim_ids
+        ][:3]
+        sanitized_body, link_warnings = _sanitize_wikilinks(
+            str(raw.get("body") or ""), known_keys
         )
-        _validate_wikilinks(str(raw.get("body") or ""), known_keys)
+        raw["body"] = sanitized_body
+        result.warnings.extend(
+            f"{operation.page_key}: {message}" for message in link_warnings
+        )
         if old_page is not None:
             risks = _risk_flags(parsed_plan, operation, raw, old_page)
             if risks:
@@ -439,17 +554,69 @@ def apply_wiki_plan(
                 )
                 result.review_item_ids.append(review_id)
                 continue
-        page = _candidate_page(
-            raw,
-            operation=operation,
-            document_id=document_id,
-            existing=old_page,
-        )
+        try:
+            page = _candidate_page(
+                raw,
+                operation=operation,
+                document_id=document_id,
+                existing=old_page,
+            )
+        except ValueError as exc:
+            fallback = _fallback_candidate(
+                parsed_plan,
+                operation,
+                document_id=document_id,
+                existing=old_page,
+            )
+            result.warnings.append(
+                f"{operation.page_key} 候选字段不可用（{exc}），已使用确定性候选"
+            )
+            page = _candidate_page(
+                fallback,
+                operation=operation,
+                document_id=document_id,
+                existing=old_page,
+            )
+            raw = fallback
         reason = operation.reason or str(raw.get("reason") or operation.op)
-        if operation.op == "create":
-            repository.create(page, job_id=job_id, reason=reason)
-        else:
+        try:
+            if operation.op == "create":
+                repository.create(page, job_id=job_id, reason=reason)
+            else:
+                repository.update(operation.page_key, page, job_id=job_id, reason=reason)
+        except WikiPageAlreadyExistsError:
+            current = repository.read(operation.page_key)
+            update_operation = operation.model_copy(update={"op": "update"})
+            page = _candidate_page(
+                raw,
+                operation=update_operation,
+                document_id=document_id,
+                existing=current.page,
+            )
             repository.update(operation.page_key, page, job_id=job_id, reason=reason)
+            result.warnings.append(
+                f"{operation.page_key} 并发创建冲突，已自动转为 update"
+            )
+        except (WikiPageCorruptError, WikiPageFileError, WikiAtomicApplyError):
+            raise
+        except (ValueError, WikiPageNotFoundError) as exc:
+            review_id = _queue_review(
+                session,
+                operation="review",
+                page_id=row_ids.get(operation.page_key),
+                page_key=operation.page_key,
+                job_id=job_id,
+                reason=f"页面写入已隔离：{exc}",
+                risks=["page_apply_failed"],
+                candidate=raw,
+                space_id=repository.space_id,
+            )
+            result.review_item_ids.append(review_id)
+            result.skipped_page_keys.append(operation.page_key)
+            result.warnings.append(
+                f"{operation.page_key} 写入失败，已转为审核项并继续处理其他页面"
+            )
+            continue
         result.applied_page_keys.append(operation.page_key)
         existing_keys.add(operation.page_key)
     return result

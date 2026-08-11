@@ -99,6 +99,13 @@ class TaskEventOut(BaseModel):
 class ApplyPromptBody(BaseModel):
     revision_id: int
     mode: Literal["global", "task_temp"]
+    content: Optional[str] = Field(default=None, min_length=1)
+
+
+class TaskModelUpdate(BaseModel):
+    """Select the model used by the next generation attempt."""
+
+    model_id: Optional[int] = Field(default=None, ge=1)
 
 
 class PromptRevisionOut(BaseModel):

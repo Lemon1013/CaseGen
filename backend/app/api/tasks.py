@@ -10,6 +10,7 @@ from app.db import get_session
 from app.models.entities import (
     CaseDraft,
     GenerationTask,
+    ModelConfig,
     PromptRevision,
     PromptTemplate,
     Requirement,
@@ -28,6 +29,7 @@ from app.schemas.tasks import (
     TaskCitationOut,
     TaskCreate,
     TaskEventOut,
+    TaskModelUpdate,
     TaskOut,
 )
 from app.services.task_events import append_event
@@ -272,6 +274,43 @@ def get_task(task_id: int, session: Session = Depends(get_session)) -> TaskOut:
     return to_task_out(session, task)
 
 
+@router.patch("/{task_id}/model", response_model=TaskOut)
+def update_task_model(
+    task_id: int,
+    body: TaskModelUpdate,
+    session: Session = Depends(get_session),
+) -> TaskOut:
+    """Change the model before an initial or failed generation attempt."""
+
+    task = session.get(GenerationTask, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if task.status not in {"draft", "failed"}:
+        raise HTTPException(
+            status_code=409,
+            detail="Model can only be changed for draft or failed tasks",
+        )
+    if body.model_id is not None and session.get(ModelConfig, body.model_id) is None:
+        raise HTTPException(status_code=422, detail="Model not found")
+
+    previous_model_id = task.model_id
+    task.model_id = body.model_id
+    session.add(task)
+    append_event(
+        session,
+        task.id,
+        "model_change",
+        "已切换任务模型，下一次生成将使用新配置",
+        detail={
+            "previous_model_id": previous_model_id,
+            "model_id": body.model_id,
+        },
+    )
+    session.commit()
+    session.refresh(task)
+    return to_task_out(session, task)
+
+
 @router.delete("/{task_id}")
 def delete_task(task_id: int, session: Session = Depends(get_session)) -> dict:
     """Hard-delete a task and its dependent rows (drafts, reviews, events, …)."""
@@ -408,6 +447,7 @@ def apply_prompt_task(
             task_id,
             revision_id=body.revision_id,
             mode=body.mode,
+            content=body.content,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

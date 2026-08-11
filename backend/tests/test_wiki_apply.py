@@ -12,7 +12,11 @@ from app.models.entities import (
     WikiReviewItem,
 )
 from app.services.wiki_apply import apply_wiki_plan, queue_merge_review
-from app.services.wiki_pages_parse import WikiPageParseError, parse_wiki_write_output
+from app.services.wiki_pages_parse import (
+    WikiPageParseError,
+    parse_wiki_write_output,
+    reconcile_wiki_write_output,
+)
 from app.services.wiki_repository import WikiRepository
 from app.services.wiki_schema import WikiFrontmatter, WikiPage, WikiSource
 
@@ -190,39 +194,116 @@ def test_numeric_change_is_queued_for_review_without_overwriting_page(tmp_app_da
         assert review is not None and review.kind == "numeric_change"
 
 
-def test_invalid_wikilink_fails_before_any_page_is_applied(tmp_app_data):
+def test_invalid_wikilink_is_sanitized_without_aborting_page(tmp_app_data):
     init_db()
     with Session(get_engine()) as session:
         document_id, job_id = _seed_job(session)
-        try:
-            apply_wiki_plan(
-                session,
-                {
-                    "page_operations": [
-                        {
-                            "op": "create",
-                            "page_key": "rule.order.link",
-                            "page_type": "rule",
-                            "source_anchors": [_anchor()],
-                        }
-                    ]
-                },
-                [
+        result = apply_wiki_plan(
+            session,
+            {
+                "claims": [{"statement": "链接规则需要人工核对"}],
+                "page_operations": [
                     {
+                        "op": "create",
                         "page_key": "rule.order.link",
-                        "title": "链接规则",
-                        "type": "rule",
-                        "body": "参见 [[rule.missing]]。",
+                        "page_type": "rule",
+                        "source_anchors": [_anchor()],
                     }
                 ],
-                document_id=document_id,
-                job_id=job_id,
+            },
+            [
+                {
+                    "page_key": "rule.order.link",
+                    "title": "链接规则",
+                    "type": "rule",
+                    "body": "参见 [[rule.missing|缺失规则]]。",
+                }
+            ],
+            document_id=document_id,
+            job_id=job_id,
+        )
+        assert "rule.order.link" in result.applied_page_keys
+        assert any("未知 Wiki 链接" in warning for warning in result.warnings)
+        assert "[[rule.missing" not in WikiRepository(session).read("rule.order.link").body
+
+
+def test_existing_create_and_model_identity_are_reconciled(tmp_app_data):
+    init_db()
+    with Session(get_engine()) as session:
+        old_document_id, _ = _seed_job(session)
+        repository = WikiRepository(session)
+        repository.create(
+            WikiPage(
+                frontmatter=WikiFrontmatter(
+                    page_key="rule.order.balance",
+                    title="余额校验",
+                    type="rule",
+                    sources=[WikiSource(document_id=old_document_id)],
+                ),
+                body="旧规则。",
             )
-        except ValueError as exc:
-            assert "wikilink target" in str(exc)
-        else:
-            raise AssertionError("invalid wikilink should fail")
-        assert WikiRepository(session).list_rows() == []
+        )
+        document_id, job_id = _seed_job(session)
+        result = apply_wiki_plan(
+            session,
+            {
+                "claims": [{"statement": "余额不足时拒绝申报"}],
+                "page_operations": [
+                    {
+                        "op": "create",
+                        "page_key": "rule.order.balance",
+                        "page_type": "rule",
+                        "source_anchors": [_anchor()],
+                    }
+                ],
+            },
+            [
+                {
+                    "page_key": "rule.wrong.target",
+                    "operation": "create",
+                    "type": "entity",
+                    "title": "余额不足处理",
+                    "body": "余额不足时拒绝申报。",
+                }
+            ],
+            document_id=document_id,
+            job_id=job_id,
+        )
+        updated = repository.read("rule.order.balance")
+        assert "旧规则" in updated.body
+        assert "余额不足" in updated.body
+        assert updated.page.type == "rule"
+        assert result.applied_page_keys.count("rule.order.balance") == 1
+
+
+def test_deterministic_fallback_uses_readable_chinese_title(tmp_app_data):
+    init_db()
+    with Session(get_engine()) as session:
+        document_id, job_id = _seed_job(session)
+        result = apply_wiki_plan(
+            session,
+            {
+                "claims": [
+                    {"claim_id": "c1", "statement": "最低资本充足率不得低于监管要求"}
+                ],
+                "page_operations": [
+                    {
+                        "op": "create",
+                        "page_key": "rule.capital.minimum",
+                        "page_type": "rule",
+                        "claim_ids": ["c1"],
+                        "source_anchors": [_anchor()],
+                    }
+                ],
+            },
+            [],
+            document_id=document_id,
+            job_id=job_id,
+        )
+        page = WikiRepository(session).read("rule.capital.minimum")
+        assert page.title == "最低资本充足率不得低于监管要求"
+        assert page.title != page.page_key
+        assert result.warnings
 
 
 def test_merge_only_creates_review_item(tmp_app_data):
@@ -269,3 +350,37 @@ def test_structured_writer_rejects_paths_unknown_fields_and_unknown_operations()
             pass
         else:
             raise AssertionError(f"invalid writer field should be rejected: {field}")
+
+
+def test_writer_output_is_joined_to_server_owned_operation():
+    candidates, warnings = reconcile_wiki_write_output(
+        json.dumps(
+            {
+                "pages": [
+                    {
+                        "operation_id": "op-1",
+                        "page_key": "rule.model.wrong",
+                        "operation": "create",
+                        "type": "entity",
+                        "path": "../../escape.md",
+                        "title": "余额校验规则",
+                        "body": "余额不足时拒绝申报。",
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        [
+            {
+                "operation_id": "op-1",
+                "op": "update",
+                "page_key": "rule.order.balance",
+                "page_type": "rule",
+            }
+        ],
+    )
+    assert candidates[0]["page_key"] == "rule.order.balance"
+    assert candidates[0]["operation"] == "update"
+    assert candidates[0]["type"] == "rule"
+    assert candidates[0]["sources"] == []
+    assert any("路径字段" in warning for warning in warnings)

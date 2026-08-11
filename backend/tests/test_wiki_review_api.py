@@ -278,3 +278,50 @@ def test_approve_create_links_review_to_created_page(tmp_app_data):
         item = session.get(WikiReviewItem, review_id)
         assert item is not None and item.page_id is not None
         assert WikiRepository(session).read("rule.order.new-limit").revision == 1
+
+
+def test_batch_approve_isolates_manual_and_invalid_items(tmp_app_data):
+    _document_id, job_id, page_id = _seed_page_and_job()
+    writable_id = _review(page_id=page_id, job_id=job_id)
+    reminder_id = _review(
+        page_id=None,
+        job_id=job_id,
+        kind="needs_review",
+        candidate={"claim_ids": ["claim-1"]},
+        payload={"operation": "review"},
+        content=None,
+    )
+    merge_id = _review(
+        page_id=None,
+        job_id=job_id,
+        kind="merge",
+        candidate={"target_page_key": "rule.order.limit"},
+        payload={"operation": "merge"},
+        content=None,
+    )
+    invalid_id = _review(
+        page_id=page_id,
+        job_id=job_id,
+        candidate={},
+        payload={"operation": "update"},
+        content=None,
+    )
+    client = _client(tmp_app_data)
+
+    response = client.post(
+        "/api/wiki/reviews/batch-approve",
+        json={
+            "review_ids": [writable_id, reminder_id, merge_id, invalid_id],
+            "reviewed_by": "batch-tester",
+        },
+    )
+    assert response.status_code == 200, response.json()
+    body = response.json()
+    assert body["approved_ids"] == [writable_id]
+    assert body["acknowledged_ids"] == [reminder_id]
+    assert {item["review_id"] for item in body["skipped"]} == {merge_id, invalid_id}
+    with Session(get_engine()) as session:
+        assert session.get(WikiReviewItem, writable_id).status == "approved"
+        assert session.get(WikiReviewItem, reminder_id).status == "acknowledged"
+        assert session.get(WikiReviewItem, merge_id).status == "pending"
+        assert session.get(WikiReviewItem, invalid_id).status == "pending"

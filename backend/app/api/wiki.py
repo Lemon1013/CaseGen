@@ -31,6 +31,9 @@ from app.schemas.wiki import (
     WikiCandidateOut,
     WikiDiffOut,
     WikiReviewDecisionIn,
+    WikiReviewBatchIn,
+    WikiReviewBatchOut,
+    WikiReviewBatchSkipOut,
     WikiReviewDetailOut,
     WikiReviewOut,
     WikiReviewReasonOut,
@@ -52,6 +55,7 @@ from app.services.wiki_repository import (
     page_key_lock,
 )
 from app.services.wiki_schema import WikiFrontmatter, WikiPage, WikiSource
+from app.services.wiki_titles import display_title, is_technical_title
 from app.services.wiki_spaces import (
     resolve_space,
     resolve_space_id,
@@ -165,12 +169,20 @@ def _to_page_out(
     space = None
     if session is not None:
         space = _space_for_row(session, row)
+    needs_title_fallback = is_technical_title(row.title, row.page_key)
+    content = _read_page_content(row) if include_content or needs_title_fallback else None
+    title = display_title(
+        row.title,
+        page_key=row.page_key,
+        page_type=row.page_type,
+        body=content or "",
+    )
     return WikiPageOut(
         id=row.id,
         path=row.path,
         space_id=int(space.id if space and space.id is not None else row.space_id or 0),
         space_name=space.name if space else "",
-        title=row.title,
+        title=title,
         page_type=row.page_type,
         source_document_id=row.source_document_id,
         page_key=row.page_key,
@@ -179,7 +191,7 @@ def _to_page_out(
         revision=row.revision,
         aliases=_aliases_from_row(row),
         tags=_tags_from_row(row),
-        content=_read_page_content(row) if include_content else None,
+        content=content if include_content else None,
         created_at=row.created_at,
         updated_at=row.updated_at,
     )
@@ -489,6 +501,130 @@ def _best_effort_rebuild_derived(session: Session, space_id: int | None = None) 
         pass
 
 
+def _approve_review_item(
+    session: Session,
+    item: WikiReviewItem,
+    sid: int,
+    body: WikiReviewDecisionIn | None,
+    *,
+    rebuild_derived: bool = True,
+) -> WikiReviewDetailOut:
+    review_id = int(item.id or 0)
+    _review_scope(session, item, sid)
+    if item.status != "pending":
+        raise HTTPException(status_code=409, detail="Only pending review items can be approved")
+    item.space_id = item.space_id or sid
+    if item.kind == "merge":
+        raise HTTPException(status_code=409, detail="Merge candidates require manual review")
+
+    payload = _json_object(item.payload_json)
+    operation = str(payload.get("operation") or ("update" if item.page_id else "create"))
+    if operation not in {"create", "update"}:
+        raise HTTPException(
+            status_code=422,
+            detail="Review item has no applicable create/update candidate",
+        )
+    try:
+        page_key, page = _candidate_page(session, item, operation)
+    except (ValueError, WikiPageNotFoundError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    decision_reason = (
+        (body.decision_reason if body else None)
+        or (body.reason if body else None)
+        or item.reason
+    ).strip()
+    with page_key_lock(f"review.item.{review_id}", sid), page_key_lock(page_key, sid):
+        session.refresh(item)
+        if item.status != "pending":
+            raise HTTPException(
+                status_code=409,
+                detail="Only pending review items can be approved",
+            )
+        try:
+            if operation == "create":
+                if item.page_id is not None:
+                    raise ValueError("create candidate cannot target an existing page")
+                record = WikiRepository(session, space_id=sid).create(
+                    page, job_id=item.job_id, reason=decision_reason
+                )
+                item.page_id = record.id
+            else:
+                if item.page_id is None:
+                    raise ValueError("update candidate requires page_id")
+                record = WikiRepository(session, space_id=sid).update(
+                    page_key, page, job_id=item.job_id, reason=decision_reason
+                )
+        except (ValueError, WikiPageAlreadyExistsError, WikiPageNotFoundError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        item.status = "approved"
+        item.reviewed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        item.reviewed_by = body.reviewed_by if body else None
+        item.decision_reason = decision_reason
+        session.add(item)
+        session.commit()
+    _best_effort_log(
+        log_review,
+        review_id=review_id,
+        action="approve",
+        page_id=record.id,
+        job_id=item.job_id,
+        revision=record.revision,
+        reason=decision_reason,
+    )
+    if rebuild_derived:
+        _best_effort_rebuild_derived(session, sid)
+    return _review_detail(session, item)
+
+
+def _acknowledge_review_item(
+    session: Session,
+    item: WikiReviewItem,
+    sid: int,
+    body: WikiReviewDecisionIn | None,
+) -> WikiReviewDetailOut:
+    review_id = int(item.id or 0)
+    _review_scope(session, item, sid)
+    if item.status != "pending":
+        raise HTTPException(
+            status_code=409,
+            detail="Only pending review items can be acknowledged",
+        )
+    payload = _json_object(item.payload_json)
+    operation = str(payload.get("operation") or "")
+    if operation in {"create", "update", "merge"} or item.candidate_content_md:
+        raise HTTPException(
+            status_code=409,
+            detail="Writable candidates must be approved or rejected, not acknowledged",
+        )
+    decision_reason = (
+        (body.decision_reason if body else None)
+        or (body.reason if body else None)
+        or "已确认结构化提醒"
+    ).strip()
+    with page_key_lock(f"review.item.{review_id}", sid):
+        session.refresh(item)
+        if item.status != "pending":
+            raise HTTPException(
+                status_code=409,
+                detail="Only pending review items can be acknowledged",
+            )
+        item.status = "acknowledged"
+        item.reviewed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        item.reviewed_by = body.reviewed_by if body else None
+        item.decision_reason = decision_reason
+        session.add(item)
+        session.commit()
+    _best_effort_log(
+        log_review,
+        review_id=review_id,
+        action="acknowledge",
+        reason=decision_reason,
+    )
+    return _review_detail(session, item)
+
+
 @router.get("/api/ingest-jobs", response_model=list[IngestJobOut])
 def list_ingest_jobs(
     status: Optional[str] = None,
@@ -633,65 +769,8 @@ def approve_wiki_review(
     item = session.get(WikiReviewItem, review_id)
     if item is None:
         raise HTTPException(status_code=404, detail="Wiki review item not found")
-    if item.status != "pending":
-        raise HTTPException(status_code=409, detail="Only pending review items can be approved")
     sid = resolve_space_id(session, space_id)
-    _review_scope(session, item, sid)
-    item.space_id = item.space_id or sid
-    if item.kind == "merge":
-        raise HTTPException(status_code=409, detail="Merge candidates require manual review")
-
-    payload = _json_object(item.payload_json)
-    operation = str(payload.get("operation") or ("update" if item.page_id else "create"))
-    if operation not in {"create", "update"}:
-        raise HTTPException(status_code=422, detail="Review item has no applicable create/update candidate")
-    try:
-        page_key, page = _candidate_page(session, item, operation)
-    except (ValueError, WikiPageNotFoundError) as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-    decision_reason = ((body.decision_reason if body else None) or (body.reason if body else None) or item.reason).strip()
-    with page_key_lock(f"review.item.{review_id}", sid), page_key_lock(page_key, sid):
-        session.refresh(item)
-        if item.status != "pending":
-            raise HTTPException(
-                status_code=409,
-                detail="Only pending review items can be approved",
-            )
-        try:
-            if operation == "create":
-                if item.page_id is not None:
-                    raise ValueError("create candidate cannot target an existing page")
-                record = WikiRepository(session, space_id=sid).create(
-                    page, job_id=item.job_id, reason=decision_reason
-                )
-                item.page_id = record.id
-            else:
-                if item.page_id is None:
-                    raise ValueError("update candidate requires page_id")
-                record = WikiRepository(session, space_id=sid).update(
-                    page_key, page, job_id=item.job_id, reason=decision_reason
-                )
-        except (ValueError, WikiPageAlreadyExistsError, WikiPageNotFoundError) as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-        item.status = "approved"
-        item.reviewed_at = datetime.now(timezone.utc).replace(tzinfo=None)
-        item.reviewed_by = body.reviewed_by if body else None
-        item.decision_reason = decision_reason
-        session.add(item)
-        session.commit()
-    _best_effort_log(
-        log_review,
-        review_id=review_id,
-        action="approve",
-        page_id=record.id,
-        job_id=item.job_id,
-        revision=record.revision,
-        reason=decision_reason,
-    )
-    _best_effort_rebuild_derived(session, sid)
-    return _review_detail(session, item)
+    return _approve_review_item(session, item, sid, body)
 
 
 @router.post("/api/wiki/reviews/{review_id}/reject", response_model=WikiReviewDetailOut)
@@ -741,41 +820,77 @@ def acknowledge_wiki_review(
     if item is None:
         raise HTTPException(status_code=404, detail="Wiki review item not found")
     sid = resolve_space_id(session, space_id)
-    _review_scope(session, item, sid)
-    if item.status != "pending":
-        raise HTTPException(status_code=409, detail="Only pending review items can be acknowledged")
-    payload = _json_object(item.payload_json)
-    operation = str(payload.get("operation") or "")
-    if operation in {"create", "update", "merge"} or item.candidate_content_md:
-        raise HTTPException(
-            status_code=409,
-            detail="Writable candidates must be approved or rejected, not acknowledged",
-        )
-    decision_reason = (
-        (body.decision_reason if body else None)
-        or (body.reason if body else None)
-        or "已确认结构化提醒"
-    ).strip()
-    with page_key_lock(f"review.item.{review_id}", sid):
-        session.refresh(item)
-        if item.status != "pending":
-            raise HTTPException(
-                status_code=409,
-                detail="Only pending review items can be acknowledged",
-            )
-        item.status = "acknowledged"
-        item.reviewed_at = datetime.now(timezone.utc).replace(tzinfo=None)
-        item.reviewed_by = body.reviewed_by if body else None
-        item.decision_reason = decision_reason
-        session.add(item)
-        session.commit()
-    _best_effort_log(
-        log_review,
-        review_id=review_id,
-        action="acknowledge",
-        reason=decision_reason,
+    return _acknowledge_review_item(session, item, sid, body)
+
+
+@router.post("/api/wiki/reviews/batch-approve", response_model=WikiReviewBatchOut)
+def batch_approve_wiki_reviews(
+    body: WikiReviewBatchIn,
+    space_id: Optional[int] = Query(default=None),
+    session: Session = Depends(get_session),
+) -> WikiReviewBatchOut:
+    """Approve safe page candidates and acknowledge non-writable reminders.
+
+    Every item is isolated: merge candidates, malformed candidates and stale
+    rows remain pending and are reported instead of aborting the batch.
+    """
+
+    sid = resolve_space_id(session, space_id)
+    decision = WikiReviewDecisionIn(
+        reviewed_by=body.reviewed_by,
+        decision_reason=body.decision_reason or "批量审核通过",
     )
-    return _review_detail(session, item)
+    approved_ids: list[int] = []
+    acknowledged_ids: list[int] = []
+    skipped: list[WikiReviewBatchSkipOut] = []
+    for review_id in dict.fromkeys(body.review_ids):
+        item = session.get(WikiReviewItem, review_id)
+        if item is None:
+            skipped.append(
+                WikiReviewBatchSkipOut(review_id=review_id, reason="审核项不存在")
+            )
+            continue
+        try:
+            _review_scope(session, item, sid)
+            if item.status != "pending":
+                raise HTTPException(status_code=409, detail="审核项已被处理")
+            payload = _json_object(item.payload_json)
+            operation = str(payload.get("operation") or "")
+            if item.kind == "merge" or operation == "merge":
+                raise HTTPException(status_code=409, detail="合并候选需要人工处理")
+            if operation in {"create", "update"} or item.candidate_content_md:
+                _approve_review_item(
+                    session,
+                    item,
+                    sid,
+                    decision,
+                    rebuild_derived=False,
+                )
+                approved_ids.append(review_id)
+            else:
+                _acknowledge_review_item(session, item, sid, decision)
+                acknowledged_ids.append(review_id)
+        except HTTPException as exc:
+            session.rollback()
+            skipped.append(
+                WikiReviewBatchSkipOut(
+                    review_id=review_id,
+                    reason=str(exc.detail),
+                )
+            )
+        except (ValueError, WikiPageAlreadyExistsError, WikiPageNotFoundError) as exc:
+            session.rollback()
+            skipped.append(
+                WikiReviewBatchSkipOut(review_id=review_id, reason=str(exc))
+            )
+
+    if approved_ids:
+        _best_effort_rebuild_derived(session, sid)
+    return WikiReviewBatchOut(
+        approved_ids=approved_ids,
+        acknowledged_ids=acknowledged_ids,
+        skipped=skipped,
+    )
 
 
 @router.get("/api/wiki/pages/{page_id}/revisions", response_model=list[WikiRevisionOut])

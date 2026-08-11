@@ -141,6 +141,7 @@ _TARGET_PATH_FIELDS = frozenset(
 )
 _PAGE_FIELDS = frozenset(
     {
+        "operation_id",
         "page_key",
         "title",
         "type",
@@ -357,6 +358,129 @@ def parse_wiki_write_output(
             f"too many Wiki pages: {len(raw_pages)} (maximum {max_pages})"
         )
     return [_normalise_structured_page(item) for item in raw_pages]
+
+
+def reconcile_wiki_write_output(
+    raw: str | Mapping[str, Any] | list[Any],
+    operations: list[Mapping[str, Any]],
+    *,
+    max_pages: int = 8,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Join untrusted Step B prose to server-owned page operations.
+
+    Page identity, operation, type and sources always come from the validated
+    Step A plan.  A model may omit or alter those fields without aborting the
+    ingest; unusable bodies simply fall back to deterministic rendering.
+    """
+
+    if isinstance(raw, str):
+        value = _parse_json_value(raw)
+    else:
+        value = raw
+    raw_pages = _page_list_from_value(value)
+    warnings: list[str] = []
+    tasks: list[dict[str, Any]] = []
+    for position, operation in enumerate(operations, start=1):
+        if not isinstance(operation, Mapping):
+            continue
+        op = str(operation.get("op") or operation.get("operation") or "")
+        page_key = str(operation.get("page_key") or "").strip()
+        if op not in {"create", "update"} or not page_key:
+            continue
+        tasks.append(
+            {
+                **dict(operation),
+                "operation_id": str(operation.get("operation_id") or f"op-{position}"),
+            }
+        )
+    tasks = tasks[:max_pages]
+    by_id = {str(task["operation_id"]): task for task in tasks}
+    by_key = {str(task["page_key"]): task for task in tasks}
+    used: set[str] = set()
+    candidates: list[dict[str, Any]] = []
+
+    for position, raw_page in enumerate(raw_pages, start=1):
+        if not isinstance(raw_page, Mapping):
+            warnings.append(f"Step B pages[{position}] 不是对象，已忽略")
+            continue
+        page = dict(raw_page)
+        nested = page.pop("frontmatter", None)
+        if isinstance(nested, Mapping):
+            merged = dict(nested)
+            merged.update(page)
+            page = merged
+        forbidden = sorted(_TARGET_PATH_FIELDS.intersection(page))
+        if forbidden:
+            warnings.append(
+                f"Step B pages[{position}] 路径字段已忽略：{', '.join(forbidden)}"
+            )
+        returned_operation_id = str(page.get("operation_id") or "").strip()
+        returned_page_key = str(page.get("page_key") or "").strip()
+        task = by_id.get(returned_operation_id)
+        if task is None:
+            task = by_key.get(returned_page_key)
+        if task is None and (returned_operation_id or returned_page_key):
+            warnings.append(
+                f"Step B pages[{position}] 指向未知服务端任务，已忽略"
+            )
+            continue
+        if task is None and position <= len(tasks):
+            task = tasks[position - 1]
+            warnings.append(
+                f"Step B pages[{position}] 未提供有效 operation_id，已按计划顺序绑定"
+            )
+        if task is None:
+            warnings.append(f"Step B pages[{position}] 没有对应服务端任务，已忽略")
+            continue
+        task_id = str(task["operation_id"])
+        if task_id in used:
+            warnings.append(f"Step B 重复返回 {task_id}，后续候选已忽略")
+            continue
+
+        body = page.get("body", page.get("content", page.get("markdown", "")))
+        if not isinstance(body, str) or not body.strip():
+            warnings.append(f"Step B {task_id} 正文为空，将使用确定性正文")
+            continue
+        expected_key = str(task["page_key"])
+        returned_key = returned_page_key
+        if returned_key and returned_key != expected_key:
+            warnings.append(
+                f"Step B {task_id} page_key {returned_key} 已覆盖为 {expected_key}"
+            )
+        expected_op = str(task.get("op") or task.get("operation"))
+        returned_op = str(page.get("operation") or "").strip()
+        if returned_op and returned_op != expected_op:
+            warnings.append(
+                f"Step B {task_id} operation {returned_op} 已覆盖为 {expected_op}"
+            )
+
+        used.add(task_id)
+        candidates.append(
+            {
+                "operation_id": task_id,
+                "operation": expected_op,
+                "page_key": expected_key,
+                "title": str(page.get("title") or "").strip(),
+                "type": str(task.get("page_type") or "").strip(),
+                "domain": page.get("domain"),
+                "aliases": _as_string_list(page.get("aliases")),
+                "tags": _as_string_list(page.get("tags")),
+                # Source evidence is attached from the real Step A window by
+                # the apply service; model-supplied source ids are ignored.
+                "sources": [],
+                "status": "published",
+                "replace_existing": False,
+                "body": body.replace("\r\n", "\n").replace("\r", "\n").strip(),
+                "reason": str(page.get("reason") or task.get("reason") or "").strip(),
+            }
+        )
+
+    missing = [str(task["operation_id"]) for task in tasks if str(task["operation_id"]) not in used]
+    if missing:
+        warnings.append(
+            "Step B 未返回以下页面正文，将使用确定性候选：" + ", ".join(missing)
+        )
+    return candidates, warnings
 
 
 # Names used by the apply service and by callers migrating from early Task 7

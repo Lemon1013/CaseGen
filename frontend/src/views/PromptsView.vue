@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   createPrompt,
+  deletePrompt,
   listPrompts,
   PROMPT_TYPE_OPTIONS,
   updatePrompt,
@@ -11,6 +12,7 @@ import {
 
 const loading = ref(false)
 const saving = ref(false)
+const deleting = ref(false)
 const prompts = ref<PromptTemplate[]>([])
 const filterType = ref<string>('')
 const selectedId = ref<number | null>(null)
@@ -110,6 +112,45 @@ async function setActive() {
     ElMessage.error(`操作失败：${(e as Error).message}`)
   } finally {
     saving.value = false
+  }
+}
+
+function deleteError(error: unknown) {
+  const message = (error as Error).message || String(error)
+  if (message.includes('last active prompt')) {
+    return '这是该类型最后一个启用的提示词，请先启用同类型的其他提示词。'
+  }
+  if (message.includes('referenced by task')) {
+    return '该提示词已被任务引用，为保留任务可重现性不能删除。'
+  }
+  if (message.includes('referenced by revision')) {
+    return '该提示词已被 Prompt 修订引用，为保留历史记录不能删除。'
+  }
+  return message
+}
+
+async function removeSelected() {
+  const current = selected.value
+  if (!current) return
+  try {
+    await ElMessageBox.confirm(
+      `确认删除提示词「${current.name}」v${current.version}？此操作不可恢复。${current.is_active ? '当前提示词处于启用状态。' : ''}`,
+      '删除提示词',
+      { type: 'warning', confirmButtonText: '确认删除', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  deleting.value = true
+  try {
+    await deletePrompt(current.id)
+    selectedId.value = null
+    ElMessage.success('提示词已删除')
+    await load()
+  } catch (error) {
+    ElMessage.error(`删除失败：${deleteError(error)}`)
+  } finally {
+    deleting.value = false
   }
 }
 
@@ -217,6 +258,16 @@ onMounted(load)
                 @click="setActive"
               >
                 设为启用
+              </el-button>
+              <el-button
+                v-if="selected"
+                type="danger"
+                plain
+                :loading="deleting"
+                :disabled="saving"
+                @click="removeSelected"
+              >
+                删除
               </el-button>
             </el-form-item>
           </el-form>

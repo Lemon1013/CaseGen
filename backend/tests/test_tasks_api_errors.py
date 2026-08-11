@@ -104,3 +104,43 @@ def test_apply_prompt_missing_revision(tmp_app_data):
         json={"revision_id": 99999, "mode": "task_temp"},
     )
     assert r.status_code in (400, 404)
+
+
+def test_failed_task_can_switch_model_for_retry(tmp_app_data):
+    client = TestClient(create_app())
+    first = client.post(
+        "/api/models",
+        json={
+            "name": "first",
+            "base_url": "https://example.com/v1",
+            "api_key": "sk-first",
+            "model_name": "model-first",
+        },
+    ).json()
+    second = client.post(
+        "/api/models",
+        json={
+            "name": "second",
+            "base_url": "https://example.com/v1",
+            "api_key": "sk-second",
+            "model_name": "model-second",
+        },
+    ).json()
+    task = client.post(
+        "/api/tasks",
+        json={"title": "t", "description": "d", "model_id": first["id"]},
+    ).json()
+    task_id = task["id"]
+    assert client.post(f"/api/tasks/{task_id}/review").json()["status"] == "failed"
+
+    changed = client.patch(
+        f"/api/tasks/{task_id}/model",
+        json={"model_id": second["id"]},
+    )
+    assert changed.status_code == 200
+    assert changed.json()["model_id"] == second["id"]
+    events = client.get(f"/api/tasks/{task_id}/events").json()
+    assert events[-1]["step"] == "model_change"
+
+    missing = client.patch(f"/api/tasks/{task_id}/model", json={"model_id": 99999})
+    assert missing.status_code == 422

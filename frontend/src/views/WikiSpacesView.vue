@@ -2,11 +2,12 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
-  archiveWikiSpace,
   createWikiSpace,
   listWikiSpaces,
+  updateWikiSpaceStatus,
   updateWikiSpace,
   type WikiSpace,
+  type WikiSpaceStatus,
 } from '../api/wikiSpaces'
 
 const spaces = ref<WikiSpace[]>([])
@@ -14,7 +15,15 @@ const loading = ref(false)
 const dialogVisible = ref(false)
 const editing = ref<WikiSpace | null>(null)
 const form = reactive({ name: '', slug: '', description: '' })
+const statusFilter = ref<'all' | WikiSpaceStatus>('all')
+const statusChangingId = ref<number | null>(null)
 const activeCount = computed(() => spaces.value.filter((space) => space.status === 'active').length)
+const archivedCount = computed(() => spaces.value.filter((space) => space.status === 'archived').length)
+const visibleSpaces = computed(() =>
+  statusFilter.value === 'all'
+    ? spaces.value
+    : spaces.value.filter((space) => space.status === statusFilter.value),
+)
 
 async function load() {
   loading.value = true
@@ -66,20 +75,30 @@ async function save() {
   }
 }
 
-async function archive(space: WikiSpace) {
+async function changeStatus(space: WikiSpace, nextStatus: WikiSpaceStatus) {
+  const isArchiving = nextStatus === 'archived'
   try {
     await ElMessageBox.confirm(
-      `归档「${space.name}」后将不能上传、摄入或创建新任务，但历史内容仍可读取。继续吗？`,
-      '确认归档',
-      { type: 'warning' },
+      isArchiving
+        ? `归档「${space.name}」后将不能上传、摄入或创建新任务，但历史内容仍可读取。继续吗？`
+        : `恢复「${space.name}」后将重新允许上传、摄入和创建任务。继续吗？`,
+      isArchiving ? '确认归档' : '确认恢复',
+      {
+        type: isArchiving ? 'warning' : 'info',
+        confirmButtonText: isArchiving ? '确认归档' : '恢复使用',
+        cancelButtonText: '取消',
+      },
     )
-    await archiveWikiSpace(space.id)
-    ElMessage.success('空间已归档')
+    statusChangingId.value = space.id
+    await updateWikiSpaceStatus(space.id, nextStatus)
+    ElMessage.success(isArchiving ? '空间已归档' : '空间已恢复使用')
     await load()
   } catch (error) {
     if (error !== 'cancel' && error !== 'close') {
-      ElMessage.error(`归档失败：${(error as Error).message}`)
+      ElMessage.error(`${isArchiving ? '归档' : '恢复'}失败：${(error as Error).message}`)
     }
+  } finally {
+    statusChangingId.value = null
   }
 }
 
@@ -95,12 +114,18 @@ onMounted(load)
       </div>
       <div class="header-actions">
         <el-tag type="info">活动空间 {{ activeCount }}</el-tag>
+        <el-tag type="info">归档空间 {{ archivedCount }}</el-tag>
+        <el-select v-model="statusFilter" style="width: 130px" aria-label="空间状态筛选">
+          <el-option label="全部状态" value="all" />
+          <el-option label="活动" value="active" />
+          <el-option label="已归档" value="archived" />
+        </el-select>
         <el-button type="primary" @click="openCreate">新建空间</el-button>
       </div>
     </div>
 
     <el-card shadow="never" class="space-card">
-      <el-table v-loading="loading" :data="spaces" row-key="id">
+      <el-table v-loading="loading" :data="visibleSpaces" row-key="id">
         <el-table-column label="空间" min-width="220">
           <template #default="{ row }">
             <div class="space-name">{{ row.name }}</div>
@@ -120,18 +145,31 @@ onMounted(load)
             <el-tag :type="row.status === 'active' ? 'success' : 'info'">
               {{ row.status === 'active' ? '活动' : '已归档' }}
             </el-tag>
+            <el-tag v-if="row.slug === 'default'" type="info" effect="plain" class="default-tag">
+              系统默认
+            </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="180" fixed="right">
+        <el-table-column label="操作" width="220" fixed="right">
           <template #default="{ row }">
-            <el-button link type="primary" @click="openEdit(row)">编辑</el-button>
+            <el-button v-if="row.status === 'active'" link type="primary" @click="openEdit(row)">编辑</el-button>
             <el-button
               v-if="row.status === 'active' && row.slug !== 'default'"
               link
               type="warning"
-              @click="archive(row)"
+              :loading="statusChangingId === row.id"
+              @click="changeStatus(row, 'archived')"
             >
               归档
+            </el-button>
+            <el-button
+              v-if="row.status === 'archived'"
+              link
+              type="success"
+              :loading="statusChangingId === row.id"
+              @click="changeStatus(row, 'active')"
+            >
+              恢复使用
             </el-button>
           </template>
         </el-table-column>
@@ -165,4 +203,5 @@ onMounted(load)
 .space-name { font-weight: 650; color: var(--cg-text); }
 .space-slug { color: var(--cg-text-muted); font-size: 12px; margin-top: 3px; }
 .stat-gap { margin-left: 14px; }
+.default-tag { margin-left: 6px; }
 </style>

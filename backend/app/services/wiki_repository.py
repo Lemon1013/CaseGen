@@ -406,6 +406,8 @@ class WikiRepository:
             document = self.session.get(Document, source.document_id)
             if document is None:
                 raise ValueError(f"source document not found: {source.document_id}")
+            if document.status == "deleted":
+                raise ValueError(f"source document has been deleted: {source.document_id}")
             if document.space_id is None:
                 document.space_id = self.space_id
                 self.session.add(document)

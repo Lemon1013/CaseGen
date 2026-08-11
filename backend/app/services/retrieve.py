@@ -10,6 +10,7 @@ from sqlmodel import Session, or_, select
 from app import config
 from app.db import get_engine
 from app.models.entities import WikiPageRow, WikiPageSource
+from app.services.wiki_titles import display_title
 
 # Instruction-y noise often appended to requirements; hurts keyword retrieve.
 _QUERY_NOISE = re.compile(
@@ -285,7 +286,12 @@ def load_all_wiki_pages(
             pages.append(
                 {
                     "id": row.id,
-                    "title": row.title,
+                    "title": display_title(
+                        row.title,
+                        page_key=row.page_key,
+                        page_type=row.page_type,
+                        body=content,
+                    ),
                     "page_type": row.page_type,
                     "path": row.path,
                     "content": content,

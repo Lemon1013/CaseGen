@@ -502,6 +502,8 @@ def _plan_analysis_details(
         raw,
         source_path=source_path,
         existing_page_keys=existing_page_keys,
+        source_windows=source_windows,
+        max_operations=int(config.WIKI_ANALYZE_MAX_OPERATIONS),
     )
     try:
         return coerce_step_a_plan(
@@ -511,6 +513,7 @@ def _plan_analysis_details(
             existing_page_keys=existing_page_keys,
             reference_page_keys=reference_page_keys,
             source_length=source_length,
+            max_operations=int(config.WIKI_ANALYZE_MAX_OPERATIONS),
         ), warnings
     except PlanValidationError as exc:
         raise LLMError(f"invalid Wiki Step A plan: {exc}") from exc
@@ -550,10 +553,19 @@ def _degraded_window_plan(
 
 
 def _unsafe_normalisation_reason(warnings: Iterable[str]) -> str | None:
-    unsafe = [str(item) for item in warnings if "已忽略" in str(item)]
-    if not unsafe:
-        return None
-    return "模型输出包含无法安全转换的字段：" + "；".join(unsafe[:4])
+    """Only request model repair when deterministic normalisation is unsafe.
+
+    Dropped optional fields, corrected operations and source-window fallbacks
+    are expected boundary behaviour.  They are surfaced as job warnings but
+    must not multiply model calls or turn a usable window into a failure.
+    """
+
+    unsafe = [
+        str(item)
+        for item in warnings
+        if "无法建立安全计划" in str(item) or "路径穿越" in str(item)
+    ]
+    return "；".join(unsafe[:4]) or None
 
 
 def _repair_step_a_output(
