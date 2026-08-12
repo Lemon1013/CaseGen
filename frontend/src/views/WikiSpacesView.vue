@@ -109,7 +109,7 @@ onMounted(load)
   <div class="page">
     <div class="page-header space-header">
       <div>
-        <h1 class="page-title">Wiki 空间</h1>
+        <h1 class="page-title">知识空间</h1>
         <p class="page-subtitle">每个项目拥有独立的文档、Wiki 页面、审核和检索边界。</p>
       </div>
       <div class="header-actions">

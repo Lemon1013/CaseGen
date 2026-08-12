@@ -6,6 +6,7 @@ import { listModels, type ModelConfig } from '../api/models'
 import { listPrompts, type PromptTemplate } from '../api/prompts'
 import { createTask, generateTask } from '../api/tasks'
 import { listWikiSpaces, type WikiSpace } from '../api/wikiSpaces'
+import { listRequirements, type RequirementItem } from '../api/requirements'
 import { chooseSpace, rememberAndRoute, spaceIdFromQuery } from '../utils/wikiSpace'
 
 const router = useRouter()
@@ -15,6 +16,7 @@ const models = ref<ModelConfig[]>([])
 const prompts = ref<PromptTemplate[]>([])
 const spaces = ref<WikiSpace[]>([])
 const currentSpace = ref<WikiSpace | null>(null)
+const requirements = ref<RequirementItem[]>([])
 
 const form = reactive({
   title: '',
@@ -24,11 +26,17 @@ const form = reactive({
   prompt_template_id: null as number | null,
   auto_review: false,
   wiki_space_id: null as number | null,
+  requirement_id: null as number | null,
 })
 
 async function loadOptions() {
   try {
-    const [m, p, s] = await Promise.all([listModels(), listPrompts('generate'), listWikiSpaces()])
+    const [m, p, s, reqs] = await Promise.all([
+      listModels(),
+      listPrompts('generate'),
+      listWikiSpaces(),
+      listRequirements().catch(() => [] as RequirementItem[]),
+    ])
     models.value = m
     prompts.value = p.filter((item) => item.is_active)
     const defaultModel = m.find((x) => x.is_default)
@@ -36,6 +44,7 @@ async function loadOptions() {
     const activePrompt = prompts.value[0]
     if (activePrompt) form.prompt_template_id = activePrompt.id
     spaces.value = s
+    requirements.value = reqs
     currentSpace.value = chooseSpace(s, spaceIdFromQuery(route.query))
     form.wiki_space_id = currentSpace.value?.id || null
     if (currentSpace.value && spaceIdFromQuery(route.query) !== currentSpace.value.id) {
@@ -59,6 +68,14 @@ function changeSpace(id: number) {
   void rememberAndRoute(router, id, '/')
 }
 
+function selectRequirement(id: number | null) {
+  const requirement = requirements.value.find((item) => item.id === id)
+  if (!requirement) return
+  form.title = requirement.title
+  form.description = requirement.description
+  form.focusText = requirement.focus_tags.join(', ')
+}
+
 async function submit() {
   if (!form.title.trim() || !form.description.trim()) {
     ElMessage.warning('请填写标题和需求描述')
@@ -72,6 +89,7 @@ async function submit() {
   try {
     // 1) 快速创建任务（不阻塞在 LLM 上）
     const task = await createTask({
+      requirement_id: form.requirement_id,
       title: form.title.trim(),
       description: form.description.trim(),
       focus_tags: parseFocusTags(form.focusText),
@@ -140,6 +158,24 @@ onMounted(loadOptions)
             show-word-limit
           />
         </el-form-item>
+        <el-form-item label="已有需求">
+          <el-select
+            v-model="form.requirement_id"
+            clearable
+            filterable
+            placeholder="可复用已有 Requirement（可选）"
+            style="width: 100%"
+            @change="selectRequirement"
+          >
+            <el-option
+              v-for="requirement in requirements"
+              :key="requirement.id"
+              :label="`#${requirement.id} · ${requirement.title}`"
+              :value="requirement.id"
+            />
+          </el-select>
+          <div class="field-hint">选择后会沿用需求分组，生成任务不会复制 Requirement。</div>
+        </el-form-item>
         <el-form-item label="需求描述" required>
           <el-input
             v-model="form.description"
@@ -205,7 +241,7 @@ onMounted(loadOptions)
           <el-button type="primary" size="large" :loading="submitting" @click="submit">
             创建并生成
           </el-button>
-          <el-button size="large" @click="router.push('/tasks')">查看任务列表</el-button>
+          <el-button size="large" @click="router.push('/tasks')">查看生成任务</el-button>
         </el-form-item>
       </el-form>
     </div>

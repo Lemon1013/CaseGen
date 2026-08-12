@@ -622,7 +622,7 @@ onUnmounted(() => {
   <div class="page">
     <div class="page-header">
       <div>
-        <h1 class="page-title">文档管理</h1>
+        <h1 class="page-title">文档摄入</h1>
         <p class="page-subtitle">上传源文档，查看解析质量，并将内容摄入当前空间的 Wiki</p>
       </div>
       <div class="page-actions document-toolbar">

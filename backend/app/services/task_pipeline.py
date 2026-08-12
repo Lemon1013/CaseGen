@@ -23,6 +23,7 @@ from app.services.llm import LLMError, chat_completion
 from app.services.retrieve import load_all_wiki_pages, rank_pages
 from app.services.source_chunks_store import load_all_source_chunks, rank_source_chunks
 from app.services.review_parse import parse_review_payload
+from app.services.case_management import import_cases_from_draft, utcnow
 from app.services.task_events import append_event
 from app.services.task_state import InvalidTransition, transition
 from app.services.wiki_spaces import resolve_space_id
@@ -1424,14 +1425,49 @@ def run_regenerate(
     return run_generate(session, task_id, chat_fn=chat_fn)
 
 
-def finalize_task(session: Session, task_id: int) -> GenerationTask:
+def finalize_task(
+    session: Session,
+    task_id: int,
+    draft_id: int | None = None,
+) -> GenerationTask:
     task = session.get(GenerationTask, task_id)
     if task is None:
         raise ValueError(f"GenerationTask id={task_id} not found")
 
-    draft = _latest_draft(session, task.id)
+    draft = (
+        session.get(CaseDraft, draft_id)
+        if draft_id is not None
+        else _latest_draft(session, task.id)
+    )
     if draft is None:
         raise ValueError("Cannot finalize task without a case draft")
+    if draft.task_id != task.id:
+        raise ValueError("Selected draft does not belong to task")
+
+    # Repeating the exact finalize request is intentionally idempotent.  It
+    # returns the same current state without adding another audit event or
+    # touching manually edited cases.  Rows finalized by an older release do
+    # not have finalized_draft_id; selecting their latest draft once backfills
+    # the new metadata and imports that exact draft.
+    if task.status == "finalized":
+        if task.finalized_draft_id not in (None, draft.id):
+            raise ValueError("Task is already finalized with another draft")
+        if task.finalized_draft_id == draft.id:
+            return task
+        imported = import_cases_from_draft(session, task, draft)
+        task.finalized_draft_id = draft.id
+        task.finalized_at = task.finalized_at or utcnow()
+        session.add(task)
+        session.commit()
+        session.refresh(task)
+        return task
+
+    if task.status not in {"generated", "reviewed"}:
+        raise ValueError(f"Cannot finalize task from status {task.status!r}")
+
+    # Parse and import before moving the task state.  A malformed draft must
+    # leave the task retryable and must never commit a partial case set.
+    imported = import_cases_from_draft(session, task, draft)
 
     try:
         _set_status(task, "finalized")
@@ -1439,13 +1475,20 @@ def finalize_task(session: Session, task_id: int) -> GenerationTask:
         raise ValueError(str(exc)) from exc
 
     task.error_message = None
+    task.finalized_draft_id = draft.id
+    task.finalized_at = utcnow()
     session.add(task)
     append_event(
         session,
         task.id,
         "finalize",
         f"任务已终版，draft v{draft.version}",
-        detail={"draft_id": draft.id, "draft_version": draft.version},
+        detail={
+            "draft_id": draft.id,
+            "draft_version": draft.version,
+            "imported_case_ids": [int(row.id) for row in imported if row.id is not None],
+            "imported_case_count": len(imported),
+        },
     )
     session.commit()
     session.refresh(task)

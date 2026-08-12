@@ -1,6 +1,9 @@
 from fastapi.testclient import TestClient
+from sqlmodel import Session
 
+from app.db import get_engine
 from app.main import create_app
+from app.models.entities import TestCase as _TestCaseRow
 
 
 def test_list_tasks_empty(tmp_app_data):
@@ -51,6 +54,49 @@ def test_task_subresources_empty_on_new_task(tmp_app_data):
     assert client.get(f"/api/tasks/{tid}/events").json() == []
     assert client.get(f"/api/tasks/{tid}/reviews").json() == []
     assert client.get(f"/api/tasks/{tid}/revisions").json() == []
+
+
+def test_create_task_reuses_existing_requirement(tmp_app_data):
+    client = TestClient(create_app())
+    requirement = client.post(
+        "/api/requirements",
+        json={"title": "共享需求", "description": "同一需求可创建多个任务", "focus_tags": ["共享"]},
+    )
+    assert requirement.status_code == 200
+    rid = requirement.json()["id"]
+    first = client.post("/api/tasks", json={"requirement_id": rid})
+    second = client.post("/api/tasks", json={"requirement_id": rid})
+    assert first.status_code == 200 and second.status_code == 200
+    assert first.json()["requirement_id"] == rid
+    assert second.json()["requirement_id"] == rid
+    assert client.get("/api/requirements").json()
+
+
+def test_delete_task_keeps_imported_case_and_requirement(tmp_app_data):
+    client = TestClient(create_app())
+    requirement = client.post(
+        "/api/requirements",
+        json={"title": "已入库需求", "description": "删除任务不应删除资产"},
+    ).json()
+    task = client.post("/api/tasks", json={"requirement_id": requirement["id"]}).json()
+    with Session(get_engine()) as session:
+        row = _TestCaseRow(
+            requirement_id=requirement["id"],
+            case_key="TC-001",
+            source_case_key="TC-001",
+            source_task_id=task["id"],
+            source_draft_id=None,
+            title="已入库",
+            content_md="## TC-001\n已入库",
+        )
+        session.add(row)
+        session.commit()
+        case_id = row.id
+    deleted = client.delete(f"/api/tasks/{task['id']}")
+    assert deleted.status_code == 200
+    with Session(get_engine()) as session:
+        assert session.get(_TestCaseRow, case_id) is not None
+    assert client.get(f"/api/requirements/{requirement['id']}").status_code == 200
 
 
 def test_review_before_generate_fails(tmp_app_data):

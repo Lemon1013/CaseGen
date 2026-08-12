@@ -18,12 +18,14 @@ from app.models.entities import (
     SourceChunk,
     TaskCitation,
     TaskEvent,
+    TestCase,
     WikiPageRow,
     WikiSpace,
 )
 from app.schemas.tasks import (
     ApplyPromptBody,
     CaseDraftOut,
+    FinalizeTaskBody,
     PromptRevisionOut,
     ReviewResultOut,
     TaskCitationOut,
@@ -167,6 +169,14 @@ def to_task_out(session: Session, task: GenerationTask) -> TaskOut:
 
     review_row = _latest_review_row(session, task.id)
     latest_review = _review_to_out(review_row) if review_row is not None else None
+    imported_case_rows = session.exec(
+        select(TestCase)
+        .where(
+            TestCase.source_task_id == task.id,
+            TestCase.source_draft_id == task.finalized_draft_id,
+        )
+        .order_by(col(TestCase.case_key).asc(), col(TestCase.id).asc())
+    ).all() if task.finalized_draft_id is not None else []
     try:
         space = resolve_space(session, task.wiki_space_id)
     except ValueError:
@@ -188,6 +198,10 @@ def to_task_out(session: Session, task: GenerationTask) -> TaskOut:
         latest_draft_snippet=snippet,
         latest_draft_version=version,
         latest_review=latest_review,
+        finalized_draft_id=task.finalized_draft_id,
+        finalized_at=task.finalized_at,
+        imported_case_ids=[int(row.id) for row in imported_case_rows if row.id is not None],
+        imported_case_count=len(imported_case_rows),
         created_at=task.created_at,
         updated_at=task.updated_at,
     )
@@ -222,14 +236,24 @@ def create_task(
                 detail="Only active generate prompt templates can be selected",
             )
 
-    requirement = Requirement(
-        title=body.title,
-        description=body.description,
-        focus_tags_json=json.dumps(body.focus_tags or [], ensure_ascii=False),
-    )
-    session.add(requirement)
-    session.commit()
-    session.refresh(requirement)
+    if body.requirement_id is not None:
+        requirement = session.get(Requirement, body.requirement_id)
+        if requirement is None:
+            raise HTTPException(status_code=422, detail="Requirement not found")
+    else:
+        if not (body.title or "").strip() or not (body.description or "").strip():
+            raise HTTPException(
+                status_code=422,
+                detail="title and description are required when requirement_id is omitted",
+            )
+        requirement = Requirement(
+            title=(body.title or "").strip(),
+            description=(body.description or "").strip(),
+            focus_tags_json=json.dumps(body.focus_tags or [], ensure_ascii=False),
+        )
+        session.add(requirement)
+        session.commit()
+        session.refresh(requirement)
 
     task = GenerationTask(
         requirement_id=requirement.id,
@@ -332,7 +356,10 @@ def delete_task(task_id: int, session: Session = Depends(get_session)) -> dict:
     other = session.exec(
         select(GenerationTask).where(GenerationTask.requirement_id == requirement_id)
     ).first()
-    if other is None:
+    has_cases = session.exec(
+        select(TestCase.id).where(TestCase.requirement_id == requirement_id)
+    ).first()
+    if other is None and has_cases is None:
         req = session.get(Requirement, requirement_id)
         if req is not None:
             session.delete(req)
@@ -485,14 +512,16 @@ def regenerate_task(
 
 @router.post("/{task_id}/finalize", response_model=TaskOut)
 def finalize_task_route(
-    task_id: int, session: Session = Depends(get_session)
+    task_id: int,
+    body: FinalizeTaskBody | None = None,
+    session: Session = Depends(get_session),
 ) -> TaskOut:
     task = session.get(GenerationTask, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
 
     try:
-        task = finalize_task(session, task_id)
+        task = finalize_task(session, task_id, draft_id=body.draft_id if body else None)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return to_task_out(session, task)

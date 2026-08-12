@@ -35,11 +35,16 @@ export interface TaskItem {
   latest_draft_snippet: string | null
   latest_draft_version: number | null
   latest_review: ReviewResult | null
+  finalized_draft_id?: number | null
+  finalized_at?: string | null
+  imported_case_ids?: number[]
+  imported_case_count?: number
   created_at: string
   updated_at: string
 }
 
 export interface TaskCreate {
+  requirement_id?: number | null
   title: string
   description: string
   focus_tags?: string[]
@@ -149,8 +154,11 @@ export function regenerateTask(id: number) {
   return api<TaskItem>(`/api/tasks/${id}/regenerate`, { method: 'POST' })
 }
 
-export function finalizeTask(id: number) {
-  return api<TaskItem>(`/api/tasks/${id}/finalize`, { method: 'POST' })
+export function finalizeTask(id: number, draftId?: number | null) {
+  return api<TaskItem>(`/api/tasks/${id}/finalize`, {
+    method: 'POST',
+    ...(draftId == null ? {} : { body: JSON.stringify({ draft_id: draftId }) }),
+  })
 }
 
 export function applyPrompt(

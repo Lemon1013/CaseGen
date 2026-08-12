@@ -211,7 +211,8 @@ async function onFinalize() {
   } catch {
     return
   }
-  return runAction('终版', finalizeTask)
+  const selectedDraftId = activeDraftTab.value ? Number(activeDraftTab.value) : null
+  return runAction('终版', (id) => finalizeTask(id, selectedDraftId))
 }
 
 async function onRetryFailed() {
@@ -439,6 +440,15 @@ onUnmounted(stopPolling)
               <div class="draft-meta">
                 {{ formatTime(d.created_at) }}
                 <span v-if="d.prompt_version_ref"> · {{ d.prompt_version_ref }}</span>
+                <el-tag
+                  v-if="task?.finalized_draft_id === d.id"
+                  type="success"
+                  size="small"
+                  effect="plain"
+                  style="margin-left: 8px"
+                >
+                  已定稿并导入
+                </el-tag>
               </div>
               <MarkdownView :content="d.content_md" />
             </el-tab-pane>

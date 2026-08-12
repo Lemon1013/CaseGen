@@ -1,9 +1,54 @@
+export class ApiError extends Error {
+  status: number
+  detail: string
+
+  constructor(status: number, detail: string) {
+    super(detail)
+    this.name = 'ApiError'
+    this.status = status
+    this.detail = detail
+  }
+}
+
+type UnauthorizedHandler = (requestEpoch: number) => void | Promise<void>
+let unauthorizedHandler: UnauthorizedHandler | null = null
+let authEpoch = 0
+
+export function setUnauthorizedHandler(handler: UnauthorizedHandler | null) {
+  unauthorizedHandler = handler
+}
+
+export function getAuthEpoch() {
+  return authEpoch
+}
+
+export function bumpAuthEpoch() {
+  authEpoch += 1
+  return authEpoch
+}
+
+function readCookie(name: string): string | null {
+  if (typeof document === 'undefined') return null
+  const prefix = `${encodeURIComponent(name)}=`
+  const item = document.cookie.split('; ').find((entry) => entry.startsWith(prefix))
+  return item ? decodeURIComponent(item.slice(prefix.length)) : null
+}
+
+function isUnsafe(method?: string) {
+  return !['GET', 'HEAD', 'OPTIONS', 'TRACE'].includes((method || 'GET').toUpperCase())
+}
+
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
+  const requestEpoch = authEpoch
   const headers = new Headers(init?.headers)
   if (init?.body && !(init.body instanceof FormData) && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json")
   }
-  const res = await fetch(path, { ...init, headers })
+  if (isUnsafe(init?.method)) {
+    const csrf = readCookie('casegen_csrf')
+    if (csrf && !headers.has('X-CSRF-Token')) headers.set('X-CSRF-Token', csrf)
+  }
+  const res = await fetch(path, { ...init, headers, credentials: 'include' })
   if (!res.ok) {
     const text = await res.text()
     let detail = text
@@ -17,10 +62,31 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
       // Non-JSON gateway errors fall through to the status-aware message.
     }
     const translated = translateApiError(detail, res.status)
-    throw new Error(translated)
+    if (res.status === 401 && !path.startsWith('/api/auth/')) {
+      void unauthorizedHandler?.(requestEpoch)
+    }
+    throw new ApiError(res.status, translated)
   }
   if (res.status === 204) return undefined as T
   return res.json()
+}
+
+export async function apiBlob(path: string, init?: RequestInit): Promise<Blob> {
+  const requestEpoch = authEpoch
+  const headers = new Headers(init?.headers)
+  if (isUnsafe(init?.method)) {
+    const csrf = readCookie('casegen_csrf')
+    if (csrf && !headers.has('X-CSRF-Token')) headers.set('X-CSRF-Token', csrf)
+  }
+  const res = await fetch(path, { ...init, headers, credentials: 'include' })
+  if (!res.ok) {
+    const text = await res.text()
+    if (res.status === 401 && !path.startsWith('/api/auth/')) {
+      void unauthorizedHandler?.(requestEpoch)
+    }
+    throw new ApiError(res.status, text || `请求失败（HTTP ${res.status}）`)
+  }
+  return res.blob()
 }
 
 function translateApiError(detail: string, status: number) {

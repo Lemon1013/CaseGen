@@ -51,6 +51,10 @@ def tmp_app_data(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "WIKI_PAGES_DIR", wiki_pages_dir)
     monkeypatch.setattr(config, "META_DIR", meta_dir)
     monkeypatch.setattr(config, "DB_PATH", db_path)
+    # Legacy workflow tests predate authentication.  They explicitly use the
+    # test-only compatibility switch; auth-specific tests turn this back on
+    # with monkeypatch.setattr(config, "AUTH_ENABLED", True).
+    monkeypatch.setattr(config, "AUTH_ENABLED", False)
 
     reset_engine()
     yield data_dir

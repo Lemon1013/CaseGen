@@ -416,7 +416,7 @@ watch(
   <div class="page">
     <div class="page-header">
       <div>
-        <h1 class="page-title">Wiki 审核 / 版本</h1>
+        <h1 class="page-title">变更审核 / 版本</h1>
         <p class="page-subtitle">核对当前空间的候选内容、来源证据和版本差异</p>
       </div>
       <div class="page-actions">

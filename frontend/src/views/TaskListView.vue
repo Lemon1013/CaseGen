@@ -101,7 +101,7 @@ onMounted(load)
   <div class="page">
     <div class="page-header">
       <div>
-        <h1 class="page-title">任务列表</h1>
+        <h1 class="page-title">生成任务</h1>
         <p class="page-subtitle">跟踪生成进度、草稿版本与最新评审分数</p>
       </div>
       <div class="page-actions">
@@ -114,7 +114,7 @@ onMounted(load)
       v-loading="loading"
       :data="tasks"
       stripe
-      empty-text="暂无任务，去工作台创建第一条"
+      empty-text="暂无任务，去用例生成创建第一条"
       class="task-table"
       @row-click="openDetail"
     >
