@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlmodel import Session, col, func, select
 
 from app.db import get_session
-from app.models.entities import PromptTemplate
+from app.models.entities import GenerationTask, PromptRevision, PromptTemplate
 from app.schemas.prompts import PromptCreate, PromptOut, PromptUpdate
 
 router = APIRouter(prefix="/api/prompts", tags=["prompts"])
@@ -79,3 +79,54 @@ def update_prompt(
     session.commit()
     session.refresh(row)
     return row
+
+
+@router.delete("/{prompt_id}")
+def delete_prompt(
+    prompt_id: int,
+    session: Session = Depends(get_session),
+) -> dict[str, int | bool]:
+    """Delete an unused prompt without breaking active pipelines or history."""
+
+    row = session.get(PromptTemplate, prompt_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Prompt not found")
+
+    task = session.exec(
+        select(GenerationTask).where(
+            GenerationTask.prompt_template_id == prompt_id
+        )
+    ).first()
+    if task is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Prompt is referenced by task #{task.id}",
+        )
+    revision = session.exec(
+        select(PromptRevision).where(PromptRevision.base_prompt_id == prompt_id)
+    ).first()
+    if revision is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Prompt is referenced by revision #{revision.id}",
+        )
+    if row.is_active:
+        replacement = session.exec(
+            select(PromptTemplate).where(
+                PromptTemplate.type == row.type,
+                PromptTemplate.is_active == True,  # noqa: E712
+                PromptTemplate.id != prompt_id,
+            )
+        ).first()
+        if replacement is None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Cannot delete the last active prompt of this type; "
+                    "activate another prompt first"
+                ),
+            )
+
+    session.delete(row)
+    session.commit()
+    return {"ok": True, "id": prompt_id}

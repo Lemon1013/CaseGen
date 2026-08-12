@@ -30,7 +30,9 @@ import {
   type TaskCitation,
   type TaskEvent,
   type TaskItem,
+  updateTaskModel,
 } from '../api/tasks'
+import { listModels, type ModelConfig } from '../api/models'
 
 const route = useRoute()
 const router = useRouter()
@@ -43,12 +45,15 @@ const events = ref<TaskEvent[]>([])
 const reviews = ref<ReviewResult[]>([])
 const revisions = ref<PromptRevision[]>([])
 const citations = ref<TaskCitation[]>([])
+const models = ref<ModelConfig[]>([])
 const activeDraftTab = ref('')
 
 const applyDialogVisible = ref(false)
 const applyMode = ref<ApplyPromptMode>('task_temp')
 const selectedRevision = ref<PromptRevision | null>(null)
 const alsoRegenerate = ref(true)
+const editedPromptContent = ref('')
+const retryModelId = ref<number | null>(null)
 
 let pollTimer: number | null = null
 
@@ -85,13 +90,14 @@ async function loadAll() {
   if (!taskId.value || Number.isNaN(taskId.value)) return
   loading.value = true
   try {
-    const [t, d, e, rev, revs, c] = await Promise.all([
+    const [t, d, e, rev, revs, c, modelRows] = await Promise.all([
       getTask(taskId.value),
       listDrafts(taskId.value),
       listEvents(taskId.value),
       listReviews(taskId.value),
       listRevisions(taskId.value),
       listCitations(taskId.value),
+      listModels().catch(() => [] as ModelConfig[]),
     ])
     task.value = t
     drafts.value = d
@@ -99,6 +105,9 @@ async function loadAll() {
     reviews.value = rev
     revisions.value = revs
     citations.value = c
+    models.value = modelRows
+    retryModelId.value =
+      t.model_id ?? modelRows.find((model) => model.is_default)?.id ?? modelRows[0]?.id ?? null
     if (!activeDraftTab.value && d.length) {
       activeDraftTab.value = String(d[0].id)
     }
@@ -207,12 +216,30 @@ async function onFinalize() {
 
 async function onRetryFailed() {
   if (!task.value) return
-  const last = [...events.value].reverse()[0]
+  const last = [...events.value].reverse().find((event) => event.step !== 'model_change')
   const step = last?.step || ''
   if (step.includes('review')) return onReview()
   if (step.includes('optimize')) return onOptimize()
   if (step.includes('regenerat')) return onRegenerate()
   return onGenerate()
+}
+
+async function onSwitchModelAndRetry() {
+  if (!task.value || retryModelId.value == null) {
+    ElMessage.warning('请先选择重试模型')
+    return
+  }
+  acting.value = true
+  try {
+    task.value = await updateTaskModel(task.value.id, retryModelId.value)
+    ElMessage.success('模型已切换，正在重新生成')
+  } catch (e) {
+    ElMessage.error(`切换模型失败：${(e as Error).message}`)
+    acting.value = false
+    return
+  }
+  acting.value = false
+  await onGenerate()
 }
 
 function openApplyDialog(rev?: PromptRevision) {
@@ -223,16 +250,22 @@ function openApplyDialog(rev?: PromptRevision) {
   }
   applyMode.value = 'task_temp'
   alsoRegenerate.value = true
+  editedPromptContent.value = selectedRevision.value.new_content
   applyDialogVisible.value = true
 }
 
 async function confirmApply() {
   if (!task.value || !selectedRevision.value) return
+  if (!editedPromptContent.value.trim()) {
+    ElMessage.warning('Prompt 内容不能为空')
+    return
+  }
   acting.value = true
   try {
     await applyPrompt(task.value.id, {
       revision_id: selectedRevision.value.id,
       mode: applyMode.value,
+      content: editedPromptContent.value,
     })
     ElMessage.success(
       applyMode.value === 'global' ? '已全局启用新 Prompt' : '已仅对本任务应用 Prompt',
@@ -339,6 +372,17 @@ onUnmounted(stopPolling)
       <template v-else-if="task.status === 'failed'">
         <el-button type="danger" :loading="acting" @click="onRetryFailed">重试当前步</el-button>
         <el-button :loading="acting" @click="onGenerate">重新生成</el-button>
+        <el-select v-model="retryModelId" placeholder="选择重试模型" style="width: 260px">
+          <el-option
+            v-for="model in models"
+            :key="model.id"
+            :label="`${model.name} · ${model.model_name}${model.is_default ? '（默认）' : ''}`"
+            :value="model.id"
+          />
+        </el-select>
+        <el-button type="warning" :loading="acting" @click="onSwitchModelAndRetry">
+          换模型并重新生成
+        </el-button>
       </template>
       <template v-else-if="task.status === 'finalized'">
         <el-tag type="success" effect="dark">已终版（只读）</el-tag>
@@ -454,11 +498,11 @@ onUnmounted(stopPolling)
       <div v-if="selectedRevision" class="apply-body">
         <div class="apply-meta">修订 #{{ selectedRevision.id }} · {{ selectedRevision.status }}</div>
         <el-input
+          v-model="editedPromptContent"
           type="textarea"
-          :model-value="selectedRevision.new_content"
           :rows="12"
-          readonly
         />
+        <div class="apply-hint">可在确认前手动修改；最终保存的是此处内容。</div>
         <div class="apply-mode">
           <div class="label">应用方式</div>
           <el-radio-group v-model="applyMode">

@@ -226,7 +226,7 @@ def test_structured_step_b_create_is_applied_with_job_revision(tmp_app_data, mon
     )
     job = client.post(f"/api/documents/{uploaded.json()['id']}/ingest").json()
 
-    assert job["status"] == "success_with_warnings", job
+    assert job["status"] == "success", job
     log = json.loads(job["step_log_json"])
     apply_step = next(item for item in log if item["step"] == "wiki_apply")
     assert "rule.order.auction-price" in apply_step["applied_page_keys"]

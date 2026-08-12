@@ -6,6 +6,7 @@ import { formatDateTime as formatTime } from '../utils/datetime'
 import {
   approveWikiReview,
   acknowledgeWikiReview,
+  batchApproveWikiReviews,
   getWikiDiff,
   getWikiReview,
   listWikiReviews,
@@ -29,6 +30,7 @@ const spaces = ref<WikiSpace[]>([])
 const currentSpace = ref<WikiSpace | null>(null)
 const detailLoading = ref(false)
 const actionLoading = ref(false)
+const batchLoading = ref(false)
 const revisionsLoading = ref(false)
 const revisionDiffLoading = ref(false)
 const reviews = ref<WikiReview[]>([])
@@ -44,6 +46,10 @@ const decisionReason = ref('')
 
 const latestRevision = computed(() =>
   revisions.value.length ? revisions.value[revisions.value.length - 1] : null,
+)
+
+const pendingReviewIds = computed(() =>
+  reviews.value.filter((item) => item.status === 'pending').map((item) => item.id),
 )
 
 function statusLabel(status: string) {
@@ -283,6 +289,41 @@ async function acknowledge() {
   }
 }
 
+async function batchApprove() {
+  const ids = pendingReviewIds.value
+  if (!ids.length) return
+  try {
+    await ElMessageBox.confirm(
+      `将批量处理当前列表中的 ${ids.length} 条待审核记录：可写入候选自动批准，结构化提醒自动确认；合并或损坏候选会保留待人工处理。`,
+      '一键审核通过',
+      { type: 'warning', confirmButtonText: '确认批量处理', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  batchLoading.value = true
+  try {
+    const result = await batchApproveWikiReviews(ids, {
+      reviewed_by: reviewedBy.value.trim() || undefined,
+      decision_reason: decisionReason.value.trim() || '批量审核通过',
+    }, currentSpace.value?.id)
+    const processed = result.approved_ids.length + result.acknowledged_ids.length
+    if (result.skipped.length) {
+      ElMessage.warning(`已处理 ${processed} 条，另有 ${result.skipped.length} 条需人工检查`)
+    } else {
+      ElMessage.success(`已完成 ${processed} 条审核`)
+    }
+    const refreshedSpaces = await listWikiSpaces()
+    spaces.value = refreshedSpaces
+    currentSpace.value = refreshedSpaces.find((space) => space.id === currentSpace.value?.id) || currentSpace.value
+    await loadReviews()
+  } catch (error) {
+    ElMessage.error(actionableError('批量审核', error))
+  } finally {
+    batchLoading.value = false
+  }
+}
+
 async function compareRevision(revision: WikiRevision) {
   const pageId = detail.value?.page_id
   const current = latestRevision.value
@@ -393,6 +434,15 @@ watch(
             :value="space.id"
           />
         </el-select>
+        <el-button
+          v-if="pendingReviewIds.length"
+          type="primary"
+          :loading="batchLoading"
+          :disabled="currentSpace?.status !== 'active'"
+          @click="batchApprove"
+        >
+          一键审核通过（{{ pendingReviewIds.length }}）
+        </el-button>
         <el-button :loading="loading" @click="loadReviews">刷新列表</el-button>
       </div>
     </div>

@@ -3,7 +3,7 @@ from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from app.services.wiki_spaces import normalize_space_slug
+from app.services.wiki_spaces import normalize_space_slug, validate_space_status
 
 
 class WikiSpaceCreate(BaseModel):
@@ -34,6 +34,17 @@ class WikiSpaceUpdate(BaseModel):
     @classmethod
     def _strip_text(cls, value: str | None) -> str | None:
         return value.strip() if value is not None else value
+
+
+class WikiSpaceStatusUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: str
+
+    @field_validator("status")
+    @classmethod
+    def _validate_status(cls, value: str) -> str:
+        return validate_space_status(value)
 
 
 class WikiSpaceOut(BaseModel):

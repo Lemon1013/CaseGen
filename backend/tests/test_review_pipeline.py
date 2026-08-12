@@ -229,6 +229,48 @@ def test_finalize_without_draft_fails(tmp_app_data):
     assert fin.status_code == 400
 
 
+def test_apply_prompt_accepts_manual_edit_before_confirmation(tmp_app_data):
+    init_db()
+    with Session(get_engine()) as session:
+        requirement = Requirement(title="t", description="d")
+        session.add(requirement)
+        session.flush()
+        task = GenerationTask(requirement_id=int(requirement.id), status="failed")
+        session.add(task)
+        session.flush()
+        revision = PromptRevision(
+            task_id=int(task.id),
+            new_content="模型生成的版本",
+            status="pending",
+        )
+        session.add(revision)
+        session.commit()
+        task_id = int(task.id)
+        revision_id = int(revision.id)
+
+    client = TestClient(create_app())
+    applied = client.post(
+        f"/api/tasks/{task_id}/apply-prompt",
+        json={
+            "revision_id": revision_id,
+            "mode": "task_temp",
+            "content": "人工确认后的提示词\n保留关键约束。",
+        },
+    )
+    assert applied.status_code == 200
+    with Session(get_engine()) as session:
+        task = session.get(GenerationTask, task_id)
+        revision = session.get(PromptRevision, revision_id)
+        assert task is not None and task.temp_prompt_content == "人工确认后的提示词\n保留关键约束。"
+        assert revision is not None and revision.new_content == task.temp_prompt_content
+
+    repeated = client.post(
+        f"/api/tasks/{task_id}/apply-prompt",
+        json={"revision_id": revision_id, "mode": "task_temp"},
+    )
+    assert repeated.status_code == 400
+
+
 def test_review_messages_preserve_wiki_and_source_labels():
     requirement = Requirement(
         title="集合竞价撤单",

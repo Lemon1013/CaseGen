@@ -1,12 +1,13 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import type { UploadRequestOptions } from 'element-plus'
 import { Refresh, UploadFilled } from '@element-plus/icons-vue'
 import { formatDateTime as formatTime } from '../utils/datetime'
 import {
   cancelIngestJob,
+  deleteDocument,
   getDocumentPreview,
   getIngestJob,
   ingestDocument,
@@ -461,6 +462,42 @@ async function cancelJob(row: DocumentItem) {
   }
 }
 
+async function removeDocument(row: DocumentItem) {
+  if (isActiveJob(currentJob(row))) {
+    ElMessage.warning('请先取消正在运行的摄入任务，再删除文档')
+    return
+  }
+  try {
+    await ElMessageBox.confirm(
+      `确认删除「${row.filename}」？原文件和原文块会删除；仅由该文档支持的 Wiki 页面会归档，共享页面会移除此来源。历史任务和版本记录仍会保留。`,
+      '删除文档',
+      { type: 'warning', confirmButtonText: '确认删除', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  setActionLoading(row.id, true)
+  try {
+    const result = await deleteDocument(row.id, currentSpace.value?.id)
+    clearPoll(row.id)
+    if (previewDocument.value?.id === row.id) previewDrawerVisible.value = false
+    if (chunkDocument.value?.id === row.id) chunkDrawerVisible.value = false
+    if (result.warnings.length) {
+      ElMessage.warning(`文档已删除，但有 ${result.warnings.length} 条清理提示可查看后端日志`)
+    } else {
+      ElMessage.success(
+        `文档已删除：归档 ${result.pages_archived.length} 页，解绑 ${result.pages_detached.length} 页`,
+      )
+    }
+    spaces.value = await listWikiSpaces()
+    await load()
+  } catch (error: unknown) {
+    ElMessage.error(`删除失败：${errorMessage(error, '请稍后重试')}`)
+  } finally {
+    setActionLoading(row.id, false)
+  }
+}
+
 function qualityPreview(row: DocumentItem) {
   return qualityPreviews.value[row.id]
 }
@@ -724,7 +761,7 @@ onUnmounted(() => {
           {{ formatTime(row.updated_at) }}
         </template>
       </el-table-column>
-      <el-table-column label="操作" width="230">
+      <el-table-column label="操作" width="280">
         <template #default="{ row }">
           <div class="row-actions">
             <el-button type="primary" link :loading="previewDocument?.id === row.id && previewLoading" @click="openOriginalPreview(row)">
@@ -769,6 +806,15 @@ onUnmounted(() => {
               @click="startIngest(row)"
             >
               摄入 Wiki
+            </el-button>
+            <el-button
+              type="danger"
+              link
+              :loading="actionLoading[row.id]"
+              :disabled="isActiveJob(currentJob(row))"
+              @click="removeDocument(row)"
+            >
+              删除
             </el-button>
           </div>
         </template>

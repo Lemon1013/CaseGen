@@ -6,25 +6,65 @@ import { Plus, Refresh } from '@element-plus/icons-vue'
 import { formatDateTime as formatTime } from '../utils/datetime'
 import {
   deleteTask,
+  generateTask,
   listTasks,
   statusLabel,
   statusTagType,
   type TaskItem,
+  updateTaskModel,
 } from '../api/tasks'
+import { listModels, type ModelConfig } from '../api/models'
 
 const router = useRouter()
 const loading = ref(false)
 const deletingId = ref<number | null>(null)
+const retryingId = ref<number | null>(null)
 const tasks = ref<TaskItem[]>([])
+const models = ref<ModelConfig[]>([])
+const retryModelIds = ref<Record<number, number | null>>({})
 
 async function load() {
   loading.value = true
   try {
-    tasks.value = await listTasks()
+    const [taskRows, modelRows] = await Promise.all([
+      listTasks(),
+      listModels().catch(() => [] as ModelConfig[]),
+    ])
+    tasks.value = taskRows
+    models.value = modelRows
+    const defaultModel = modelRows.find((model) => model.is_default)?.id ?? modelRows[0]?.id ?? null
+    for (const task of taskRows) {
+      if (task.status === 'failed' && retryModelIds.value[task.id] == null) {
+        retryModelIds.value[task.id] = task.model_id ?? defaultModel
+      }
+    }
   } catch (e) {
     ElMessage.error(`加载任务失败：${(e as Error).message}`)
   } finally {
     loading.value = false
+  }
+}
+
+async function retryWithModel(row: TaskItem) {
+  const modelId = retryModelIds.value[row.id]
+  if (modelId == null) {
+    ElMessage.warning('请先选择重试模型')
+    return
+  }
+  retryingId.value = row.id
+  try {
+    await updateTaskModel(row.id, modelId)
+    const updated = await generateTask(row.id)
+    if (updated.status === 'failed') {
+      ElMessage.error(`已切换模型，但重试仍失败：${updated.error_message || '未知错误'}`)
+    } else {
+      ElMessage.success('已切换模型并提交重试')
+    }
+    await load()
+  } catch (e) {
+    ElMessage.error(`切换模型重试失败：${(e as Error).message}`)
+  } finally {
+    retryingId.value = null
   }
 }
 
@@ -123,9 +163,37 @@ onMounted(load)
           {{ formatTime(row.updated_at) }}
         </template>
       </el-table-column>
-      <el-table-column label="操作" width="140" fixed="right">
+      <el-table-column label="操作" width="230" fixed="right">
         <template #default="{ row }">
           <el-button link type="primary" @click.stop="openDetail(row)">详情</el-button>
+          <el-popover
+            v-if="row.status === 'failed'"
+            placement="bottom-end"
+            :width="310"
+            trigger="click"
+          >
+            <template #reference>
+              <el-button link type="warning" @click.stop>换模型重试</el-button>
+            </template>
+            <div class="retry-model" @click.stop>
+              <el-select v-model="retryModelIds[row.id]" placeholder="选择模型" style="width: 100%">
+                <el-option
+                  v-for="model in models"
+                  :key="model.id"
+                  :label="`${model.name} · ${model.model_name}${model.is_default ? '（默认）' : ''}`"
+                  :value="model.id"
+                />
+              </el-select>
+              <el-button
+                type="primary"
+                :loading="retryingId === row.id"
+                :disabled="!models.length"
+                @click="retryWithModel(row)"
+              >
+                保存并重新生成
+              </el-button>
+            </div>
+          </el-popover>
           <el-button
             link
             type="danger"
@@ -147,5 +215,10 @@ onMounted(load)
 
 .muted {
   color: var(--cg-text-muted);
+}
+
+.retry-model {
+  display: grid;
+  gap: 10px;
 }
 </style>

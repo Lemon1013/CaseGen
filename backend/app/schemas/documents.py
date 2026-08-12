@@ -45,6 +45,16 @@ class RechunkOut(BaseModel):
     chunk_count: int
 
 
+class DocumentDeleteOut(BaseModel):
+    document_id: int
+    chunks_deleted: int = 0
+    pages_archived: list[str] = Field(default_factory=list)
+    pages_detached: list[str] = Field(default_factory=list)
+    reviews_closed: int = 0
+    source_file_removed: bool = False
+    warnings: list[str] = Field(default_factory=list)
+
+
 class DocumentPreviewOut(BaseModel):
     document_id: int
     filename: str

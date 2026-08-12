@@ -157,7 +157,12 @@ def space_statistics(session: Session, space: WikiSpace) -> dict[str, Any]:
         }
     sid = int(space.id)
     document_count = int(
-        session.exec(select(func.count(Document.id)).where(Document.space_id == sid)).one()
+        session.exec(
+            select(func.count(Document.id)).where(
+                Document.space_id == sid,
+                Document.status != "deleted",
+            )
+        ).one()
         or 0
     )
     page_count = int(

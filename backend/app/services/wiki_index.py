@@ -18,6 +18,7 @@ from app import config
 from app.models.entities import WikiPageRow, WikiPageSource
 from app.services.wiki_spaces import space_scope_clause
 from app.services.wiki_schema import parse_wiki_page
+from app.services.wiki_titles import display_title, page_type_label
 from app.services.wiki_repository import page_path
 
 _SUMMARY_LIMIT = 140
@@ -168,7 +169,12 @@ def page_descriptor(
             parsed_metadata = parse_wiki_page(content).frontmatter
         except (TypeError, ValueError):
             pass
-    title = str(_get(page, "title", default=None) or _get(parsed_metadata, "title", default=None) or key or "Untitled")
+    title = display_title(
+        str(_get(page, "title", default=None) or _get(parsed_metadata, "title", default=None) or ""),
+        page_key=key,
+        page_type=page_type,
+        body=content,
+    )
     domain = _get(page, "domain", default=None) or _get(parsed_metadata, "domain", default=None) or "未分类"
     status = str(_get(page, "status", default=None) or _get(parsed_metadata, "status", default=None) or "published")
 
@@ -292,7 +298,7 @@ def render_index(entries: Iterable[Mapping[str, Any]]) -> str:
     for domain, types in sorted(domains.items()):
         lines.extend([f"## {domain}", ""])
         for page_type, pages in sorted(types.items()):
-            lines.extend([f"### {page_type}", "", "| 页面 | 摘要 | 状态 | 来源数 |", "| --- | --- | --- | ---: |"])
+            lines.extend([f"### {page_type_label(page_type)}", "", "| 页面 | 摘要 | 状态 | 来源数 |", "| --- | --- | --- | ---: |"])
             for entry in sorted(pages, key=lambda item: (str(item.get("title")), str(item.get("page_key")))):
                 title = _md(entry.get("title") or entry.get("page_key") or "Untitled")
                 lines.append(

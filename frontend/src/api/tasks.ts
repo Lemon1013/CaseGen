@@ -118,6 +118,13 @@ export function deleteTask(id: number) {
   return api<{ ok: boolean; id: number }>(`/api/tasks/${id}`, { method: 'DELETE' })
 }
 
+export function updateTaskModel(id: number, modelId: number | null) {
+  return api<TaskItem>(`/api/tasks/${id}/model`, {
+    method: 'PATCH',
+    body: JSON.stringify({ model_id: modelId }),
+  })
+}
+
 export function createTask(body: TaskCreate) {
   return api<TaskItem>('/api/tasks', {
     method: 'POST',
@@ -148,7 +155,7 @@ export function finalizeTask(id: number) {
 
 export function applyPrompt(
   id: number,
-  body: { revision_id: number; mode: ApplyPromptMode },
+  body: { revision_id: number; mode: ApplyPromptMode; content?: string },
 ) {
   return api<TaskItem>(`/api/tasks/${id}/apply-prompt`, {
     method: 'POST',

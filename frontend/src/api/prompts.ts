@@ -50,6 +50,12 @@ export function updatePrompt(id: number, body: PromptUpdate) {
   })
 }
 
+export function deletePrompt(id: number) {
+  return api<{ ok: boolean; id: number }>(`/api/prompts/${id}`, {
+    method: 'DELETE',
+  })
+}
+
 export const PROMPT_TYPE_OPTIONS: { value: PromptType; label: string }[] = [
   { value: 'generate', label: '生成 (generate)' },
   { value: 'review', label: '评审 (review)' },

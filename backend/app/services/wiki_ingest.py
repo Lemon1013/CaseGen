@@ -27,8 +27,8 @@ from app.services.wiki_apply import apply_wiki_plan
 from app.services.wiki_candidates import recall_wiki_candidates_from_session
 from app.services.wiki_long_analyze import run_long_source_analyze
 from app.services.wiki_pages_parse import (
-    parse_wiki_write_output,
     pages_from_analysis,
+    reconcile_wiki_write_output,
     split_wiki_pages,
 )
 from app.services.wiki_spaces import ensure_space_dirs, resolve_space, space_scope_clause
@@ -560,7 +560,10 @@ def ingest_document(
             retry_window_indices=retry_window_indices,
         )
         analysis = analyze_result["analysis"]
-        ingest_warnings = list(analyze_result.get("warnings") or [])
+        # Model-shape corrections are expected interoperability work.  Keep
+        # them available for diagnostics without turning a successful ingest
+        # into a user-facing warning state.
+        normalization_notes = list(analyze_result.get("warnings") or [])
         try:
             persisted_plan = json.loads(job.plan_json or "{}")
         except json.JSONDecodeError:
@@ -618,11 +621,52 @@ def ingest_document(
                 analysis_json = analysis_json[:write_cap] + "\n...[truncated]"
 
         digest = str(analysis.get("global_digest") or "").strip()
+        strict_plan = analyze_result.get("step_a_plan") or {}
+        strict_operations = (
+            strict_plan.get("page_operations")
+            if isinstance(strict_plan, dict)
+            else None
+        ) or []
+        strict_claims = (
+            (strict_plan.get("claims") or [])
+            if isinstance(strict_plan, dict)
+            else []
+        )
+        claims_by_id = {
+            str(item.get("claim_id")): str(item.get("statement") or "")
+            for item in strict_claims
+            if isinstance(item, dict)
+            and item.get("claim_id")
+        }
+        existing_titles = {
+            str(item.get("page_key")): str(item.get("title") or "")
+            for item in candidate_pages
+            if isinstance(item, dict) and item.get("page_key")
+        }
+        writer_tasks: list[dict[str, Any]] = []
+        for position, operation in enumerate(strict_operations, start=1):
+            if not isinstance(operation, dict) or operation.get("op") == "noop":
+                continue
+            claim_ids = [str(value) for value in (operation.get("claim_ids") or [])]
+            writer_tasks.append(
+                {
+                    "operation_id": f"op-{position}",
+                    "operation": operation.get("op"),
+                    "page_key": operation.get("page_key"),
+                    "page_type": operation.get("page_type") or "rule",
+                    "existing_title": existing_titles.get(str(operation.get("page_key"))) or None,
+                    "reason": operation.get("reason") or "",
+                    "claims": [claims_by_id[item] for item in claim_ids if claims_by_id.get(item)],
+                    "source_anchors": operation.get("source_anchors") or [],
+                }
+            )
         write_messages = [
             {"role": "system", "content": write_prompt.content},
             {
                 "role": "user",
                 "content": (
+                    "# 服务端页面任务（身份字段不可修改）\n"
+                    f"```json\n{json.dumps(writer_tasks, ensure_ascii=False, indent=2)}\n```\n\n"
                     f"# Step A 分析结果\n```json\n{analysis_json}\n```\n\n"
                     f"# 源路径\n{doc.stored_path}\n\n"
                     f"# 现有 index 摘要\n{index_excerpt[:2000]}\n\n"
@@ -633,12 +677,6 @@ def ingest_document(
         ]
         pages: list[dict] = []
         strict_apply_result = None
-        strict_plan = analyze_result.get("step_a_plan") or {}
-        strict_operations = (
-            strict_plan.get("page_operations")
-            if isinstance(strict_plan, dict)
-            else None
-        ) or []
         write_mode = "llm"
         has_strict_plan = (
             isinstance(strict_plan, dict) and "page_operations" in strict_plan
@@ -648,39 +686,18 @@ def ingest_document(
             if strict_operations:
                 try:
                     write_raw = _call_chat(chat_fn, write_messages)
-                    candidates = parse_wiki_write_output(
+                    candidates, write_warnings = reconcile_wiki_write_output(
                         write_raw,
+                        writer_tasks,
                         max_pages=MAX_WIKI_PAGES_PER_DOC,
-                        allow_legacy_markdown=False,
                     )
-                    allowed_candidate_keys = {
-                        str(operation.get("page_key"))
-                        for operation in strict_operations
-                        if isinstance(operation, dict)
-                        and operation.get("op") != "noop"
-                        and operation.get("page_key")
-                    }
-                    unexpected_candidate_keys = [
-                        str(candidate.get("page_key"))
-                        for candidate in candidates
-                        if str(candidate.get("page_key")) not in allowed_candidate_keys
-                    ]
-                    if unexpected_candidate_keys:
-                        candidates = [
-                            candidate
-                            for candidate in candidates
-                            if str(candidate.get("page_key")) in allowed_candidate_keys
-                        ]
-                        warning = (
-                            "Step B 返回了未被 Step A 请求的页面，已忽略："
-                            + ", ".join(unexpected_candidate_keys[:8])
-                        )
-                        ingest_warnings.append(warning)
+                    if write_warnings:
+                        normalization_notes.extend(write_warnings)
                         _append_step(
                             job,
                             "wiki_write_sanitized",
-                            warning,
-                            ignored_page_keys=unexpected_candidate_keys[:8],
+                            f"Step B 已由服务端整理：{len(write_warnings)} 条纠正",
+                            warnings=write_warnings[:12],
                         )
                 except (LLMError, ValueError) as write_exc:
                     write_mode = "deterministic_fallback"
@@ -703,6 +720,15 @@ def ingest_document(
                 max_pages=MAX_WIKI_PAGES_PER_DOC,
                 space_id=space.id,
             )
+            if strict_apply_result.warnings:
+                normalization_notes.extend(strict_apply_result.warnings)
+                _append_step(
+                    job,
+                    "wiki_apply_sanitized",
+                    f"写入阶段自动处理 {len(strict_apply_result.warnings)} 个模型偏差",
+                    warnings=strict_apply_result.warnings[:20],
+                    skipped_page_keys=strict_apply_result.skipped_page_keys,
+                )
             _append_step(
                 job,
                 "wiki_apply",
@@ -711,6 +737,7 @@ def ingest_document(
                 applied_page_keys=strict_apply_result.applied_page_keys,
                 noop_page_keys=strict_apply_result.noop_page_keys,
                 review_item_ids=strict_apply_result.review_item_ids,
+                skipped_page_keys=strict_apply_result.skipped_page_keys,
                 source_summary_key=strict_apply_result.source_summary_key,
             )
         else:
@@ -795,28 +822,27 @@ def ingest_document(
         doc.char_count = len(text)
         doc.error_message = None
         doc.updated_at = _utcnow()
-        if ingest_warnings:
+        if normalization_notes:
             try:
                 final_plan = json.loads(job.plan_json or "{}")
             except (TypeError, json.JSONDecodeError):
                 final_plan = {}
             if not isinstance(final_plan, dict):
                 final_plan = {}
-            final_plan["warnings"] = ingest_warnings
+            final_plan.pop("warnings", None)
+            final_plan["normalization_notes"] = normalization_notes
             job.plan_json = json.dumps(final_plan, ensure_ascii=False)
         degraded_windows = [
             int(index)
             for index in (analyze_result.get("degraded_windows") or [])
             if str(index).strip().isdigit()
         ]
-        if degraded_windows or ingest_warnings:
+        if degraded_windows:
             warning_parts: list[str] = []
             if degraded_windows:
                 warning_parts.append(
                     f"{len(degraded_windows)} 个分析窗口未通过模型校验"
                 )
-            if ingest_warnings and not degraded_windows:
-                warning_parts.append("模型写入结果已按安全白名单整理")
             job.error_message = (
                 "摄入已完成，但 "
                 + "；".join(warning_parts)

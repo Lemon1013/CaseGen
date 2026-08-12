@@ -63,6 +63,24 @@ const previewMeta = ref('')
 const previewLoading = ref(false)
 const previewDocumentId = ref<number | null>(null)
 
+const pageTypeLabels: Record<string, string> = {
+  source: '来源',
+  rule: '规则',
+  entity: '实体',
+  scenario: '场景',
+  regression: '回归知识',
+  synthesis: '综合知识',
+  source_chunk: '原文',
+  source_summary: '来源',
+  business: '规则',
+  api: '接口知识',
+  test_hint: '测试提示',
+}
+
+function pageTypeLabel(value: string | null | undefined) {
+  return pageTypeLabels[value || ''] || value || 'Wiki'
+}
+
 function isSourceHit(h: {
   citation_type?: string
   page_type?: string
@@ -153,7 +171,7 @@ const groupedItems = computed(() => {
   const groups = new Map<string, ListItem[]>()
   for (const item of displayList.value) {
     const domain = item.citation_type === 'source' ? '原文证据' : item.domain || '未分类'
-    const key = `${domain} / ${item.page_type || 'page'}`
+    const key = `${domain} / ${pageTypeLabel(item.page_type)}`
     groups.set(key, [...(groups.get(key) || []), item])
   }
   return [...groups.entries()].map(([label, items]) => ({ label, items }))
@@ -523,7 +541,7 @@ watch(
         <el-option v-for="value in filterOptions.domains" :key="value" :label="value" :value="value" />
       </el-select>
       <el-select v-model="typeFilter" clearable placeholder="页面类型" style="width: 140px">
-        <el-option v-for="value in filterOptions.types" :key="value" :label="value" :value="value" />
+        <el-option v-for="value in filterOptions.types" :key="value" :label="pageTypeLabel(value)" :value="value" />
       </el-select>
       <el-select v-model="statusFilter" clearable placeholder="状态" style="width: 130px">
         <el-option v-for="value in filterOptions.statuses" :key="value" :label="value" :value="value" />
@@ -562,7 +580,7 @@ watch(
                   :type="item.citation_type === 'source' ? 'success' : 'info'"
                   effect="plain"
                 >
-                  {{ item.citation_type === 'source' ? '原文' : item.page_type || 'Wiki' }}
+                  {{ item.citation_type === 'source' ? '原文' : pageTypeLabel(item.page_type) }}
                 </el-tag>
                 <el-tag v-if="item.status" size="small" effect="plain">{{ item.status }}</el-tag>
                 <el-tag v-if="item.revision" size="small" effect="plain">r{{ item.revision }}</el-tag>

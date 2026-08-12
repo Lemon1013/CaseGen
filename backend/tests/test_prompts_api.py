@@ -120,3 +120,72 @@ def test_bundled_prompts_keep_required_output_contracts(tmp_app_data):
     assert "本次需求中的专属" in active["optimize"]
     assert all(token in active["wiki_analyze"] for token in ("page_operations", "source_anchors", "禁止 merge"))
     assert all(token in active["wiki_write"] for token in ('"pages"', "replace_existing", "不决定磁盘路径"))
+
+
+def test_delete_prompt_is_safe_for_runtime_and_history(tmp_app_data):
+    client = TestClient(create_app())
+
+    removable = client.post(
+        "/api/prompts",
+        json={
+            "name": "removable-review",
+            "type": "review",
+            "content": "temporary",
+            "is_active": False,
+        },
+    ).json()
+    deleted = client.delete(f"/api/prompts/{removable['id']}")
+    assert deleted.status_code == 200
+    assert deleted.json() == {"ok": True, "id": removable["id"]}
+    assert client.get(f"/api/prompts/{removable['id']}").status_code == 404
+
+    referenced = client.post(
+        "/api/prompts",
+        json={
+            "name": "task-generate",
+            "type": "generate",
+            "content": "task prompt",
+            "is_active": True,
+        },
+    ).json()
+    task = client.post(
+        "/api/tasks",
+        json={
+            "title": "引用提示词",
+            "description": "不能删除其提示词",
+            "prompt_template_id": referenced["id"],
+        },
+    )
+    assert task.status_code == 200
+    blocked = client.delete(f"/api/prompts/{referenced['id']}")
+    assert blocked.status_code == 409
+    assert "task" in blocked.json()["detail"].lower()
+
+    items = client.get("/api/prompts", params={"type": "optimize"}).json()
+    for item in items:
+        if item["is_active"]:
+            assert client.put(
+                f"/api/prompts/{item['id']}",
+                json={"is_active": False},
+            ).status_code == 200
+    only_active = client.post(
+        "/api/prompts",
+        json={
+            "name": "only-optimize",
+            "type": "optimize",
+            "content": "only active prompt",
+            "is_active": True,
+        },
+    ).json()
+    assert client.delete(f"/api/prompts/{only_active['id']}").status_code == 409
+    client.post(
+        "/api/prompts",
+        json={
+            "name": "replacement-optimize",
+            "type": "optimize",
+            "content": "replacement",
+            "is_active": True,
+        },
+    )
+    assert client.delete(f"/api/prompts/{only_active['id']}").status_code == 200
+    assert client.delete("/api/prompts/999999").status_code == 404

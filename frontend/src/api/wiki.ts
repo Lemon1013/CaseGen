@@ -171,6 +171,12 @@ export function listWikiPages(spaceId?: number) {
   return api<WikiPage[]>(`/api/wiki/pages${query}`)
 }
 
+export interface WikiReviewBatchResult {
+  approved_ids: number[]
+  acknowledged_ids: number[]
+  skipped: Array<{ review_id: number; reason: string }>
+}
+
 export function getWikiPage(id: number, spaceId?: number) {
   const query = spaceId ? `?space_id=${spaceId}` : ''
   return api<WikiPage>(`/api/wiki/pages/${id}${query}`)
@@ -250,6 +256,22 @@ export function acknowledgeWikiReview(id: number, body: WikiReviewDecision = {},
   return api<WikiReviewDetail>(`/api/wiki/reviews/${id}/acknowledge${query}`, {
     method: 'POST',
     body: JSON.stringify(body),
+  })
+}
+
+export function batchApproveWikiReviews(
+  reviewIds: number[],
+  body: WikiReviewDecision = {},
+  spaceId?: number,
+) {
+  const query = spaceId ? `?space_id=${spaceId}` : ''
+  return api<WikiReviewBatchResult>(`/api/wiki/reviews/batch-approve${query}`, {
+    method: 'POST',
+    body: JSON.stringify({
+      review_ids: reviewIds,
+      reviewed_by: body.reviewed_by,
+      decision_reason: body.decision_reason || body.reason,
+    }),
   })
 }
 

@@ -181,6 +181,25 @@ class WikiReviewDecisionIn(BaseModel):
     decision_reason: Optional[str] = None
 
 
+class WikiReviewBatchIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    review_ids: List[int] = Field(min_length=1, max_length=200)
+    reviewed_by: Optional[str] = None
+    decision_reason: Optional[str] = None
+
+
+class WikiReviewBatchSkipOut(BaseModel):
+    review_id: int
+    reason: str
+
+
+class WikiReviewBatchOut(BaseModel):
+    approved_ids: List[int] = Field(default_factory=list)
+    acknowledged_ids: List[int] = Field(default_factory=list)
+    skipped: List[WikiReviewBatchSkipOut] = Field(default_factory=list)
+
+
 class WikiRollbackIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

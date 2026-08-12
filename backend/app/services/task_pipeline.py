@@ -1320,6 +1320,7 @@ def apply_prompt(
     task_id: int,
     revision_id: int,
     mode: str,
+    content: str | None = None,
 ) -> GenerationTask:
     task = session.get(GenerationTask, task_id)
     if task is None:
@@ -1328,9 +1329,19 @@ def apply_prompt(
     revision = session.get(PromptRevision, revision_id)
     if revision is None or revision.task_id != task.id:
         raise ValueError(f"PromptRevision id={revision_id} not found for task")
+    if revision.status != "pending":
+        raise ValueError("Only pending prompt revisions can be applied")
 
     if mode not in ("global", "task_temp"):
         raise ValueError(f"Invalid apply mode {mode!r}")
+
+    edited = content is not None
+    if content is not None:
+        normalized_content = content.strip()
+        if not normalized_content:
+            raise ValueError("Prompt content must not be empty")
+        revision.new_content = normalized_content
+        session.add(revision)
 
     if mode == "task_temp":
         task.temp_prompt_content = revision.new_content
@@ -1342,7 +1353,7 @@ def apply_prompt(
             task.id,
             "apply_prompt",
             f"已应用 revision#{revision_id} 为任务临时提示词",
-            detail={"mode": mode, "revision_id": revision_id},
+            detail={"mode": mode, "revision_id": revision_id, "edited": edited},
         )
     else:
         # global: new active generate PromptTemplate version
@@ -1376,6 +1387,7 @@ def apply_prompt(
                 "revision_id": revision_id,
                 "prompt_template_id": row.id,
                 "version": version,
+                "edited": edited,
             },
         )
 

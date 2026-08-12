@@ -93,6 +93,53 @@ def test_space_crud_document_and_task_selection(tmp_app_data):
     )
     assert rejected.status_code == 422
     assert client.post(f"/api/wiki-spaces/{default['id']}/archive").status_code == 409
+    assert client.put(
+        f"/api/wiki-spaces/{project['id']}",
+        json={"name": "归档后不可编辑"},
+    ).status_code == 409
+
+    restored = client.patch(
+        f"/api/wiki-spaces/{project['id']}/status",
+        json={"status": "active"},
+    )
+    assert restored.status_code == 200
+    assert restored.json()["status"] == "active"
+    assert client.post(
+        "/api/tasks",
+        json={"title": "恢复后可创建", "description": "活动空间", "wiki_space_id": project["id"]},
+    ).status_code == 200
+    assert client.patch(
+        f"/api/wiki-spaces/{project['id']}/status",
+        json={"status": "paused"},
+    ).status_code == 422
+    assert client.patch(
+        f"/api/wiki-spaces/{default['id']}/status",
+        json={"status": "archived"},
+    ).status_code == 409
+
+
+def test_space_cannot_be_archived_while_ingest_is_active(tmp_app_data):
+    client = TestClient(create_app())
+    project = client.post(
+        "/api/wiki-spaces",
+        json={"name": "运行中空间", "slug": "busy-space"},
+    ).json()
+    with Session(get_engine()) as session:
+        session.add(
+            IngestJob(
+                document_id=999,
+                space_id=project["id"],
+                status="queued",
+            )
+        )
+        session.commit()
+
+    blocked = client.patch(
+        f"/api/wiki-spaces/{project['id']}/status",
+        json={"status": "archived"},
+    )
+    assert blocked.status_code == 409
+    assert "active ingest job" in blocked.json()["detail"].lower()
 
 
 def test_same_page_key_and_retrieval_are_strictly_space_scoped(tmp_app_data):

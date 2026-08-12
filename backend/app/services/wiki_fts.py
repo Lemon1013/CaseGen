@@ -17,6 +17,8 @@ from typing import Any, Iterator, Mapping
 from sqlalchemy.engine import Connection, Engine
 from sqlmodel import Session
 
+from app.services.wiki_titles import display_title
+
 WIKI_FTS_TABLE = "wiki_pages_fts"
 SOURCE_CHUNKS_FTS_TABLE = "source_chunks_fts"
 SOURCE_FTS_TABLE = SOURCE_CHUNKS_FTS_TABLE
@@ -329,6 +331,22 @@ def _page_values(item: Any, content: str | None = None, **overrides: Any) -> tup
             except (OSError, UnicodeError):
                 pass
     body = _strip_frontmatter(str(body or ""))
+    title = display_title(
+        str(title or ""),
+        page_key=str(
+            overrides.get(
+                "page_key", _get(source, "page_key", _get(row, "page_key", ""))
+            )
+            or ""
+        ),
+        page_type=str(
+            overrides.get(
+                "page_type", _get(source, "type", _get(row, "page_type", ""))
+            )
+            or ""
+        ),
+        body=body,
+    )
     clause_value = overrides.get("clauses", _get(source, "clauses", None))
     if clause_value is None:
         clause_values: list[str] = []

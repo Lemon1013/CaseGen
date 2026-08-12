@@ -8,6 +8,7 @@ accepted here; merge is reserved for a reviewed future task.
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 from collections.abc import Iterable, Mapping
 from typing import Any, Literal
@@ -23,7 +24,10 @@ class PlanValidationError(ValueError):
 
 class _StrictModel(BaseModel):
     model_config = ConfigDict(
-        extra="forbid",
+        # These models describe the trusted internal plan.  Model providers
+        # frequently add harmless explanatory fields, so the LLM boundary
+        # normalises and drops extras before the strict repository boundary.
+        extra="ignore",
         validate_assignment=True,
         str_strip_whitespace=True,
     )
@@ -268,6 +272,65 @@ _SOURCE_ANCHOR_FIELDS = {
     "end",
 }
 
+_PAGE_TYPES = {"source", "rule", "entity", "scenario", "regression", "synthesis"}
+_PAGE_TYPE_ALIASES = {
+    "source_summary": "source",
+    "summary": "source",
+    "business": "rule",
+    "rules": "rule",
+    "fact": "entity",
+    "api": "entity",
+    "test_hint": "scenario",
+    "test": "scenario",
+}
+
+
+def _page_type_hint(value: Any, page_key: str = "") -> str:
+    raw = str(value or "").strip().lower()
+    page_type = _PAGE_TYPE_ALIASES.get(raw, raw)
+    if page_type in _PAGE_TYPES:
+        return page_type
+    prefix = page_key.split(".", 1)[0].lower() if page_key else ""
+    prefix = _PAGE_TYPE_ALIASES.get(prefix, prefix)
+    return prefix if prefix in _PAGE_TYPES else "rule"
+
+
+def _safe_page_key_hint(
+    value: Any,
+    *,
+    page_type: Any = None,
+    title: Any = None,
+    reason: Any = None,
+    claim_ids: Any = None,
+) -> tuple[str, str | None]:
+    """Return a safe stable key without trusting model path-like text."""
+
+    raw = str(value or "").strip()
+    if is_valid_page_key(raw):
+        return raw, None
+    normalised = raw.casefold().replace("_", "-")
+    normalised = re.sub(r"\s+", "-", normalised)
+    normalised = re.sub(r"\.+", ".", normalised).strip(".-")
+    normalised = re.sub(r"-+", "-", normalised)
+    if is_valid_page_key(normalised):
+        return normalised, f"page_key {raw!r} 已规范化为 {normalised}"
+
+    resolved_type = _page_type_hint(page_type, normalised)
+    seed = "|".join(
+        (
+            resolved_type,
+            raw,
+            str(title or "").strip(),
+            str(reason or "").strip(),
+            "|".join(_strings(claim_ids)),
+        )
+    )
+    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:12]
+    generated = f"{resolved_type}.generated-{digest}"
+    return generated, (
+        f"page_key {raw or '<empty>'!r} 不可用，已生成稳定 key {generated}"
+    )
+
 
 def _listify(value: Any) -> list[Any]:
     if value is None:
@@ -310,6 +373,109 @@ def _normalise_anchor_mapping(value: Any) -> dict[str, Any] | None:
     return anchor or None
 
 
+def _window_mapping(value: Any) -> dict[str, Any]:
+    if isinstance(value, Mapping):
+        return dict(value)
+    return {
+        name: getattr(value, name)
+        for name in (
+            "index",
+            "window_index",
+            "start",
+            "end",
+            "start_char",
+            "end_char",
+            "page_start",
+            "page_end",
+            "section",
+            "clause_ids",
+            "chunk_id",
+            "chunk_ids",
+            "document_id",
+            "source_path",
+        )
+        if hasattr(value, name)
+    }
+
+
+def _default_source_anchors(
+    source_windows: Iterable[Any] | None,
+    *,
+    maximum: int = 16,
+) -> list[dict[str, Any]]:
+    """Build authoritative anchors from the actual source window metadata."""
+
+    anchors: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in source_windows or ():
+        item = _window_mapping(raw)
+        anchor: dict[str, Any] = {}
+        for name in (
+            "document_id",
+            "source_path",
+            "chunk_id",
+            "chunk_ids",
+            "page_start",
+            "page_end",
+            "section",
+            "clause_ids",
+        ):
+            value = item.get(name)
+            if value not in (None, "", []):
+                anchor[name] = value
+        window_index = item.get("window_index", item.get("index"))
+        if window_index not in (None, "", 0):
+            anchor["window_index"] = window_index
+        start = item.get("start_char", item.get("start"))
+        end = item.get("end_char", item.get("end"))
+        if start is not None and end is not None:
+            try:
+                if int(end) > int(start):
+                    anchor["start_char"] = int(start)
+                    anchor["end_char"] = int(end)
+            except (TypeError, ValueError):
+                pass
+        try:
+            parsed = SourceAnchor.model_validate(anchor)
+        except (ValidationError, TypeError, ValueError):
+            continue
+        key = json.dumps(parsed.model_dump(mode="json"), ensure_ascii=False, sort_keys=True)
+        if key in seen:
+            continue
+        seen.add(key)
+        anchors.append(parsed.model_dump(mode="json", exclude_none=True))
+        if len(anchors) >= maximum:
+            break
+    return anchors
+
+
+def _trusted_source_anchors(
+    value: Any,
+    *,
+    source_windows: Iterable[Any] | None,
+    fallback_to_window: bool,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Intersect model anchors with real windows and fall back to the window."""
+
+    warnings: list[str] = []
+    anchors: list[dict[str, Any]] = []
+    for raw in _listify(value):
+        mapped = _normalise_anchor_mapping(raw)
+        if mapped is None:
+            continue
+        try:
+            parsed = validate_source_anchor(mapped, source_windows=source_windows)
+        except PlanValidationError as exc:
+            warnings.append(f"无效来源定位已忽略：{exc}")
+            continue
+        anchors.append(parsed.model_dump(mode="json", exclude_none=True))
+    if not anchors and fallback_to_window:
+        anchors = _default_source_anchors(source_windows)
+        if anchors:
+            warnings.append("模型未提供可用来源定位，已绑定当前真实原文窗口")
+    return anchors, warnings
+
+
 def _normalise_operation_anchors(item: Mapping[str, Any]) -> list[dict[str, Any]]:
     raw_anchors = item.get("source_anchors")
     if raw_anchors is None:
@@ -333,6 +499,8 @@ def _normalise_page_operations(
     value: Any,
     *,
     existing_page_keys: Iterable[str] | None = None,
+    source_windows: Iterable[Any] | None = None,
+    max_operations: int = 64,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Tolerate page candidates accidentally returned as Step A operations.
 
@@ -345,6 +513,7 @@ def _normalise_page_operations(
 
     known = {str(key) for key in (existing_page_keys or ())}
     operations: list[dict[str, Any]] = []
+    operation_index: dict[str, int] = {}
     warnings: list[str] = []
     for position, raw_value in enumerate(_listify(value), start=1):
         if isinstance(raw_value, BaseModel):
@@ -353,10 +522,15 @@ def _normalise_page_operations(
             warnings.append(f"page_operations[{position}] 不是对象，已忽略")
             continue
         item = dict(raw_value)
-        page_key = str(item.get("page_key") or item.get("key") or "").strip()
-        if not page_key:
-            warnings.append(f"page_operations[{position}] 缺少 page_key，已忽略")
-            continue
+        page_key, key_warning = _safe_page_key_hint(
+            item.get("page_key") or item.get("key"),
+            page_type=item.get("page_type") or item.get("type"),
+            title=item.get("title"),
+            reason=item.get("reason"),
+            claim_ids=item.get("claim_ids"),
+        )
+        if key_warning:
+            warnings.append(f"page_operations[{position}] {key_warning}")
         raw_op = str(
             item.get("op")
             or item.get("operation")
@@ -382,26 +556,75 @@ def _normalise_page_operations(
                     f"page_operations[{position}] 操作 {raw_op or '未知'} 不安全，已忽略"
                 )
                 continue
-        anchors = _normalise_operation_anchors(item)
-        if raw_op in {"create", "update"} and not anchors:
+        desired_op = raw_op
+        if page_key in known and raw_op == "create":
+            desired_op = "update"
+            warnings.append(
+                f"page_operations[{position}] {page_key} 已存在，create 已纠正为 update"
+            )
+        elif page_key not in known and raw_op == "update":
+            desired_op = "create"
+            warnings.append(
+                f"page_operations[{position}] {page_key} 尚不存在，update 已纠正为 create"
+            )
+        elif page_key not in known and raw_op == "noop":
+            warnings.append(
+                f"page_operations[{position}] {page_key} 不存在，noop 已忽略"
+            )
+            continue
+
+        raw_anchors = _normalise_operation_anchors(item)
+        anchors, anchor_warnings = _trusted_source_anchors(
+            raw_anchors,
+            source_windows=source_windows,
+            fallback_to_window=desired_op in {"create", "update"},
+        )
+        warnings.extend(
+            f"page_operations[{position}] {message}" for message in anchor_warnings
+        )
+        if desired_op in {"create", "update"} and not anchors:
             warnings.append(
                 f"page_operations[{position}] {page_key} 缺少来源锚点，已忽略"
             )
             continue
         operation: dict[str, Any] = {
-            "op": raw_op,
+            "op": desired_op,
             "page_key": page_key,
             "reason": str(item.get("reason") or item.get("title") or "").strip(),
             "source_anchors": anchors,
         }
         page_type = item.get("page_type") or item.get("type")
-        if page_type:
-            operation["page_type"] = page_type
+        operation["page_type"] = _page_type_hint(page_type, page_key)
         if item.get("claim_ids") is not None:
             operation["claim_ids"] = item.get("claim_ids")
         if item.get("confidence") is not None:
-            operation["confidence"] = item.get("confidence")
+            try:
+                operation["confidence"] = max(0.0, min(1.0, float(item.get("confidence"))))
+            except (TypeError, ValueError):
+                warnings.append(
+                    f"page_operations[{position}] {page_key} confidence 无效，已忽略"
+                )
+        if page_key in operation_index:
+            index = operation_index[page_key]
+            previous = operations[index]
+            previous["op"] = "update" if page_key in known else "create"
+            previous["reason"] = previous.get("reason") or operation.get("reason") or ""
+            previous["source_anchors"] = [
+                *previous.get("source_anchors", []),
+                *operation.get("source_anchors", []),
+            ]
+            previous["claim_ids"] = _strings(
+                [*previous.get("claim_ids", []), *operation.get("claim_ids", [])]
+            )
+            warnings.append(f"重复页面操作 {page_key} 已自动合并")
+            continue
+        operation_index[page_key] = len(operations)
         operations.append(operation)
+    if len(operations) > max_operations:
+        warnings.append(
+            f"页面操作共 {len(operations)} 条，已裁剪为 {max_operations} 条"
+        )
+        operations = _bounded(operations, max_operations)
     return operations, warnings
 
 
@@ -410,8 +633,10 @@ def _normalise_source_summary(value: Any) -> Any:
 
     if isinstance(value, BaseModel):
         value = value.model_dump(mode="python")
+    if isinstance(value, str):
+        return {"summary": value.strip()}
     if not isinstance(value, Mapping):
-        return value
+        return {}
     item = dict(value)
     summary = item.get("summary") or item.get("description") or item.get("body") or item.get("content_md")
     result = {
@@ -424,11 +649,142 @@ def _normalise_source_summary(value: Any) -> Any:
     return result
 
 
+def _normalise_claims(
+    value: Any,
+    *,
+    source_windows: Iterable[Any] | None,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    claims: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    for position, raw in enumerate(_listify(value), start=1):
+        if isinstance(raw, BaseModel):
+            raw = raw.model_dump(mode="python")
+        if isinstance(raw, str):
+            raw = {"statement": raw}
+        if not isinstance(raw, Mapping):
+            warnings.append(f"claims[{position}] 不是对象，已忽略")
+            continue
+        item = dict(raw)
+        statement = str(
+            item.get("statement")
+            or item.get("text")
+            or item.get("claim")
+            or item.get("rule")
+            or ""
+        ).strip()
+        if not statement:
+            warnings.append(f"claims[{position}] 缺少可验证陈述，已忽略")
+            continue
+        anchors, anchor_warnings = _trusted_source_anchors(
+            item.get("source_anchors") or item.get("anchors") or item.get("sources"),
+            source_windows=source_windows,
+            fallback_to_window=True,
+        )
+        warnings.extend(f"claims[{position}] {message}" for message in anchor_warnings)
+        claim: dict[str, Any] = {
+            "claim_id": str(item.get("claim_id") or item.get("id") or f"claim-{position}"),
+            "statement": statement,
+            "kind": str(item.get("kind") or "rule"),
+            "entities": _strings(item.get("entities") or item.get("entity_keys")),
+            "clauses": _strings(item.get("clauses") or item.get("clause_ids")),
+            "source_anchors": anchors,
+        }
+        if item.get("confidence") is not None:
+            try:
+                claim["confidence"] = max(0.0, min(1.0, float(item["confidence"])))
+            except (TypeError, ValueError):
+                warnings.append(f"claims[{position}] confidence 无效，已忽略")
+        claims.append(claim)
+    return claims, warnings
+
+
+def _normalise_auxiliary_items(
+    value: Any,
+    *,
+    kind: str,
+    source_windows: Iterable[Any] | None,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    result: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    for position, raw in enumerate(_listify(value), start=1):
+        if isinstance(raw, BaseModel):
+            raw = raw.model_dump(mode="python")
+        if not isinstance(raw, Mapping):
+            warnings.append(f"{kind}[{position}] 不是对象，已忽略")
+            continue
+        item = dict(raw)
+        page_key = str(item.get("page_key") or item.get("key") or "").strip()
+        if page_key and not is_valid_page_key(page_key):
+            warnings.append(f"{kind}[{position}] page_key 无效，已移除关联")
+            page_key = ""
+        if kind == "related_pages":
+            if not page_key:
+                continue
+            score = None
+            if item.get("score") is not None:
+                try:
+                    score = float(item["score"])
+                except (TypeError, ValueError):
+                    warnings.append(f"{kind}[{position}] score 无效，已忽略")
+            result.append(
+                {
+                    "page_key": page_key,
+                    "relation": str(item.get("relation") or "related"),
+                    "reason": str(item.get("reason") or ""),
+                    "matched_on": _strings(item.get("matched_on")),
+                    "score": score,
+                }
+            )
+            continue
+
+        reason = str(
+            item.get("description")
+            or item.get("reason")
+            or item.get("text")
+            or ""
+        ).strip()
+        if not reason:
+            warnings.append(f"{kind}[{position}] 缺少说明，已忽略")
+            continue
+        anchors, anchor_warnings = _trusted_source_anchors(
+            item.get("source_anchors") or item.get("anchors"),
+            source_windows=source_windows,
+            fallback_to_window=False,
+        )
+        warnings.extend(f"{kind}[{position}] {message}" for message in anchor_warnings)
+        if kind == "contradictions":
+            result.append(
+                {
+                    "page_key": page_key or None,
+                    "description": reason,
+                    "claim_ids": _strings(item.get("claim_ids")),
+                    "source_anchors": anchors,
+                }
+            )
+        else:
+            severity = str(item.get("severity") or "medium").lower()
+            if severity not in {"low", "medium", "high"}:
+                severity = "medium"
+            result.append(
+                {
+                    "kind": str(item.get("kind") or "needs_review"),
+                    "reason": reason,
+                    "page_key": page_key or None,
+                    "claim_ids": _strings(item.get("claim_ids")),
+                    "source_anchors": anchors,
+                    "severity": severity,
+                }
+            )
+    return result, warnings
+
+
 def normalise_step_a_output(
     raw: StepAPlan | Mapping[str, Any],
     *,
     source_path: str = "",
     existing_page_keys: Iterable[str] | None = None,
+    source_windows: Iterable[Any] | None = None,
+    max_operations: int = 64,
 ) -> tuple[dict[str, Any] | StepAPlan, list[str]]:
     """Return a tolerant Step A shape plus non-fatal normalization warnings."""
 
@@ -465,11 +821,51 @@ def normalise_step_a_output(
         operations, operation_warnings = _normalise_page_operations(
             data.get("page_operations"),
             existing_page_keys=existing_page_keys,
+            source_windows=source_windows,
+            max_operations=max_operations,
         )
         data["page_operations"] = operations
         warnings.extend(operation_warnings)
     if "source_summary" in data:
         data["source_summary"] = _normalise_source_summary(data["source_summary"])
+    if "claims" in data:
+        data["claims"], claim_warnings = _normalise_claims(
+            data.get("claims"),
+            source_windows=source_windows,
+        )
+        warnings.extend(claim_warnings)
+    for field in ("related_pages", "contradictions", "review_items"):
+        if field not in data:
+            continue
+        data[field], item_warnings = _normalise_auxiliary_items(
+            data.get(field),
+            kind=field,
+            source_windows=source_windows,
+        )
+        warnings.extend(item_warnings)
+
+    allowed = {
+        "source_summary",
+        "claims",
+        "entities",
+        "related_pages",
+        "contradictions",
+        "page_operations",
+        "review_items",
+    }
+    legacy_compat = {
+        "summary_title",
+        "key_rules",
+        "api_points",
+        "test_hints",
+        "suggested_page_types",
+        "global_digest",
+        "digest_update",
+    }
+    unknown = set(data) - allowed - legacy_compat
+    if unknown:
+        warnings.append("未知 Step A 字段已忽略：" + ", ".join(sorted(unknown)))
+        data = {key: value for key, value in data.items() if key not in unknown}
     return data, warnings
 
 
@@ -726,23 +1122,30 @@ def coerce_step_a_plan(
     existing_page_keys: Iterable[str] | None = None,
     reference_page_keys: Iterable[str] | None = None,
     source_length: int | None = None,
+    max_operations: int = 64,
 ) -> StepAPlan:
-    """Accept the pre-Task-6 analysis JSON while producing strict Step A."""
+    """Turn untrusted model output into a safe, reconciled internal plan."""
 
     if isinstance(raw, StepAPlan):
-        return validate_step_a_plan(
-            raw,
-            existing_page_keys=existing_page_keys,
-            reference_page_keys=reference_page_keys,
-            source_windows=source_windows,
-            source_length=source_length,
-        )
+        raw = raw.model_dump(mode="python")
     if not isinstance(raw, Mapping):
         raise PlanValidationError("Step A output must be a JSON object")
+    safe_existing_keys = (
+        [str(key) for key in existing_page_keys if is_valid_page_key(str(key))]
+        if existing_page_keys is not None
+        else None
+    )
+    safe_reference_keys = (
+        [str(key) for key in reference_page_keys if is_valid_page_key(str(key))]
+        if reference_page_keys is not None
+        else None
+    )
     normalised, _warnings = normalise_step_a_output(
         raw,
         source_path=source_path,
-        existing_page_keys=existing_page_keys,
+        existing_page_keys=safe_existing_keys,
+        source_windows=source_windows,
+        max_operations=max_operations,
     )
     data = dict(normalised) if isinstance(normalised, Mapping) else dict(raw)
     is_new_shape = any(key in data for key in ("source_summary", "claims", "related_pages", "contradictions", "page_operations", "review_items"))
@@ -762,20 +1165,6 @@ def coerce_step_a_plan(
         }
     else:
         allowed = {"source_summary", "claims", "entities", "related_pages", "contradictions", "page_operations", "review_items"}
-        legacy_compat = {
-            "summary_title",
-            "key_rules",
-            "api_points",
-            "test_hints",
-            "suggested_page_types",
-            "global_digest",
-            "digest_update",
-        }
-        unknown = set(data) - allowed - legacy_compat
-        if unknown:
-            raise PlanValidationError(
-                "unknown Step A fields: " + ", ".join(sorted(unknown))
-            )
         data = {key: value for key, value in data.items() if key in allowed}
         data.setdefault("source_summary", {})
         data.setdefault("claims", [])
@@ -790,10 +1179,11 @@ def coerce_step_a_plan(
         raise PlanValidationError(f"invalid Step A plan: {exc}") from exc
     return validate_step_a_plan(
         plan,
-        existing_page_keys=existing_page_keys,
-        reference_page_keys=reference_page_keys,
+        existing_page_keys=safe_existing_keys,
+        reference_page_keys=safe_reference_keys,
         source_windows=source_windows,
         source_length=source_length,
+        max_operations=max_operations,
     )
 
 

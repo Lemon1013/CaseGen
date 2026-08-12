@@ -203,15 +203,80 @@ def test_plan_drops_unknown_auxiliary_page_references():
     assert plan.review_items[0].page_key is None
 
 
-def test_plan_rejects_unknown_fields_and_partially_invalid_anchors():
-    with pytest.raises(PlanValidationError, match="unknown Step A fields"):
-        coerce_step_a_plan(
+def test_plan_ignores_unknown_model_fields():
+    plan = coerce_step_a_plan(
+        {
+            "claims": [],
+            "page_operations": [],
+            "unexpected": "provider explanation",
+        }
+    )
+    assert plan.page_operations == []
+
+
+def test_coerce_reconciles_operations_and_uses_real_window_anchors():
+    plan = coerce_step_a_plan(
+        {
+            "claims": [{"statement": "余额不足时拒绝申报"}],
+            "page_operations": [
+                {"op": "create", "page_key": "RULE.ORDER.BALANCE"},
+                {"op": "create", "page_key": "rule.order.balance"},
+                {"op": "update", "page_key": "rule.order.new-topic"},
+            ],
+        },
+        existing_page_keys={"rule.order.balance"},
+        source_windows=[
             {
-                "claims": [],
-                "page_operations": [],
-                "unexpected": "must not be ignored",
+                "index": 1,
+                "document_id": 9,
+                "chunk_ids": [71],
+                "clause_ids": ["3.5.2"],
+                "start": 0,
+                "end": 80,
             }
-        )
+        ],
+    )
+    assert [(item.op, item.page_key) for item in plan.page_operations] == [
+        ("update", "rule.order.balance"),
+        ("create", "rule.order.new-topic"),
+    ]
+    assert plan.page_operations[0].source_anchors[0].chunk_ids == [71]
+    assert plan.claims[0].source_anchors[0].document_id == 9
+
+
+def test_coerce_generates_stable_key_for_unusable_model_key():
+    raw = {
+        "page_operations": [
+            {
+                "op": "create",
+                "page_key": "../不安全路径",
+                "page_type": "rule",
+                "reason": "余额校验规则",
+            }
+        ]
+    }
+    kwargs = {
+        "source_windows": [{"document_id": 1, "chunk_ids": [7], "start": 0, "end": 20}]
+    }
+    first = coerce_step_a_plan(raw, **kwargs)
+    second = coerce_step_a_plan(raw, **kwargs)
+    assert first.page_operations[0].page_key == second.page_operations[0].page_key
+    assert first.page_operations[0].page_key.startswith("rule.generated-")
+
+
+def test_auxiliary_shape_errors_are_non_fatal():
+    plan = coerce_step_a_plan(
+        {
+            "source_summary": "一份规则摘要",
+            "related_pages": [
+                {"page_key": "rule.order.limit", "score": "not-a-number"}
+            ],
+        },
+        existing_page_keys=["rule.order.limit"],
+    )
+
+    assert plan.source_summary.summary == "一份规则摘要"
+    assert plan.related_pages[0].score is None
 
 
 def test_anchor_drops_unverified_clause_when_chunk_is_valid():
