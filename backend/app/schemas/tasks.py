@@ -116,6 +116,7 @@ class TestCaseOut(BaseModel):
     revision: int
     source_task_id: Optional[int] = None
     source_draft_id: Optional[int] = None
+    source_draft_version: Optional[int] = None
     archived_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime

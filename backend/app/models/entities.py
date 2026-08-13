@@ -399,11 +399,11 @@ class TestCase(SQLModel, table=True):
 class TestCaseOperationLog(SQLModel, table=True):
     """Non-reversible audit metadata for import, edit and lifecycle actions.
 
-    Older local databases may still have ``before_content_md``/
-    ``after_content_md``/``diff_*`` columns.  They are intentionally not
-    mapped here and the application never writes or returns them.  New rows
-    contain only hashes, lengths, line counts and field names, so an operation
-    log cannot be used to reconstruct an earlier case body.
+    Older local databases may still have required ``diff_text``/``diff_json``
+    columns.  They remain mapped only so inserts can provide irreversible
+    empty placeholders; the application never stores or returns body/diff
+    content in them.  New rows contain only hashes, lengths, line counts and
+    field names, so an operation log cannot reconstruct an earlier case body.
     """
 
     __tablename__ = "test_case_operation_logs"
@@ -411,6 +411,10 @@ class TestCaseOperationLog(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     test_case_id: int = Field(foreign_key="test_cases.id", index=True)
     operation: str = Field(index=True)
+    # Compatibility-only columns for the pre-release SQLite schema.  Always
+    # empty: keeping the NOT NULL contract must not reintroduce case history.
+    diff_text: str = ""
+    diff_json: str = "{}"
     changed_fields_json: str = "[]"
     before_hash: Optional[str] = None
     after_hash: Optional[str] = None

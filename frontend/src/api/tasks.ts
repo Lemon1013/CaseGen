@@ -75,6 +75,16 @@ export interface TaskEvent {
   wiki_space_name?: string
 }
 
+export interface TaskStreamPayload {
+  status?: string
+  message?: string
+  text?: string
+  delta?: string
+  sequence?: number
+  terminal?: 'completed' | 'failed' | null
+  attempt?: number
+}
+
 export interface PromptRevision {
   id: number
   task_id: number
@@ -117,6 +127,10 @@ export function listTasks() {
 
 export function getTask(id: number) {
   return api<TaskItem>(`/api/tasks/${id}`)
+}
+
+export function taskStreamUrl(id: number) {
+  return `/api/tasks/${id}/stream`
 }
 
 export function deleteTask(id: number) {

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import json
-from typing import List, Optional
+import time
+from typing import AsyncIterator, List, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from sqlmodel import Session, col, select
 
-from app.db import get_session
+from app.db import get_engine, get_session
 from app.models.entities import (
     CaseDraft,
     GenerationTask,
@@ -41,6 +44,7 @@ from app.services.task_jobs import (
     job_regenerate,
     job_review,
 )
+from app.services.task_locks import task_locks
 from app.services.task_pipeline import (
     apply_prompt,
     finalize_task,
@@ -50,6 +54,7 @@ from app.services.task_pipeline import (
     run_review,
 )
 from app.services.task_state import InvalidTransition, transition
+from app.services.task_stream import encode_sse, task_stream
 from app.services.wiki_spaces import resolve_space, resolve_space_id
 
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
@@ -64,6 +69,36 @@ _OPTIMIZE_CHAT_FN = None
 _BUSY = frozenset(
     {"retrieving", "generating", "reviewing", "optimizing", "regenerating"}
 )
+_STREAM_ACTIVE_STATUSES = frozenset({"retrieving", "generating", "regenerating"})
+_STREAM_TERMINAL_STATUSES = frozenset({"generated", "reviewed", "finalized", "failed"})
+_STREAM_HEARTBEAT_SEC = 15.0
+_STREAM_POLL_INTERVAL_SEC = 0.2
+
+
+def _stream_terminal_for_status(status: str) -> str | None:
+    if status == "failed":
+        return "failed"
+    if status in {"generated", "reviewed", "finalized"}:
+        return "completed"
+    return None
+
+
+def _load_stream_task_status(task_id: int) -> str:
+    """Load only durable stream eligibility and close the DB session eagerly."""
+    with Session(get_engine()) as session:
+        task = session.get(GenerationTask, task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="Task not found")
+        return task.status
+
+
+def _start_live_generate_stream(task: GenerationTask, message: str) -> None:
+    """Create the live preview before the background task begins running."""
+    task_stream.start(
+        int(task.id or 0),
+        status=task.status,
+        message=message,
+    )
 
 
 def _chat_for(stage: str = "generate"):
@@ -265,9 +300,14 @@ def create_task(
     session.add(task)
     session.commit()
     session.refresh(task)
+    # SQLite may reuse an integer id after deletion. Clear retained state so a
+    # new task cannot inherit old preview text; draft-only tasks allocate no
+    # broker capacity until generation actually starts.
+    task_stream.discard(int(task.id or 0))
 
     if body.run_generate:
         if _force_sync("generate", wait):
+            _start_live_generate_stream(task, "开始生成测试用例")
             run_generate(session, task.id, chat_fn=_chat_for("generate"))
             session.refresh(task)
             if body.auto_review and task.status == "generated":
@@ -277,6 +317,7 @@ def create_task(
             task = _begin_status(
                 session, task, "retrieving", "retrieve", "任务已创建，后台开始检索/生成"
             )
+            _start_live_generate_stream(task, "后台开始检索/生成")
             background_tasks.add_task(
                 job_generate, task.id, bool(body.auto_review)
             )
@@ -288,6 +329,115 @@ def create_task(
 def list_tasks(session: Session = Depends(get_session)) -> list[TaskOut]:
     rows = session.exec(select(GenerationTask).order_by(col(GenerationTask.id).desc())).all()
     return [to_task_out(session, r) for r in rows]
+
+
+@router.get("/{task_id}/stream")
+def stream_task(task_id: int) -> StreamingResponse:
+    """Subscribe to the live generation preview for one task.
+
+    The first event is always a complete snapshot, so reconnecting clients can
+    safely replace their local preview rather than depend on retained deltas.
+    """
+    task_status = _load_stream_task_status(task_id)
+    if task_status not in _STREAM_ACTIVE_STATUSES | _STREAM_TERMINAL_STATUSES:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Task status {task_status!r} has no active generation stream",
+        )
+
+    durable_terminal = _stream_terminal_for_status(task_status)
+    snapshot = task_stream.snapshot(task_id)
+    if snapshot is None and task_status in _STREAM_ACTIVE_STATUSES:
+        # After process restart/LRU eviction there is no local producer state
+        # to follow. Do not manufacture a stream that can only heartbeat;
+        # polling the durable task status remains authoritative.
+        raise HTTPException(
+            status_code=409,
+            detail="Live generation stream unavailable; use task polling",
+        )
+    if snapshot is None:
+        task_stream.ensure(task_id, status=task_status, terminal=durable_terminal)
+        snapshot = task_stream.snapshot(task_id)
+    # ``ensure`` above creates the state unless it is already live, but keep a
+    # defensively complete snapshot if a broker implementation ever evicts it
+    # between those two operations.
+    if snapshot is None:
+        snapshot = {
+            "stream_id": 0,
+            "sequence": 0,
+            "status": task_status,
+            "text": "",
+            "terminal": durable_terminal,
+            "truncated": False,
+        }
+    if durable_terminal is not None and snapshot.get("terminal") is None:
+        # The durable status wins during the tiny interval after the DB commit
+        # and before the producer publishes its in-memory terminal event.
+        snapshot = {
+            **snapshot,
+            "status": task_status,
+            "terminal": durable_terminal,
+        }
+
+    async def event_stream() -> AsyncIterator[str]:
+        sequence = int(snapshot["sequence"])
+        stream_id = int(snapshot.get("stream_id") or 0)
+        next_heartbeat_at = time.monotonic() + _STREAM_HEARTBEAT_SEC
+        yield encode_sse("snapshot", snapshot, sequence=sequence)
+
+        if snapshot["terminal"] in {"completed", "failed"}:
+            return
+
+        # The snapshot is authoritative on every connection.  Starting after
+        # it avoids replaying deltas already represented by ``snapshot.text``;
+        # EventSource's Last-Event-ID is therefore naturally superseded by the
+        # snapshot when a client reconnects.
+        while True:
+            result = task_stream.poll_after(
+                task_id,
+                sequence,
+                stream_id=stream_id,
+            )
+            if result.kind == "missing":
+                # Eviction, expiry, deletion/recreation, or another lifecycle
+                # replacement. Closing lets EventSource reconnect and the UI's
+                # existing polling fallback remains authoritative.
+                return
+            if result.kind == "timeout":
+                now = time.monotonic()
+                if now >= next_heartbeat_at:
+                    yield ": keep-alive\n\n"
+                    next_heartbeat_at = now + _STREAM_HEARTBEAT_SEC
+                # Async polling avoids holding a Starlette worker thread while
+                # the model is generating. No database session remains open.
+                await asyncio.sleep(_STREAM_POLL_INTERVAL_SEC)
+                continue
+            if result.kind == "snapshot":
+                current = result.snapshot
+                if current is None:
+                    return
+                sequence = int(current["sequence"])
+                stream_id = int(current.get("stream_id") or stream_id)
+                yield encode_sse("snapshot", current, sequence=sequence)
+                if current.get("terminal") in {"completed", "failed"}:
+                    return
+                continue
+
+            for item in result.events:
+                sequence = item.sequence
+                yield encode_sse(item.event, item.payload, sequence=sequence)
+                if item.event in {"completed", "failed"}:
+                    return
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.get("/{task_id}", response_model=TaskOut)
@@ -305,6 +455,16 @@ def update_task_model(
     session: Session = Depends(get_session),
 ) -> TaskOut:
     """Change the model before an initial or failed generation attempt."""
+    with task_locks.hold(task_id):
+        session.expire_all()
+        return _update_task_model_locked(task_id, body, session)
+
+
+def _update_task_model_locked(
+    task_id: int,
+    body: TaskModelUpdate,
+    session: Session,
+) -> TaskOut:
 
     task = session.get(GenerationTask, task_id)
     if task is None:
@@ -338,11 +498,27 @@ def update_task_model(
 @router.delete("/{task_id}")
 def delete_task(task_id: int, session: Session = Depends(get_session)) -> dict:
     """Hard-delete a task and its dependent rows (drafts, reviews, events, …)."""
+    with task_locks.hold(task_id):
+        session.expire_all()
+        return _delete_task_locked(task_id, session)
+
+
+def _delete_task_locked(task_id: int, session: Session) -> dict:
     task = session.get(GenerationTask, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
+    if task.status in _BUSY:
+        # Background jobs address tasks by integer id. Prevent deletion and
+        # SQLite id reuse while a queued/running job could still act on it.
+        raise HTTPException(status_code=409, detail="Cannot delete a task while it is running")
 
     requirement_id = task.requirement_id
+    stream_snapshot = task_stream.snapshot(task_id)
+    expected_stream_id = (
+        int(stream_snapshot["stream_id"])
+        if stream_snapshot is not None
+        else None
+    )
 
     for model in (TaskCitation, CaseDraft, ReviewResult, PromptRevision, TaskEvent):
         rows = session.exec(select(model).where(model.task_id == task_id)).all()
@@ -365,6 +541,12 @@ def delete_task(task_id: int, session: Session = Depends(get_session)) -> dict:
             session.delete(req)
 
     session.commit()
+    if expected_stream_id is not None:
+        task_stream.fail_if_active(
+            task_id,
+            message="任务已删除，实时预览已关闭",
+            expected_stream_id=expected_stream_id,
+        )
     return {"ok": True, "id": task_id}
 
 
@@ -376,6 +558,25 @@ def generate_task(
     wait: bool = Query(False),
     auto_review: bool = Query(False),
 ) -> TaskOut:
+    with task_locks.hold(task_id):
+        session.expire_all()
+        return _generate_task_locked(
+            task_id,
+            background_tasks,
+            session,
+            wait=wait,
+            auto_review=auto_review,
+        )
+
+
+def _generate_task_locked(
+    task_id: int,
+    background_tasks: BackgroundTasks,
+    session: Session,
+    *,
+    wait: bool,
+    auto_review: bool,
+) -> TaskOut:
     task = session.get(GenerationTask, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
@@ -385,6 +586,7 @@ def generate_task(
         return to_task_out(session, task)
 
     if _force_sync("generate", wait):
+        _start_live_generate_stream(task, "开始生成测试用例")
         task = run_generate(session, task_id, chat_fn=_chat_for("generate"))
         if auto_review and task.status == "generated":
             task = run_review(session, task_id, chat_fn=_chat_for("review"))
@@ -392,12 +594,14 @@ def generate_task(
 
     if task.status not in ("draft", "failed", "regenerating"):
         # Preserve envelope: pipeline marks failed + error_message
+        _start_live_generate_stream(task, "开始生成测试用例")
         task = run_generate(session, task_id, chat_fn=_chat_for("generate"))
         return to_task_out(session, task)
 
     task = _begin_status(
         session, task, "retrieving", "retrieve", "后台开始检索 Wiki / 原文"
     )
+    _start_live_generate_stream(task, "后台开始检索 Wiki / 原文")
     background_tasks.add_task(job_generate, task_id, auto_review)
     return to_task_out(session, task)
 
@@ -408,6 +612,18 @@ def review_task(
     background_tasks: BackgroundTasks,
     session: Session = Depends(get_session),
     wait: bool = Query(False),
+) -> TaskOut:
+    with task_locks.hold(task_id):
+        session.expire_all()
+        return _review_task_locked(task_id, background_tasks, session, wait=wait)
+
+
+def _review_task_locked(
+    task_id: int,
+    background_tasks: BackgroundTasks,
+    session: Session,
+    *,
+    wait: bool,
 ) -> TaskOut:
     task = session.get(GenerationTask, task_id)
     if task is None:
@@ -435,6 +651,23 @@ def optimize_prompt_task(
     background_tasks: BackgroundTasks,
     session: Session = Depends(get_session),
     wait: bool = Query(False),
+) -> TaskOut:
+    with task_locks.hold(task_id):
+        session.expire_all()
+        return _optimize_prompt_task_locked(
+            task_id,
+            background_tasks,
+            session,
+            wait=wait,
+        )
+
+
+def _optimize_prompt_task_locked(
+    task_id: int,
+    background_tasks: BackgroundTasks,
+    session: Session,
+    *,
+    wait: bool,
 ) -> TaskOut:
     task = session.get(GenerationTask, task_id)
     if task is None:
@@ -464,6 +697,16 @@ def apply_prompt_task(
     body: ApplyPromptBody,
     session: Session = Depends(get_session),
 ) -> TaskOut:
+    with task_locks.hold(task_id):
+        session.expire_all()
+        return _apply_prompt_task_locked(task_id, body, session)
+
+
+def _apply_prompt_task_locked(
+    task_id: int,
+    body: ApplyPromptBody,
+    session: Session,
+) -> TaskOut:
     task = session.get(GenerationTask, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
@@ -488,6 +731,23 @@ def regenerate_task(
     session: Session = Depends(get_session),
     wait: bool = Query(False),
 ) -> TaskOut:
+    with task_locks.hold(task_id):
+        session.expire_all()
+        return _regenerate_task_locked(
+            task_id,
+            background_tasks,
+            session,
+            wait=wait,
+        )
+
+
+def _regenerate_task_locked(
+    task_id: int,
+    background_tasks: BackgroundTasks,
+    session: Session,
+    *,
+    wait: bool,
+) -> TaskOut:
     task = session.get(GenerationTask, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
@@ -496,16 +756,19 @@ def regenerate_task(
         return to_task_out(session, task)
 
     if _force_sync("generate", wait):
+        _start_live_generate_stream(task, "开始重新生成测试用例")
         task = run_regenerate(session, task_id, chat_fn=_chat_for("generate"))
         return to_task_out(session, task)
 
     if task.status not in ("generated", "reviewed", "failed"):
+        _start_live_generate_stream(task, "开始重新生成测试用例")
         task = run_regenerate(session, task_id, chat_fn=_chat_for("generate"))
         return to_task_out(session, task)
 
     task = _begin_status(
         session, task, "regenerating", "regenerate", "后台开始重新生成"
     )
+    _start_live_generate_stream(task, "后台开始重新生成")
     background_tasks.add_task(job_regenerate, task_id)
     return to_task_out(session, task)
 
@@ -515,6 +778,16 @@ def finalize_task_route(
     task_id: int,
     body: FinalizeTaskBody | None = None,
     session: Session = Depends(get_session),
+) -> TaskOut:
+    with task_locks.hold(task_id):
+        session.expire_all()
+        return _finalize_task_locked(task_id, body, session)
+
+
+def _finalize_task_locked(
+    task_id: int,
+    body: FinalizeTaskBody | None,
+    session: Session,
 ) -> TaskOut:
     task = session.get(GenerationTask, task_id)
     if task is None:

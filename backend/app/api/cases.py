@@ -14,7 +14,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, col, select
 
 from app.db import get_session
-from app.models.entities import Requirement, TestCase, TestCaseOperationLog
+from app.models.entities import CaseDraft, Requirement, TestCase, TestCaseOperationLog
 from app.schemas.tasks import (
     TestCaseCreate,
     TestCaseOperationLogOut,
@@ -40,7 +40,12 @@ def _operator(request: Request) -> str:
     return str(getattr(user, "username", None) or "system")[:128]
 
 
-def _case_out(row: TestCase) -> TestCaseOut:
+def _case_out(session: Session, row: TestCase) -> TestCaseOut:
+    source_draft = (
+        session.get(CaseDraft, row.source_draft_id)
+        if row.source_draft_id is not None
+        else None
+    )
     return TestCaseOut(
         id=int(row.id or 0),
         requirement_id=int(row.requirement_id),
@@ -53,6 +58,11 @@ def _case_out(row: TestCase) -> TestCaseOut:
         revision=int(row.revision),
         source_task_id=row.source_task_id,
         source_draft_id=row.source_draft_id,
+        source_draft_version=(
+            int(source_draft.version)
+            if source_draft is not None and source_draft.task_id == row.source_task_id
+            else None
+        ),
         archived_at=row.archived_at,
         created_at=row.created_at,
         updated_at=row.updated_at,
@@ -190,7 +200,7 @@ def list_cases(
     rows = session.exec(
         statement.order_by(col(TestCase.requirement_id).asc(), col(TestCase.case_key).asc(), col(TestCase.id).asc())
     ).all()
-    return [_case_out(row) for row in rows]
+    return [_case_out(session, row) for row in rows]
 
 
 @router.get("/export")
@@ -291,12 +301,12 @@ def create_case(
     append_case_log(session, case, "create", after=case.content_md, operator=_operator(request))
     session.commit()
     session.refresh(case)
-    return _case_out(case)
+    return _case_out(session, case)
 
 
 @router.get("/{case_id}", response_model=TestCaseOut)
 def get_case(case_id: int, session: Session = Depends(get_session)) -> TestCaseOut:
-    return _case_out(_get_case(session, case_id))
+    return _case_out(session, _get_case(session, case_id))
 
 
 @router.patch("/{case_id}", response_model=TestCaseOut)
@@ -316,7 +326,7 @@ def update_case(
     title_changed = body.title is not None and body.title != row.title
     content_changed = content is not None and content != row.content_md
     if not title_changed and not content_changed:
-        return _case_out(row)
+        return _case_out(session, row)
     if body.title is not None:
         title = body.title.strip()
         if not title:
@@ -342,7 +352,7 @@ def update_case(
     )
     session.commit()
     session.refresh(row)
-    return _case_out(row)
+    return _case_out(session, row)
 
 
 @router.get("/{case_id}/logs", response_model=List[TestCaseOperationLogOut])
@@ -398,7 +408,7 @@ def _set_archive(
     _check_revision(row, expected_revision, None)
     target = "archived" if archived else "active"
     if row.status == target:
-        return _case_out(row)
+        return _case_out(session, row)
     before = row.content_md
     row.status = target
     row.archived_at = _utcnow() if archived else None
@@ -419,7 +429,7 @@ def _set_archive(
     )
     session.commit()
     session.refresh(row)
-    return _case_out(row)
+    return _case_out(session, row)
 
 
 @router.post("/{case_id}/archive", response_model=TestCaseOut)

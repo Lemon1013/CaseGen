@@ -17,14 +17,22 @@ def _add_legacy_case_log_columns_and_row(
     """Seed one pre-release reversible audit row for migration coverage."""
 
     with sqlite3.connect(db_path) as conn:
-        conn.executescript(
-            """
-            ALTER TABLE test_case_operation_logs ADD COLUMN before_content_md TEXT;
-            ALTER TABLE test_case_operation_logs ADD COLUMN after_content_md TEXT;
-            ALTER TABLE test_case_operation_logs ADD COLUMN diff_text TEXT;
-            ALTER TABLE test_case_operation_logs ADD COLUMN diff_json TEXT;
-            """
-        )
+        existing = {
+            str(row[1])
+            for row in conn.execute(
+                'PRAGMA table_info("test_case_operation_logs")'
+            ).fetchall()
+        }
+        for name in (
+            "before_content_md",
+            "after_content_md",
+            "diff_text",
+            "diff_json",
+        ):
+            if name not in existing:
+                conn.execute(
+                    f'ALTER TABLE test_case_operation_logs ADD COLUMN "{name}" TEXT'
+                )
         conn.execute(
             """
             INSERT INTO test_case_operation_logs

@@ -50,6 +50,8 @@ def _create_model(client: TestClient) -> int:
 
 
 def test_generate_creates_draft(tmp_app_data, monkeypatch):
+    from app.services.task_stream import task_stream
+
     client = TestClient(create_app())
     _seed_wiki_page()
     mid = _create_model(client)
@@ -109,6 +111,10 @@ def test_generate_creates_draft(tmp_app_data, monkeypatch):
     assert len(drafts) == 1
     assert "用例" in drafts[0]["content_md"]
     assert drafts[0]["version"] == 1
+    snapshot = task_stream.snapshot(tid)
+    assert snapshot is not None
+    assert snapshot["terminal"] == "completed"
+    assert snapshot["text"] == drafts[0]["content_md"]
 
     citations = client.get(f"/api/tasks/{tid}/citations").json()
     assert len(citations) >= 1
@@ -146,6 +152,8 @@ def test_requirements_crud_minimal(tmp_app_data):
 
 
 def test_generate_fails_without_model(tmp_app_data, monkeypatch):
+    from app.services.task_stream import task_stream
+
     client = TestClient(create_app())
     _seed_wiki_page()
 
@@ -164,6 +172,89 @@ def test_generate_fails_without_model(tmp_app_data, monkeypatch):
     body = g.json()
     assert body["status"] == "failed"
     assert body["error_message"]
+    assert client.get(f"/api/tasks/{tid}/drafts").json() == []
+    snapshot = task_stream.snapshot(tid)
+    assert snapshot is not None
+    assert snapshot["terminal"] == "failed"
+    assert snapshot["text"] == ""
+
+
+def test_generate_discards_partial_output_when_primary_and_lean_calls_fail(
+    tmp_app_data, monkeypatch
+):
+    from app.services.llm import LLMError
+    from app.services.task_stream import task_stream
+
+    client = TestClient(create_app())
+    _seed_wiki_page()
+    mid = _create_model(client)
+    calls = {"n": 0}
+
+    def fail_after_partial(*args, **kwargs):
+        calls["n"] += 1
+        on_attempt = kwargs.get("on_attempt")
+        on_delta = kwargs.get("on_delta")
+        assert kwargs.get("stream") is True
+        if on_attempt is not None:
+            on_attempt(1, False)
+        if on_delta is not None:
+            on_delta(f"unfinished attempt {calls['n']}")
+        raise LLMError(
+            "LLM stream ended before [DONE] or a finish_reason "
+            f"(attempt {calls['n']})"
+        )
+
+    monkeypatch.setattr("app.services.task_pipeline._call_chat", fail_after_partial)
+    tid = client.post(
+        "/api/tasks",
+        json={
+            "title": "失败时不落半成品",
+            "description": "模型两次输出半成品后失败",
+            "model_id": mid,
+        },
+    ).json()["id"]
+
+    response = client.post(f"/api/tasks/{tid}/generate?wait=true")
+    assert response.status_code == 200
+    assert response.json()["status"] == "failed"
+    assert calls["n"] == 2
+    assert client.get(f"/api/tasks/{tid}/drafts").json() == []
+    snapshot = task_stream.snapshot(tid)
+    assert snapshot is not None
+    assert snapshot["terminal"] == "failed"
+    assert snapshot["text"] == ""
+
+
+def test_review_failure_does_not_replace_completed_generation_stream(
+    tmp_app_data, monkeypatch
+):
+    from app.services.llm import LLMError
+    from app.services.task_stream import task_stream
+
+    client = TestClient(create_app())
+    _seed_wiki_page()
+    mid = _create_model(client)
+    monkeypatch.setattr(
+        "app.api.tasks._GENERATE_CHAT_FN",
+        lambda **kwargs: "# 完整用例\n\n## 预期结果\n成功",
+    )
+    tid = client.post(
+        "/api/tasks",
+        json={"title": "生成后评审", "description": "验证流终态", "model_id": mid},
+    ).json()["id"]
+    generated = client.post(f"/api/tasks/{tid}/generate")
+    assert generated.json()["status"] == "generated"
+    completed = task_stream.snapshot(tid)
+    assert completed is not None
+    assert completed["terminal"] == "completed"
+
+    def failed_review(**kwargs):
+        raise LLMError("review unavailable")
+
+    monkeypatch.setattr("app.api.tasks._REVIEW_CHAT_FN", failed_review)
+    reviewed = client.post(f"/api/tasks/{tid}/review")
+    assert reviewed.json()["status"] == "failed"
+    assert task_stream.snapshot(tid) == completed
 
 
 def test_generate_lean_fallback_on_primary_llm_error(tmp_app_data, monkeypatch):

@@ -8,6 +8,7 @@ from app.models.entities import (
     TestCaseOperationLog as _TestCaseOperationLogRow,
 )
 from app.services.case_management import CaseDraftParseError, split_case_draft
+from app.api.cases import _case_out
 from app.services.task_pipeline import finalize_task
 
 
@@ -27,6 +28,65 @@ def test_split_case_draft_preserves_preamble_and_rejects_duplicate_keys():
         assert "duplicate" in str(exc)
     else:
         raise AssertionError("duplicate case keys must fail before import")
+
+
+def test_split_case_draft_accepts_model_heading_without_separator():
+    sections = split_case_draft(
+        "## TC-001 登录必填校验\n内容一\n\n## TC-002 重复提交防护\n内容二"
+    )
+    assert [item["case_key"] for item in sections] == ["TC-001", "TC-002"]
+    assert [item["title"] for item in sections] == ["登录必填校验", "重复提交防护"]
+
+
+def test_finalize_writes_empty_legacy_diff_placeholders():
+    with _session() as session:
+        requirement = Requirement(title="需求", description="描述")
+        session.add(requirement)
+        session.flush()
+        task = GenerationTask(requirement_id=requirement.id, status="generated")
+        session.add(task)
+        session.flush()
+        draft = CaseDraft(
+            task_id=task.id,
+            version=1,
+            content_md="## TC-001 登录必填校验\n内容",
+        )
+        session.add(draft)
+        session.commit()
+
+        finalize_task(session, task.id, draft.id)
+
+        log = session.exec(select(_TestCaseOperationLogRow)).one()
+        assert log.diff_text == ""
+        assert log.diff_json == "{}"
+
+
+def test_case_out_exposes_draft_version_not_database_id():
+    with _session() as session:
+        requirement = Requirement(title="需求", description="描述")
+        session.add(requirement)
+        session.flush()
+        task = GenerationTask(requirement_id=requirement.id, status="generated")
+        session.add(task)
+        session.flush()
+        draft = CaseDraft(task_id=task.id, version=2, content_md="## TC-001 登录\n内容")
+        session.add(draft)
+        session.flush()
+        case = _TestCaseRow(
+            requirement_id=requirement.id,
+            case_key="TC-001",
+            title="登录",
+            content_md="内容",
+            source_task_id=task.id,
+            source_draft_id=draft.id,
+            source_case_key="TC-001",
+        )
+        session.add(case)
+        session.commit()
+
+        response = _case_out(session, case)
+        assert response.source_draft_id == draft.id
+        assert response.source_draft_version == 2
 
 
 def test_finalize_exact_draft_is_idempotent_and_does_not_overwrite_manual_edit():

@@ -44,9 +44,11 @@ def normalize_case_key(value: str) -> str:
 
 
 # Deliberately anchored at the beginning of a line.  A heading in the body
-# such as ``### TC-001`` is not silently treated as an imported case.
+# such as ``### TC-001`` is not silently treated as an imported case.  Accept
+# both the documented ``## TC-001 - title`` form and the common model output
+# ``## TC-001 title`` so finalization does not collapse a multi-case draft.
 CASE_HEADING_RE = re.compile(
-    r"^##[ \t]+(TC-[A-Za-z0-9][A-Za-z0-9_.-]*)(?:[ \t]*(?:[-:：|])[ \t]*(.*?))?[ \t]*$",
+    r"^##[ \t]+(TC-[A-Za-z0-9][A-Za-z0-9_.-]*)(?:(?:[ \t]*(?:[-:：|])[ \t]*|[ \t]+)(.*?))?[ \t]*$",
     re.MULTILINE,
 )
 

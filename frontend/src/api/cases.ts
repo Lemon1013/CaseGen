@@ -12,6 +12,7 @@ export interface TestCaseItem {
   revision: number
   source_task_id: number | null
   source_draft_id: number | null
+  source_draft_version: number | null
   archived_at: string | null
   created_at: string
   updated_at: string

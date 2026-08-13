@@ -26,6 +26,7 @@ from app.services.review_parse import parse_review_payload
 from app.services.case_management import import_cases_from_draft, utcnow
 from app.services.task_events import append_event
 from app.services.task_state import InvalidTransition, transition
+from app.services.task_stream import task_stream
 from app.services.wiki_spaces import resolve_space_id
 
 # Optional injectable chat hooks for tests: (messages, model_cfg) -> str
@@ -726,9 +727,15 @@ def _call_chat(
     model: ModelConfig,
     messages: list[dict[str, str]],
     stage_fn: Optional[ChatFn] = None,
+    stream: bool = False,
+    on_attempt: Optional[Callable[[int, bool], None]] = None,
+    on_delta: Optional[Callable[[str], None]] = None,
+    on_retry: Optional[Callable[[int, str], None]] = None,
 ) -> str:
     fn = _resolve_chat_fn(chat_fn, stage_fn)
     if fn is not None:
+        if on_attempt is not None:
+            on_attempt(1, False)
         try:
             result = fn(messages=messages, model=model)
         except TypeError:
@@ -742,15 +749,23 @@ def _call_chat(
                     model=model.model_name,
                     messages=messages,
                 )
-        if isinstance(result, tuple):
-            return str(result[0])
-        return str(result)
+        content = str(result[0]) if isinstance(result, tuple) else str(result)
+        if stream and on_delta is not None and content:
+            # Test/injected hooks are non-streaming by design.  Publishing the
+            # completed hook result as one fragment still gives the UI a live
+            # preview without changing the existing hook contract.
+            on_delta(content)
+        return content
 
     content, _usage = chat_completion(
         base_url=model.base_url,
         api_key=model.api_key,
         model=model.model_name,
         messages=messages,
+        stream=stream,
+        on_attempt=on_attempt,
+        on_delta=on_delta,
+        on_retry=on_retry,
     )
     return content
 
@@ -903,7 +918,13 @@ def _next_draft_version(session: Session, task_id: int) -> int:
     return int(current) + 1
 
 
-def _fail_task(session: Session, task: GenerationTask, message: str) -> GenerationTask:
+def _fail_task(
+    session: Session,
+    task: GenerationTask,
+    message: str,
+    *,
+    publish_stream: bool = False,
+) -> GenerationTask:
     try:
         if task.status != "failed":
             _set_status(task, "failed")
@@ -915,6 +936,11 @@ def _fail_task(session: Session, task: GenerationTask, message: str) -> Generati
     append_event(session, task.id, "error", message)
     session.commit()
     session.refresh(task)
+    if publish_stream:
+        # This is intentionally post-commit so the SSE terminal event agrees
+        # with the durable task state. Review/optimize failures use the same
+        # helper but must not overwrite a retained generation terminal state.
+        task_stream.fail(task.id, message=message)
     return task
 
 
@@ -926,10 +952,23 @@ def run_generate(
     task = session.get(GenerationTask, task_id)
     if task is None:
         raise ValueError(f"GenerationTask id={task_id} not found")
+    stream_task_id = int(task.id or task_id)
+    existing_stream = task_stream.snapshot(stream_task_id)
+    if existing_stream is None or existing_stream.get("terminal") is not None:
+        task_stream.start(
+            stream_task_id,
+            status=task.status,
+            message="后台生成任务已启动",
+        )
 
     requirement = session.get(Requirement, task.requirement_id)
     if requirement is None:
-        return _fail_task(session, task, f"Requirement id={task.requirement_id} not found")
+        return _fail_task(
+            session,
+            task,
+            f"Requirement id={task.requirement_id} not found",
+            publish_stream=True,
+        )
 
     try:
         # Always re-retrieve: draft/failed/regenerating → retrieving
@@ -943,6 +982,12 @@ def run_generate(
             raise InvalidTransition(
                 f"Cannot start generate from status {task.status!r}"
             )
+
+        task_stream.status(
+            stream_task_id,
+            status="retrieving",
+            message="正在检索 Wiki 与原文证据",
+        )
 
         query = _build_query(requirement)
         resolved_space_id = resolve_space_id(session, task.wiki_space_id)
@@ -1026,6 +1071,11 @@ def run_generate(
         append_event(session, task.id, "generate", "开始调用 LLM 生成用例")
         session.commit()
         session.refresh(task)
+        task_stream.status(
+            stream_task_id,
+            status="generating",
+            message="正在生成测试用例",
+        )
 
         system_prompt, prompt_ref = _resolve_generate_prompt(session, task)
         model = _resolve_model(session, task)
@@ -1036,6 +1086,32 @@ def run_generate(
             system_prompt, requirement, wiki_context, source_context, index_context
         )
 
+        def publish_attempt(attempt: int, reset: bool) -> None:
+            if reset:
+                # Upstream attempts are independent.  The old partial text is
+                # deliberately discarded before the replacement attempt emits
+                # its first delta.
+                task_stream.reset(
+                    stream_task_id,
+                    status="generating",
+                    message=f"上游第 {attempt} 次尝试，已替换此前未完成输出",
+                )
+            else:
+                task_stream.notice(
+                    stream_task_id,
+                    message=f"开始接收模型输出（第 {attempt} 次尝试）",
+                )
+
+        def publish_delta(delta: str) -> None:
+            task_stream.delta(stream_task_id, delta)
+
+        def publish_retry(next_attempt: int, message: str) -> None:
+            task_stream.retry(
+                stream_task_id,
+                attempt=next_attempt,
+                message=f"模型连接重试（第 {next_attempt} 次）：{message[:300]}",
+            )
+
         used_lean_fallback = False
         try:
             content = _call_chat(
@@ -1043,6 +1119,10 @@ def run_generate(
                 model=model,
                 messages=messages,
                 stage_fn=_GENERATE_CHAT_FN,
+                stream=True,
+                on_attempt=publish_attempt,
+                on_delta=publish_delta,
+                on_retry=publish_retry,
             )
         except LLMError as primary_exc:
             # Gateway instability on long finance prompts: retry with the same
@@ -1087,11 +1167,24 @@ def run_generate(
                 },
             )
             session.commit()
+            task_stream.reset(
+                stream_task_id,
+                status="generating",
+                message="主生成失败，已清空未完成输出并切换精简上下文",
+            )
+            task_stream.notice(
+                stream_task_id,
+                message="正在使用精简上下文重新生成",
+            )
             content = _call_chat(
                 chat_fn,
                 model=model,
                 messages=lean_messages,
                 stage_fn=_GENERATE_CHAT_FN,
+                stream=True,
+                on_attempt=publish_attempt,
+                on_delta=publish_delta,
+                on_retry=publish_retry,
             )
             used_lean_fallback = True
             prompt_ref = f"{prompt_ref}|lean_fallback"
@@ -1126,14 +1219,25 @@ def run_generate(
         )
         session.commit()
         session.refresh(task)
+        task_stream.complete(
+            stream_task_id,
+            text=str(content),
+            status="generated",
+            message=f"生成完成，draft v{version}",
+        )
         return task
 
     except InvalidTransition as exc:
-        return _fail_task(session, task, str(exc))
+        return _fail_task(session, task, str(exc), publish_stream=True)
     except LLMError as exc:
-        return _fail_task(session, task, f"LLM error: {exc}")
+        return _fail_task(
+            session,
+            task,
+            f"LLM error: {exc}",
+            publish_stream=True,
+        )
     except Exception as exc:  # noqa: BLE001 — surface any pipeline failure on the task
-        return _fail_task(session, task, str(exc))
+        return _fail_task(session, task, str(exc), publish_stream=True)
 
 
 def run_review(
@@ -1420,7 +1524,7 @@ def run_regenerate(
                 f"Cannot regenerate from status {task.status!r}"
             )
     except InvalidTransition as exc:
-        return _fail_task(session, task, str(exc))
+        return _fail_task(session, task, str(exc), publish_stream=True)
 
     return run_generate(session, task_id, chat_fn=chat_fn)
 
