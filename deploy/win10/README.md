@@ -50,6 +50,7 @@ CaseGen/                     # 解压后的项目源码
 - **数据目录 `data/` 未包含**：首次启动会自动创建 `data/`（SQLite、Wiki、上传目录），
   需在「模型配置」页重新填写模型网关（base_url / model / api_key）后使用；
   上传文档后需重新「编译/摄入」到 Wiki。
+- **登录认证（默认开启）**：本版内置账号认证。首次访问会进入初始化（Setup）页面创建管理员账号，之后用该账号登录；前端新增登录 / 初始化 / 用例列表页面。若不需要认证，在 `run.bat` 的启动命令前加环境变量 `CASEGEN_AUTH_ENABLED=false` 后重启。
 - **停止服务**：在 run.bat 窗口按 `Ctrl+C` 或直接关闭窗口。
 - **修改端口**：编辑 `run.bat`，把 `--port 8000` 改成其它端口。
 - **更换 Python 版本**（如改用 3.12）：在可联网的 Windows 机器上重新下载对应版本 wheel：
@@ -64,8 +65,8 @@ CaseGen/                     # 解压后的项目源码
 
 ## 本机验证记录
 
-- 后端 pytest：`185 passed`（含 Wiki spaces）
-- 前端 `npm run build`：通过（含 WikiSpacesView）
+- 后端 pytest：`248 passed`（含认证、Wiki spaces、任务流式输出）
+- 前端 `npm run build`：通过
 - 单进程模式（后端托管 dist）：健康检查、首页、SPA 路由、静态资源、API 全部 200
-- Python 3.11.14 实机验证：`185 passed`，uvicorn 启动与静态托管正常（后端 `backend/.venv311` 与 Win10 同步）
-- 版本基线：`be11151`（含 Wiki spaces 2.0 与静态托管）
+- Python 3.11.14 实机验证通过（后端 `backend/.venv311` 与 Win10 同步）
+- 版本基线：`a4a1a18`（Wiki 弹性 + Wiki spaces + 账号认证 + 任务流式输出）
