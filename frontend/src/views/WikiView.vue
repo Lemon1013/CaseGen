@@ -503,7 +503,7 @@ watch(
   <div class="page">
     <div class="page-header">
       <div>
-        <h1 class="page-title">Wiki 浏览</h1>
+        <h1 class="page-title">知识浏览</h1>
         <p class="page-subtitle">在当前空间检索知识页与原文块，确认生成可用的业务上下文</p>
       </div>
       <div class="page-actions">

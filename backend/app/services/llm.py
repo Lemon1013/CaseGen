@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 
@@ -84,17 +84,23 @@ def _parse_chat_response(data: Any) -> tuple[str, dict[str, Any]]:
     return content, usage if isinstance(usage, dict) else {}
 
 
-def _parse_stream_response(resp: httpx.Response) -> tuple[str, dict[str, Any]]:
+def _parse_stream_response(
+    resp: httpx.Response,
+    *,
+    on_delta: Callable[[str], None] | None = None,
+) -> tuple[str, dict[str, Any]]:
     parts: list[str] = []
     usage: dict[str, Any] = {}
     reasoning_chars = 0
     finish_reason: str | None = None
+    saw_done = False
     for line in resp.iter_lines():
         line = line.strip()
         if not line or not line.startswith("data:"):
             continue
         raw = line[5:].strip()
         if raw == "[DONE]":
+            saw_done = True
             break
         try:
             event = json.loads(raw)
@@ -116,6 +122,8 @@ def _parse_stream_response(resp: httpx.Response) -> tuple[str, dict[str, Any]]:
             text = _content_text(message.get("content"))
             if text:
                 parts.append(text)
+                if on_delta is not None:
+                    on_delta(text)
             reasoning = _content_text(
                 message.get("reasoning_content") or message.get("reasoning")
             )
@@ -135,6 +143,13 @@ def _parse_stream_response(resp: httpx.Response) -> tuple[str, dict[str, Any]]:
                 f"(finish_reason={finish_reason or 'unknown'})"
             )
         raise LLMError("Empty LLM stream content")
+    if not saw_done and finish_reason is None:
+        # A clean TCP EOF is not an application-level completion signal. Some
+        # gateways truncate an SSE response without surfacing a protocol error;
+        # treating those partial tokens as complete would persist a bad draft.
+        raise _RetryableLLMError(
+            "LLM stream ended before [DONE] or a finish_reason"
+        )
     return content, usage
 
 
@@ -153,7 +168,20 @@ def chat_completion(
     max_tokens: int | None = None,
     thinking: bool | None = None,
     response_format: Mapping[str, Any] | None = None,
+    on_attempt: Callable[[int, bool], None] | None = None,
+    on_delta: Callable[[str], None] | None = None,
+    on_retry: Callable[[int, str], None] | None = None,
 ) -> tuple[str, dict[str, Any]]:
+    """Call an OpenAI-compatible chat endpoint.
+
+    ``on_attempt(attempt, reset)`` is invoked before each upstream attempt.
+    ``reset`` is true from the second attempt onward, so live consumers can
+    discard tokens that arrived before a disconnected/retryable attempt.
+    ``on_delta`` receives completed content fragments (including a single
+    fragment when a provider ignores ``stream=true`` and returns JSON), and
+    ``on_retry(next_attempt, message)`` is emitted before retry backoff.
+    Callbacks are optional; existing callers retain the same return contract.
+    """
     url = build_chat_completions_url(base_url)
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -183,6 +211,8 @@ def chat_completion(
     ) as client:
         for attempt in range(attempts):
             try:
+                if on_attempt is not None:
+                    on_attempt(attempt + 1, attempt > 0)
                 if stream:
                     with client.stream(
                         "POST",
@@ -195,9 +225,12 @@ def chat_completion(
                             raise error
                         content_type = resp.headers.get("content-type", "").lower()
                         if "text/event-stream" in content_type:
-                            return _parse_stream_response(resp)
+                            return _parse_stream_response(resp, on_delta=on_delta)
                         data = json.loads(resp.read())
-                        return _parse_chat_response(data)
+                        content, usage = _parse_chat_response(data)
+                        if on_delta is not None:
+                            on_delta(content)
+                        return content, usage
 
                 resp = client.post(url, headers=headers, json=payload)
                 error = _response_error(resp, url)
@@ -212,6 +245,8 @@ def chat_completion(
                 last_error = LLMError(f"LLM request failed ({url}): {exc}")
 
             if attempt + 1 < attempts:
+                if on_retry is not None:
+                    on_retry(attempt + 2, str(last_error or "LLM request failed"))
                 time.sleep(backoff_sec * (attempt + 1))
                 continue
             if last_error is not None:

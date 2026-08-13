@@ -1,38 +1,57 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import {
-    Collection,
-  CircleCheck,
+  Collection,
   Cpu,
+  CircleCheck,
   Document,
   EditPen,
+  FolderOpened,
   List,
   Monitor,
-    Reading,
-    FolderOpened,
+  Reading,
+  ArrowDown,
+  ArrowRight,
+  UserFilled,
+  SwitchButton,
 } from '@element-plus/icons-vue'
 import { listModels, type ModelConfig } from '../api/models'
+import { useAuthStore } from '../authStore'
 
 const route = useRoute()
+const auth = useAuthStore()
 const defaultModel = ref<ModelConfig | null>(null)
 
-const menuItems = [
-  { path: '/', label: '工作台', icon: Monitor },
-  { path: '/tasks', label: '任务列表', icon: List },
-  { path: '/documents', label: '文档管理', icon: Document },
-  { path: '/wiki', label: 'Wiki', icon: Reading },
-  { path: '/wiki/reviews', label: 'Wiki 审核', icon: CircleCheck },
-  { path: '/wiki-spaces', label: 'Wiki 空间', icon: FolderOpened },
-  { path: '/prompts', label: '提示词', icon: EditPen },
+const wikiPaths = ['/wiki', '/documents', '/wiki/reviews', '/wiki-spaces']
+
+const useCaseItems = [
+  { path: '/', label: '用例生成', icon: Monitor },
+  { path: '/tasks', label: '生成任务', icon: List },
+  { path: '/cases', label: '用例管理', icon: Collection },
+]
+
+const systemItems = [
+  { path: '/prompts', label: '提示词管理', icon: EditPen },
   { path: '/models', label: '模型配置', icon: Cpu },
 ]
+
+const wikiItems = [
+  { path: '/wiki', label: '知识浏览', icon: Reading },
+  { path: '/documents', label: '文档摄入', icon: Document },
+  { path: '/wiki/reviews', label: '变更审核', icon: CircleCheck },
+  { path: '/wiki-spaces', label: '知识空间', icon: FolderOpened },
+]
+
+const wikiExpanded = ref(false)
+
+const allMenuItems = computed(() => [...useCaseItems, ...wikiItems, ...systemItems])
 
 const pageTitle = computed(() => {
   const meta = route.meta || {}
   if (typeof meta.title === 'string' && meta.title) return meta.title
   if (route.name === 'task-detail') return '任务详情'
-  const hit = menuItems.find((m) => m.path === route.path)
+  const hit = allMenuItems.value.find((m) => m.path === route.path)
   return hit?.label || 'CaseGen'
 })
 
@@ -48,6 +67,24 @@ function isActive(path: string): boolean {
   if (path === '/wiki') return route.path === '/wiki'
   return route.path === path || route.path.startsWith(path + '/')
 }
+
+const isWikiActive = computed(() => wikiPaths.some((path) => isActive(path)))
+
+function toggleWiki() {
+  wikiExpanded.value = !wikiExpanded.value
+}
+
+watch(
+  () => route.path,
+  (path) => {
+    const isWikiRoute = wikiPaths.some((wikiPath) => {
+      if (wikiPath === '/wiki') return path === '/wiki'
+      return path === wikiPath || path.startsWith(wikiPath + '/')
+    })
+    if (isWikiRoute) wikiExpanded.value = true
+  },
+  { immediate: true },
+)
 
 async function loadDefaultModel() {
   try {
@@ -76,18 +113,69 @@ onMounted(loadDefaultModel)
       </div>
 
       <nav class="nav">
-        <router-link
-          v-for="item in menuItems"
-          :key="item.path"
-          :to="item.path"
-          class="nav-item"
-          :class="{ active: isActive(item.path) }"
-        >
-          <el-icon class="nav-icon" :size="18">
-            <component :is="item.icon" />
-          </el-icon>
-          <span>{{ item.label }}</span>
-        </router-link>
+        <section class="nav-group">
+          <div class="nav-group-title">用例中心</div>
+          <router-link
+            v-for="item in useCaseItems"
+            :key="item.path"
+            :to="item.path"
+            class="nav-item"
+            :class="{ active: isActive(item.path) }"
+          >
+            <el-icon class="nav-icon" :size="18">
+              <component :is="item.icon" />
+            </el-icon>
+            <span>{{ item.label }}</span>
+          </router-link>
+        </section>
+
+        <section class="nav-group wiki-group">
+          <button
+            type="button"
+            class="nav-group-toggle"
+            :class="{ active: isWikiActive }"
+            :aria-expanded="wikiExpanded"
+            aria-controls="wiki-submenu"
+            @click="toggleWiki"
+          >
+            <el-icon class="nav-icon" :size="18"><Reading /></el-icon>
+            <span>Wiki 知识库</span>
+            <el-icon class="nav-chevron" :size="14">
+              <ArrowDown v-if="wikiExpanded" />
+              <ArrowRight v-else />
+            </el-icon>
+          </button>
+          <div v-show="wikiExpanded" id="wiki-submenu" class="nav-submenu">
+            <router-link
+              v-for="item in wikiItems"
+              :key="item.path"
+              :to="item.path"
+              class="nav-item nav-subitem"
+              :class="{ active: isActive(item.path) }"
+            >
+              <el-icon class="nav-icon" :size="17">
+                <component :is="item.icon" />
+              </el-icon>
+              <span>{{ item.label }}</span>
+            </router-link>
+          </div>
+        </section>
+
+        <section class="nav-group">
+          <div class="nav-group-title">系统配置</div>
+          <router-link
+            v-for="item in systemItems"
+            :key="item.path"
+            :to="item.path"
+            class="nav-item"
+            :class="{ active: isActive(item.path) }"
+          >
+            <el-icon class="nav-icon" :size="18">
+              <component :is="item.icon" />
+            </el-icon>
+            <span>{{ item.label }}</span>
+          </router-link>
+        </section>
       </nav>
 
       <div class="sidebar-footer">
@@ -109,6 +197,11 @@ onMounted(loadDefaultModel)
             <span class="model-label">默认模型</span>
             <span class="model-name">{{ defaultModel.name }} · {{ defaultModel.model_name }}</span>
           </div>
+          <div v-if="auth.user" class="user-chip">
+            <el-icon><UserFilled /></el-icon>
+            <span>{{ auth.user.display_name || auth.user.username }}</span>
+          </div>
+          <el-button class="logout-button" text :icon="SwitchButton" @click="auth.signOut">退出</el-button>
         </div>
       </header>
 
@@ -180,9 +273,27 @@ onMounted(loadDefaultModel)
 .nav {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 2px;
   padding: 14px 10px;
   flex: 1;
+}
+
+.nav-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.nav-group + .nav-group {
+  margin-top: 10px;
+}
+
+.nav-group-title {
+  padding: 0 12px 3px;
+  color: rgba(255, 255, 255, 0.44);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
 }
 
 .nav-item {
@@ -197,6 +308,70 @@ onMounted(loadDefaultModel)
   font-weight: 500;
   transition: background 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
   position: relative;
+}
+
+.nav-group-toggle {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 11px 12px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--cg-text-on-dark-muted);
+  font: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
+  position: relative;
+}
+
+.nav-group-toggle:hover {
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--cg-text-on-dark);
+}
+
+.nav-group-toggle.active {
+  color: #fff;
+  background: linear-gradient(
+    90deg,
+    rgba(79, 124, 255, 0.22),
+    rgba(139, 92, 246, 0.12)
+  );
+  box-shadow: inset 0 0 0 1px rgba(79, 124, 255, 0.18);
+}
+
+.nav-group-toggle.active::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 10px;
+  bottom: 10px;
+  width: 3px;
+  border-radius: 0 3px 3px 0;
+  background: var(--cg-gradient-brand);
+}
+
+.nav-chevron {
+  margin-left: auto;
+  opacity: 0.78;
+}
+
+.nav-submenu {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 1px 0 0 18px;
+  padding-left: 8px;
+  border-left: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.nav-subitem {
+  padding: 9px 10px;
+  font-size: 13px;
 }
 
 .nav-item:hover {
@@ -318,6 +493,19 @@ onMounted(loadDefaultModel)
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.user-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--cg-text-muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.logout-button {
+  color: var(--cg-text-muted);
 }
 
 .main-content {

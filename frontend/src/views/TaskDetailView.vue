@@ -23,6 +23,7 @@ import {
   reviewTask,
   statusLabel,
   statusTagType,
+  taskStreamUrl,
   type ApplyPromptMode,
   type CaseDraft,
   type PromptRevision,
@@ -30,6 +31,7 @@ import {
   type TaskCitation,
   type TaskEvent,
   type TaskItem,
+  type TaskStreamPayload,
   updateTaskModel,
 } from '../api/tasks'
 import { listModels, type ModelConfig } from '../api/models'
@@ -54,13 +56,43 @@ const selectedRevision = ref<PromptRevision | null>(null)
 const alsoRegenerate = ref(true)
 const editedPromptContent = ref('')
 const retryModelId = ref<number | null>(null)
+const livePreviewText = ref('')
+const liveStageMessage = ref('')
+const liveStageStatus = ref('')
+const liveStreamError = ref('')
+const liveStreamConnected = ref(false)
+const liveStreamConnecting = ref(false)
 
 let pollTimer: number | null = null
+let liveStreamSource: EventSource | null = null
+let liveStreamTaskId: number | null = null
+let liveStreamReconnectTimer: number | null = null
+let liveStreamReconnectAttempts = 0
+let livePreviewDeltaBuffer = ''
+let livePreviewBufferTaskId: number | null = null
+let livePreviewFlushFrame: number | null = null
+let postGenerationConfirmTimer: number | null = null
+let postGenerationConfirmTaskId: number | null = null
+let postGenerationConfirmAttempts = 0
+let postGenerationConfirmEpoch = 0
+
+const LIVE_STREAM_STATUSES = new Set(['retrieving', 'generating', 'regenerating'])
+const LIVE_STREAM_MAX_RECONNECTS = 3
+const POST_GENERATION_CONFIRM_DELAY_MS = 400
+const POST_GENERATION_CONFIRM_ATTEMPTS = 10
 
 const taskId = computed(() => Number(route.params.id))
 
 const isBusy = computed(() =>
   task.value ? IN_PROGRESS_STATUSES.has(task.value.status) : false,
+)
+
+const isLiveGeneration = computed(() =>
+  Boolean(task.value && task.value.id === taskId.value && LIVE_STREAM_STATUSES.has(task.value.status)),
+)
+
+const showLivePreview = computed(() =>
+  Boolean(livePreviewText.value || liveStreamConnected.value || liveStreamConnecting.value),
 )
 
 const showEmptyCitationBanner = computed(() => {
@@ -81,24 +113,27 @@ const latestReview = computed(
 )
 
 const highlightFinal = computed(() => {
+  if (!task.value || task.value.status === 'finalized') return false
   const r = latestReview.value
   if (!r) return false
   return Boolean(r.payload?.ready_for_final) || r.score >= 80
 })
 
 async function loadAll() {
-  if (!taskId.value || Number.isNaN(taskId.value)) return
+  const id = taskId.value
+  if (!id || Number.isNaN(id)) return
   loading.value = true
   try {
     const [t, d, e, rev, revs, c, modelRows] = await Promise.all([
-      getTask(taskId.value),
-      listDrafts(taskId.value),
-      listEvents(taskId.value),
-      listReviews(taskId.value),
-      listRevisions(taskId.value),
-      listCitations(taskId.value),
+      getTask(id),
+      listDrafts(id),
+      listEvents(id),
+      listReviews(id),
+      listRevisions(id),
+      listCitations(id),
       listModels().catch(() => [] as ModelConfig[]),
     ])
+    if (id !== taskId.value) return
     task.value = t
     drafts.value = d
     events.value = e
@@ -112,23 +147,27 @@ async function loadAll() {
       activeDraftTab.value = String(d[0].id)
     }
   } catch (err) {
-    ElMessage.error(`加载任务失败：${(err as Error).message}`)
+    if (id === taskId.value) {
+      ElMessage.error(`加载任务失败：${(err as Error).message}`)
+    }
   } finally {
-    loading.value = false
+    if (id === taskId.value) loading.value = false
   }
 }
 
-async function refreshLight() {
-  if (!taskId.value || Number.isNaN(taskId.value)) return
+async function refreshLight(): Promise<boolean> {
+  const id = taskId.value
+  if (!id || Number.isNaN(id)) return false
   try {
     const [t, d, e, rev, revs, c] = await Promise.all([
-      getTask(taskId.value),
-      listDrafts(taskId.value),
-      listEvents(taskId.value),
-      listReviews(taskId.value),
-      listRevisions(taskId.value),
-      listCitations(taskId.value),
+      getTask(id),
+      listDrafts(id),
+      listEvents(id),
+      listReviews(id),
+      listRevisions(id),
+      listCitations(id),
     ])
+    if (id !== taskId.value) return false
     task.value = t
     drafts.value = d
     events.value = e
@@ -138,8 +177,10 @@ async function refreshLight() {
     if (d.length && !d.some((x) => String(x.id) === activeDraftTab.value)) {
       activeDraftTab.value = String(d[0].id)
     }
+    return true
   } catch {
     // keep polling; surface hard errors on manual actions
+    return false
   }
 }
 
@@ -157,6 +198,339 @@ function stopPolling() {
     clearInterval(pollTimer)
     pollTimer = null
   }
+}
+
+function cancelPostGenerationConfirmation() {
+  postGenerationConfirmEpoch += 1
+  if (postGenerationConfirmTimer != null) {
+    clearTimeout(postGenerationConfirmTimer)
+    postGenerationConfirmTimer = null
+  }
+  postGenerationConfirmTaskId = null
+  postGenerationConfirmAttempts = 0
+}
+
+function shouldStopPostGenerationConfirmation(status?: string) {
+  return ['reviewing', 'optimizing', 'reviewed', 'failed', 'finalized'].includes(status || '')
+}
+
+function startPostGenerationConfirmation(id: number) {
+  cancelPostGenerationConfirmation()
+  if (id !== taskId.value || task.value?.id !== id || shouldStopPostGenerationConfirmation(task.value.status)) {
+    return
+  }
+  const epoch = ++postGenerationConfirmEpoch
+  postGenerationConfirmTaskId = id
+
+  const confirmStatus = async () => {
+    if (
+      epoch !== postGenerationConfirmEpoch ||
+      postGenerationConfirmTaskId !== id ||
+      id !== taskId.value ||
+      task.value?.id !== id
+    ) {
+      return
+    }
+
+    await refreshLight()
+    if (
+      epoch !== postGenerationConfirmEpoch ||
+      postGenerationConfirmTaskId !== id ||
+      id !== taskId.value ||
+      task.value?.id !== id
+    ) {
+      return
+    }
+
+    const status = task.value.status
+    if (status === 'reviewing' || status === 'optimizing') {
+      startPolling()
+      cancelPostGenerationConfirmation()
+      return
+    }
+    if (['reviewed', 'failed', 'finalized'].includes(status)) {
+      cancelPostGenerationConfirmation()
+      return
+    }
+    if (postGenerationConfirmAttempts >= POST_GENERATION_CONFIRM_ATTEMPTS) {
+      cancelPostGenerationConfirmation()
+      return
+    }
+
+    postGenerationConfirmAttempts += 1
+    postGenerationConfirmTimer = window.setTimeout(() => {
+      postGenerationConfirmTimer = null
+      void confirmStatus()
+    }, POST_GENERATION_CONFIRM_DELAY_MS)
+  }
+
+  postGenerationConfirmTimer = window.setTimeout(() => {
+    postGenerationConfirmTimer = null
+    void confirmStatus()
+  }, POST_GENERATION_CONFIRM_DELAY_MS)
+}
+
+function isCurrentLiveStream(source: EventSource, id: number) {
+  return source === liveStreamSource && id === liveStreamTaskId && id === taskId.value
+}
+
+function cancelLivePreviewFlush() {
+  if (livePreviewFlushFrame != null) {
+    cancelAnimationFrame(livePreviewFlushFrame)
+    livePreviewFlushFrame = null
+  }
+  livePreviewDeltaBuffer = ''
+  livePreviewBufferTaskId = null
+}
+
+function flushLivePreviewDeltas() {
+  if (livePreviewFlushFrame != null) {
+    cancelAnimationFrame(livePreviewFlushFrame)
+    livePreviewFlushFrame = null
+  }
+  const delta = livePreviewDeltaBuffer
+  const bufferedTaskId = livePreviewBufferTaskId
+  livePreviewDeltaBuffer = ''
+  livePreviewBufferTaskId = null
+  if (
+    delta &&
+    bufferedTaskId === taskId.value &&
+    bufferedTaskId === liveStreamTaskId
+  ) {
+    livePreviewText.value += delta
+  }
+}
+
+function replaceLivePreview(text: string) {
+  cancelLivePreviewFlush()
+  livePreviewText.value = text
+}
+
+function clearLivePreview() {
+  cancelLivePreviewFlush()
+  livePreviewText.value = ''
+}
+
+function queueLivePreviewDelta(id: number, delta: string) {
+  if (!delta || id !== taskId.value || id !== liveStreamTaskId) return
+  if (livePreviewBufferTaskId !== id) {
+    cancelLivePreviewFlush()
+    livePreviewBufferTaskId = id
+  }
+  livePreviewDeltaBuffer += delta
+  if (livePreviewFlushFrame == null) {
+    livePreviewFlushFrame = requestAnimationFrame(() => {
+      livePreviewFlushFrame = null
+      flushLivePreviewDeltas()
+    })
+  }
+}
+
+function clearLiveStreamConnection(options?: {
+  clearPreview?: boolean
+  clearStage?: boolean
+  resetReconnectAttempts?: boolean
+}) {
+  if (liveStreamSource) {
+    liveStreamSource.close()
+    liveStreamSource = null
+  }
+  if (liveStreamReconnectTimer != null) {
+    clearTimeout(liveStreamReconnectTimer)
+    liveStreamReconnectTimer = null
+  }
+  liveStreamTaskId = null
+  liveStreamConnected.value = false
+  liveStreamConnecting.value = false
+  if (options?.resetReconnectAttempts !== false) {
+    liveStreamReconnectAttempts = 0
+  }
+  if (options?.clearPreview) clearLivePreview()
+  else cancelLivePreviewFlush()
+  if (options?.clearStage) {
+    liveStageMessage.value = ''
+    liveStageStatus.value = ''
+  }
+}
+
+function parseStreamPayload(event: Event): TaskStreamPayload | null {
+  try {
+    const payload = JSON.parse((event as MessageEvent<string>).data) as unknown
+    return payload && typeof payload === 'object' ? payload as TaskStreamPayload : null
+  } catch {
+    return null
+  }
+}
+
+function updateLiveStage(payload: TaskStreamPayload, fallback = '') {
+  if (payload.status) liveStageStatus.value = payload.status
+  if (payload.message) liveStageMessage.value = payload.message
+  else if (fallback) liveStageMessage.value = fallback
+}
+
+async function handleLiveStreamCompleted(
+  source: EventSource,
+  id: number,
+  payload: TaskStreamPayload,
+) {
+  if (!isCurrentLiveStream(source, id)) return
+  if (typeof payload.text === 'string') replaceLivePreview(payload.text)
+  else flushLivePreviewDeltas()
+  updateLiveStage(payload, '生成完成，正在载入正式草稿…')
+  clearLiveStreamConnection({ resetReconnectAttempts: false })
+  const refreshed = await refreshLight()
+  if (refreshed && id === taskId.value && !isLiveGeneration.value) {
+    clearLivePreview()
+    liveStageMessage.value = ''
+    liveStageStatus.value = ''
+  }
+  if (id === taskId.value && task.value?.id === id) {
+    startPostGenerationConfirmation(id)
+  }
+}
+
+async function handleLiveStreamFailed(
+  source: EventSource,
+  id: number,
+  payload: TaskStreamPayload,
+) {
+  if (!isCurrentLiveStream(source, id)) return
+  cancelPostGenerationConfirmation()
+  clearLivePreview()
+  updateLiveStage(payload, '生成失败')
+  liveStreamError.value = payload.message || task.value?.error_message || '生成失败，请稍后重试'
+  clearLiveStreamConnection({ resetReconnectAttempts: false })
+  await refreshLight()
+}
+
+function scheduleLiveStreamReconnect(id: number) {
+  if (!isLiveGeneration.value || id !== taskId.value) return
+  if (liveStreamReconnectAttempts >= LIVE_STREAM_MAX_RECONNECTS) {
+    liveStageMessage.value = '实时预览连接已断开，仍会通过自动刷新更新任务状态'
+    return
+  }
+  liveStreamReconnectAttempts += 1
+  const attempt = liveStreamReconnectAttempts
+  const delay = attempt * 1000
+  liveStageMessage.value = `实时预览连接中断，正在重连（${attempt}/${LIVE_STREAM_MAX_RECONNECTS}）…`
+  liveStreamReconnectTimer = window.setTimeout(() => {
+    liveStreamReconnectTimer = null
+    if (isLiveGeneration.value && id === taskId.value && !liveStreamSource) {
+      openLiveStream(id)
+    }
+  }, delay)
+}
+
+function openLiveStream(id: number) {
+  if (!isLiveGeneration.value || id !== taskId.value || liveStreamSource || liveStreamReconnectTimer != null) {
+    return
+  }
+  if (liveStreamTaskId !== id) {
+    liveStreamTaskId = id
+    liveStreamReconnectAttempts = 0
+  }
+  liveStreamConnecting.value = true
+  const source = new EventSource(taskStreamUrl(id))
+  liveStreamSource = source
+
+  source.onopen = () => {
+    if (!isCurrentLiveStream(source, id)) return
+    liveStreamConnecting.value = false
+    liveStreamConnected.value = true
+    if (!liveStageMessage.value) liveStageMessage.value = '已连接实时生成预览'
+  }
+
+  source.addEventListener('snapshot', (event) => {
+    if (!isCurrentLiveStream(source, id)) return
+    const payload = parseStreamPayload(event)
+    if (!payload) return
+    if (typeof payload.text === 'string') replaceLivePreview(payload.text)
+    else flushLivePreviewDeltas()
+    updateLiveStage(payload)
+    if (payload.terminal === 'completed') {
+      void handleLiveStreamCompleted(source, id, payload)
+    } else if (payload.terminal === 'failed') {
+      void handleLiveStreamFailed(source, id, payload)
+    }
+  })
+
+  source.addEventListener('status', (event) => {
+    if (!isCurrentLiveStream(source, id)) return
+    const payload = parseStreamPayload(event)
+    if (!payload) return
+    liveStreamError.value = ''
+    updateLiveStage(payload)
+  })
+
+  source.addEventListener('reset', (event) => {
+    if (!isCurrentLiveStream(source, id)) return
+    const payload = parseStreamPayload(event)
+    if (!payload) return
+    replaceLivePreview(typeof payload.text === 'string' ? payload.text : '')
+    liveStreamError.value = ''
+    updateLiveStage(payload)
+  })
+
+  source.addEventListener('delta', (event) => {
+    if (!isCurrentLiveStream(source, id)) return
+    const payload = parseStreamPayload(event)
+    if (!payload) return
+    if (typeof payload.delta === 'string') queueLivePreviewDelta(id, payload.delta)
+  })
+
+  source.addEventListener('retry', (event) => {
+    if (!isCurrentLiveStream(source, id)) return
+    const payload = parseStreamPayload(event)
+    if (!payload) return
+    updateLiveStage(payload, '模型请求正在重试…')
+  })
+
+  source.addEventListener('notice', (event) => {
+    if (!isCurrentLiveStream(source, id)) return
+    const payload = parseStreamPayload(event)
+    if (!payload) return
+    updateLiveStage(payload)
+  })
+
+  source.addEventListener('completed', (event) => {
+    const payload = parseStreamPayload(event)
+    if (payload) void handleLiveStreamCompleted(source, id, payload)
+  })
+
+  source.addEventListener('failed', (event) => {
+    const payload = parseStreamPayload(event)
+    if (payload) void handleLiveStreamFailed(source, id, payload)
+  })
+
+  source.onerror = () => {
+    if (!isCurrentLiveStream(source, id)) return
+    source.close()
+    liveStreamSource = null
+    liveStreamConnected.value = false
+    liveStreamConnecting.value = false
+    scheduleLiveStreamReconnect(id)
+  }
+}
+
+function syncLiveStream() {
+  if (!isLiveGeneration.value) {
+    const isFailed = task.value?.status === 'failed'
+    if (isFailed) {
+      clearLivePreview()
+      liveStreamError.value = task.value?.error_message || liveStreamError.value
+    } else if (task.value && !IN_PROGRESS_STATUSES.has(task.value.status)) {
+      clearLivePreview()
+      liveStageMessage.value = ''
+      liveStageStatus.value = ''
+    }
+    clearLiveStreamConnection({ resetReconnectAttempts: false })
+    return
+  }
+  if (liveStreamTaskId !== taskId.value) {
+    clearLiveStreamConnection({ clearPreview: true, clearStage: true })
+    liveStreamError.value = ''
+  }
+  openLiveStream(taskId.value)
 }
 
 async function runAction(
@@ -211,7 +585,8 @@ async function onFinalize() {
   } catch {
     return
   }
-  return runAction('终版', finalizeTask)
+  const selectedDraftId = activeDraftTab.value ? Number(activeDraftTab.value) : null
+  return runAction('终版', (id) => finalizeTask(id, selectedDraftId))
 }
 
 async function onRetryFailed() {
@@ -288,20 +663,37 @@ watch(
   () => {
     if (isBusy.value) startPolling()
     else stopPolling()
+    if (shouldStopPostGenerationConfirmation(task.value?.status)) {
+      cancelPostGenerationConfirmation()
+    }
+    syncLiveStream()
   },
+  { immediate: true },
 )
 
 watch(taskId, () => {
   activeDraftTab.value = ''
+  cancelPostGenerationConfirmation()
+  clearLiveStreamConnection({ clearPreview: true, clearStage: true })
+  liveStreamError.value = ''
+  task.value = null
+  drafts.value = []
+  events.value = []
+  reviews.value = []
+  revisions.value = []
+  citations.value = []
   void loadAll()
 })
 
 onMounted(async () => {
   await loadAll()
-  if (isBusy.value) startPolling()
 })
 
-onUnmounted(stopPolling)
+onUnmounted(() => {
+  stopPolling()
+  cancelPostGenerationConfirmation()
+  clearLiveStreamConnection({ clearPreview: true })
+})
 </script>
 
 <template>
@@ -348,11 +740,11 @@ onUnmounted(stopPolling)
     />
 
     <el-alert
-      v-if="task?.error_message"
+      v-if="task?.error_message || liveStreamError"
       type="error"
       show-icon
       :closable="false"
-      :title="task.error_message"
+      :title="task?.error_message || liveStreamError"
       style="margin-bottom: 16px"
     />
 
@@ -388,7 +780,9 @@ onUnmounted(stopPolling)
         <el-tag type="success" effect="dark">已终版（只读）</el-tag>
       </template>
       <template v-else-if="isBusy">
-        <el-tag type="warning" effect="light">处理中，每 2 秒自动刷新…</el-tag>
+        <el-tag type="warning" effect="light">
+          {{ liveStageStatus ? `${statusLabel(liveStageStatus)} · ` : '' }}{{ liveStageMessage || '处理中，每 2 秒自动刷新…' }}
+        </el-tag>
       </template>
 
       <el-button
@@ -427,6 +821,20 @@ onUnmounted(stopPolling)
           </div>
         </el-card>
 
+        <el-card v-if="showLivePreview" shadow="never" class="block live-preview-card">
+          <template #header>
+            <div class="card-head">
+              <span>实时生成预览（未完成）</span>
+              <el-tag type="warning" size="small" effect="plain">实时输出</el-tag>
+            </div>
+          </template>
+          <div v-if="liveStageMessage" class="live-preview-status">
+            {{ liveStageStatus ? `${statusLabel(liveStageStatus)} · ` : '' }}{{ liveStageMessage }}
+          </div>
+          <MarkdownView v-if="livePreviewText" :content="livePreviewText" />
+          <el-empty v-else description="正在等待模型输出…" :image-size="56" />
+        </el-card>
+
         <el-card shadow="never" class="block">
           <template #header>草稿</template>
           <el-tabs v-if="drafts.length" v-model="activeDraftTab">
@@ -439,6 +847,15 @@ onUnmounted(stopPolling)
               <div class="draft-meta">
                 {{ formatTime(d.created_at) }}
                 <span v-if="d.prompt_version_ref"> · {{ d.prompt_version_ref }}</span>
+                <el-tag
+                  v-if="task?.finalized_draft_id === d.id"
+                  type="success"
+                  size="small"
+                  effect="plain"
+                  style="margin-left: 8px"
+                >
+                  已定稿并导入
+                </el-tag>
               </div>
               <MarkdownView :content="d.content_md" />
             </el-tab-pane>
@@ -586,6 +1003,19 @@ onUnmounted(stopPolling)
   margin-bottom: 12px;
   padding-bottom: 10px;
   border-bottom: 1px solid var(--cg-border);
+}
+
+.live-preview-card {
+  border-color: rgba(230, 162, 60, 0.45) !important;
+}
+
+.live-preview-status {
+  margin-bottom: 14px;
+  padding: 8px 10px;
+  border-radius: var(--cg-radius-sm);
+  color: var(--cg-text-secondary);
+  font-size: 13px;
+  background: var(--cg-surface-muted);
 }
 
 .tags {

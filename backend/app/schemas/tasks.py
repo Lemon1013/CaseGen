@@ -5,10 +5,11 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class TaskCreate(BaseModel):
-    """Create a generation task with an inline requirement."""
+    """Create a task from an inline requirement or an existing requirement."""
 
-    title: str
-    description: str
+    requirement_id: Optional[int] = Field(default=None, ge=1)
+    title: Optional[str] = None
+    description: Optional[str] = None
     focus_tags: List[str] = Field(default_factory=list)
     model_id: Optional[int] = None
     prompt_template_id: Optional[int] = None
@@ -49,6 +50,10 @@ class TaskOut(BaseModel):
     latest_draft_snippet: Optional[str] = None
     latest_draft_version: Optional[int] = None
     latest_review: Optional[ReviewResultOut] = None
+    finalized_draft_id: Optional[int] = None
+    finalized_at: Optional[datetime] = None
+    imported_case_ids: List[int] = Field(default_factory=list)
+    imported_case_count: int = 0
     created_at: datetime
     updated_at: datetime
 
@@ -81,6 +86,81 @@ class CaseDraftOut(BaseModel):
     content_md: str
     prompt_version_ref: Optional[str] = None
     created_at: datetime
+
+
+class FinalizeTaskBody(BaseModel):
+    """Optional exact draft selection for finalization.
+
+    The body is optional at the route level for compatibility with the legacy
+    empty POST; when omitted the latest draft is selected.
+    """
+
+    draft_id: Optional[int] = Field(default=None, ge=1)
+
+
+class TestCaseOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    requirement_id: int
+    case_key: str
+    # ``source_case_key`` is retained as a first-class response field because
+    # import identity must remain visible even after a manual edit.
+    source_case_key: Optional[str] = None
+    title: str = ""
+    content_md: str
+    # A small compatibility alias for clients that call the editable body
+    # simply ``content``.
+    content: Optional[str] = None
+    status: str
+    revision: int
+    source_task_id: Optional[int] = None
+    source_draft_id: Optional[int] = None
+    source_draft_version: Optional[int] = None
+    archived_at: Optional[datetime] = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class TestCaseUpdate(BaseModel):
+    title: Optional[str] = None
+    content_md: Optional[str] = None
+    content: Optional[str] = None
+    expected_revision: Optional[int] = Field(default=None, ge=1)
+    revision: Optional[int] = Field(default=None, ge=1)
+    expected_updated_at: Optional[datetime] = None
+    reason: Optional[str] = None
+
+
+class TestCaseOperationLogOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    test_case_id: int
+    operation: str
+    changed_fields: List[str] = Field(default_factory=list)
+    before_hash: Optional[str] = None
+    after_hash: Optional[str] = None
+    before_length: Optional[int] = None
+    after_length: Optional[int] = None
+    added_lines: int = 0
+    deleted_lines: int = 0
+    title_changed: bool = False
+    diff_summary: str = ""
+    reason: Optional[str] = None
+    operator: Optional[str] = None
+    source_task_id: Optional[int] = None
+    source_draft_id: Optional[int] = None
+    source_case_key: Optional[str] = None
+    created_at: datetime
+
+
+class TestCaseCreate(BaseModel):
+    requirement_id: int = Field(ge=1)
+    case_key: str = Field(min_length=1)
+    title: Optional[str] = None
+    content_md: Optional[str] = None
+    content: Optional[str] = None
 
 
 class TaskEventOut(BaseModel):

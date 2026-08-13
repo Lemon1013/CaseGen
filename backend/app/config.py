@@ -43,6 +43,33 @@ FINAL_SCORE_THRESHOLD = int(os.getenv("FINAL_SCORE_THRESHOLD", "80"))
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 ALLOWED_EXTENSIONS = {".md", ".txt", ".pdf", ".docx"}
 
+# Authentication is enabled by default in production.  The test suite may
+# explicitly disable it through its fixture for legacy pipeline tests; no
+# production code path defaults to that compatibility mode.
+AUTH_ENABLED = os.getenv("CASEGEN_AUTH_ENABLED", "true").strip().lower() in {
+    "1", "true", "yes", "on"
+}
+AUTH_COOKIE_NAME = os.getenv("CASEGEN_AUTH_COOKIE_NAME", "casegen_session")
+AUTH_CSRF_COOKIE_NAME = os.getenv("CASEGEN_AUTH_CSRF_COOKIE_NAME", "casegen_csrf")
+AUTH_SESSION_DAYS = max(1, int(os.getenv("CASEGEN_AUTH_SESSION_DAYS", "7")))
+AUTH_MAX_SESSIONS_PER_USER = max(1, int(os.getenv("CASEGEN_AUTH_MAX_SESSIONS", "8")))
+_cookie_secure_raw = os.getenv("CASEGEN_AUTH_COOKIE_SECURE", "auto").strip().lower()
+AUTH_COOKIE_SECURE: bool | None = (
+    None
+    if _cookie_secure_raw in {"", "auto", "inherit"}
+    else _cookie_secure_raw in {"1", "true", "yes", "on"}
+)
+_cors_origins_raw = os.getenv(
+    "CASEGEN_CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"
+)
+# Never pass ``*`` to credentialed CORS.  A wildcard in an operator-provided
+# env var is ignored; same-origin requests remain allowed by the middleware.
+CORS_ORIGINS = [
+    origin.strip().rstrip("/")
+    for origin in _cors_origins_raw.split(",")
+    if origin.strip() and origin.strip() != "*"
+]
+
 
 def ensure_data_dirs() -> None:
     for p in (RAW_DIR, WIKI_PAGES_DIR, WIKI_SPACES_DIR, META_DIR):

@@ -277,6 +277,11 @@ class GenerationTask(SQLModel, table=True):
     prompt_template_id: Optional[int] = None
     temp_prompt_content: Optional[str] = None
     error_message: Optional[str] = None
+    # The exact draft selected for final import.  These fields were added
+    # after the original task workflow; they remain nullable so old rows and
+    # the compatibility POST /finalize contract continue to work.
+    finalized_draft_id: Optional[int] = Field(default=None, foreign_key="case_drafts.id", index=True)
+    finalized_at: Optional[datetime] = None
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow, sa_column_kwargs={"onupdate": _utcnow})
 
@@ -345,3 +350,113 @@ class TaskEvent(SQLModel, table=True):
     message: str
     detail_json: Optional[str] = None
     created_at: datetime = Field(default_factory=_utcnow)
+
+
+class TestCase(SQLModel, table=True):
+    """The current, editable state of an imported test case.
+
+    Case history/rollback intentionally is not modelled here.  Every edit is
+    instead captured as a compact :class:`TestCaseOperationLog` row while this
+    table stores only the latest content.
+    """
+
+    __tablename__ = "test_cases"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    requirement_id: int = Field(foreign_key="requirements.id", index=True)
+    case_key: str = Field(index=True)
+    title: str = ""
+    content_md: str = ""
+    status: str = Field(default="active", index=True)
+    revision: int = Field(default=1)
+    # Source references are intentionally not foreign keys: deleting a task
+    # must not cascade into already-imported current-state cases.
+    source_task_id: Optional[int] = Field(default=None, index=True)
+    source_draft_id: Optional[int] = Field(default=None, index=True)
+    source_case_key: Optional[str] = Field(default=None, index=True)
+    archived_at: Optional[datetime] = None
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow, sa_column_kwargs={"onupdate": _utcnow})
+
+    __table_args__ = (
+        Index(
+            "uq_test_cases_source_identity",
+            "source_task_id",
+            "source_draft_id",
+            "source_case_key",
+            unique=True,
+        ),
+        Index("ix_test_cases_requirement_status_key", "requirement_id", "status", "case_key"),
+        # The normalized requirement/key uniqueness index is installed by the
+        # compatibility migration after it checks legacy duplicates.  Keeping
+        # this non-unique index in metadata lets an old database start up so a
+        # diagnostic warning can be emitted instead of an opaque create_all
+        # IntegrityError.
+        Index("ix_test_cases_requirement_case_key", "requirement_id", "case_key"),
+    )
+
+
+class TestCaseOperationLog(SQLModel, table=True):
+    """Non-reversible audit metadata for import, edit and lifecycle actions.
+
+    Older local databases may still have required ``diff_text``/``diff_json``
+    columns.  They remain mapped only so inserts can provide irreversible
+    empty placeholders; the application never stores or returns body/diff
+    content in them.  New rows contain only hashes, lengths, line counts and
+    field names, so an operation log cannot reconstruct an earlier case body.
+    """
+
+    __tablename__ = "test_case_operation_logs"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    test_case_id: int = Field(foreign_key="test_cases.id", index=True)
+    operation: str = Field(index=True)
+    # Compatibility-only columns for the pre-release SQLite schema.  Always
+    # empty: keeping the NOT NULL contract must not reintroduce case history.
+    diff_text: str = ""
+    diff_json: str = "{}"
+    changed_fields_json: str = "[]"
+    before_hash: Optional[str] = None
+    after_hash: Optional[str] = None
+    before_length: Optional[int] = None
+    after_length: Optional[int] = None
+    added_lines: int = 0
+    deleted_lines: int = 0
+    title_changed: bool = False
+    diff_summary: str = ""
+    reason: Optional[str] = None
+    operator: Optional[str] = None
+    source_task_id: Optional[int] = None
+    source_draft_id: Optional[int] = None
+    source_case_key: Optional[str] = None
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+class User(SQLModel, table=True):
+    """Local CaseGen account; this release supports one initial admin."""
+
+    __tablename__ = "users"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    username: str = Field(index=True, unique=True)
+    display_name: str = ""
+    password_hash: str
+    role: str = "admin"
+    is_active: bool = True
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow, sa_column_kwargs={"onupdate": _utcnow})
+
+
+class AuthSession(SQLModel, table=True):
+    """Hashed bearer token persisted for cookie-backed browser sessions."""
+
+    __tablename__ = "auth_sessions"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: int = Field(foreign_key="users.id", index=True)
+    token_hash: str = Field(unique=True, index=True)
+    expires_at: datetime = Field(index=True)
+    last_seen_at: datetime = Field(default_factory=_utcnow)
+    created_at: datetime = Field(default_factory=_utcnow)
+    user_agent: Optional[str] = None
+    ip: Optional[str] = None
