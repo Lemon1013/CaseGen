@@ -25,6 +25,7 @@ export interface TaskItem {
   wiki_space_id: number
   wiki_space_name: string
   status: string
+  auto_review?: boolean
   model_id: number | null
   prompt_template_id: number | null
   error_message: string | null
@@ -111,6 +112,21 @@ export interface TaskCitation {
   legacy_reason?: string | null
 }
 
+export interface RetrievalCheckpoint {
+  id: number
+  task_id: number
+  attempt: number
+  version: number
+  status: string
+  query: string
+  candidate_citations: TaskCitation[]
+  selected_citation_ids: number[]
+  supplemental_text: string
+  idempotency_key: string | null
+  created_at: string
+  updated_at: string
+}
+
 export type ApplyPromptMode = 'global' | 'task_temp'
 
 export const IN_PROGRESS_STATUSES = new Set([
@@ -119,6 +135,7 @@ export const IN_PROGRESS_STATUSES = new Set([
   'reviewing',
   'optimizing',
   'regenerating',
+  'awaiting_confirmation',
 ])
 
 export function listTasks() {
@@ -205,10 +222,22 @@ export function listCitations(id: number) {
   return api<TaskCitation[]>(`/api/tasks/${id}/citations`)
 }
 
+export function getRetrievalCheckpoint(id: number) {
+  return api<RetrievalCheckpoint>(`/api/tasks/${id}/retrieval-checkpoint`)
+}
+
+export function confirmRetrievalCheckpoint(id: number, body: { selected_citation_ids: number[]; supplemental_text: string; expected_version: number; idempotency_key: string }) {
+  return api<TaskItem>(`/api/tasks/${id}/retrieval-checkpoint/confirm`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  })
+}
+
 export function statusLabel(status: string): string {
   const map: Record<string, string> = {
     draft: '草稿',
     retrieving: '检索中',
+    awaiting_confirmation: '等待确认',
     generating: '生成中',
     generated: '已生成',
     reviewing: '评审中',

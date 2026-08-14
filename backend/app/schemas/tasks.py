@@ -77,6 +77,29 @@ class TaskCitationOut(BaseModel):
     legacy_reason: Optional[str] = None
 
 
+class RetrievalCheckpointOut(BaseModel):
+    id: int
+    task_id: int
+    attempt: int
+    version: int
+    status: str
+    auto_review: bool = False
+    query: str
+    candidate_citations: List[TaskCitationOut] = Field(default_factory=list)
+    selected_citation_ids: List[int] = Field(default_factory=list)
+    supplemental_text: str = ""
+    idempotency_key: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class RetrievalCheckpointConfirm(BaseModel):
+    selected_citation_ids: List[int] = Field(default_factory=list)
+    supplemental_text: str = Field(default="", max_length=10000)
+    expected_version: int = Field(ge=1)
+    idempotency_key: str = Field(min_length=1, max_length=200)
+
+
 class CaseDraftOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

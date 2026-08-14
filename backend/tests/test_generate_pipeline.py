@@ -7,6 +7,7 @@ from sqlmodel import Session
 from app.db import get_engine, init_db
 from app.main import create_app
 from app.models.entities import WikiPageRow
+import time
 
 
 def _seed_wiki_page(title: str = "余额规则", content: str = "余额不足应拒绝下单。") -> None:
@@ -49,6 +50,35 @@ def _create_model(client: TestClient) -> int:
     return r.json()["id"]
 
 
+def _generate_with_confirmation(client: TestClient, task_id: int, *, query: str = ""):
+    """Run the retrieval gate, then confirm all candidates for legacy tests."""
+    response = client.post(f"/api/tasks/{task_id}/generate{query}")
+    assert response.status_code == 200
+    body = response.json()
+    if body.get("status") == "awaiting_confirmation":
+        checkpoint = client.get(f"/api/tasks/{task_id}/retrieval-checkpoint")
+        assert checkpoint.status_code == 200
+        payload = checkpoint.json()
+        selected = [item["id"] for item in payload["candidate_citations"]]
+        response = client.post(
+            f"/api/tasks/{task_id}/retrieval-checkpoint/confirm",
+            json={
+                "selected_citation_ids": selected,
+                "supplemental_text": "" if selected else "基于需求生成",
+                "expected_version": payload["version"],
+                "idempotency_key": f"legacy-test-{task_id}-{payload['version']}",
+            },
+        )
+        assert response.status_code == 200
+    for _ in range(80):
+        current = client.get(f"/api/tasks/{task_id}").json()
+        if current["status"] not in {"generating", "retrieving"}:
+            response = type("Response", (), {"status_code": 200, "json": lambda self: current})()
+            break
+        time.sleep(0.05)
+    return response
+
+
 def test_generate_creates_draft(tmp_app_data, monkeypatch):
     from app.services.task_stream import task_stream
 
@@ -80,6 +110,7 @@ def test_generate_creates_draft(tmp_app_data, monkeypatch):
         return fake_md
 
     monkeypatch.setattr("app.api.tasks._GENERATE_CHAT_FN", fake_chat)
+    monkeypatch.setattr("app.services.task_pipeline._GENERATE_CHAT_FN", fake_chat)
 
     r = client.post(
         "/api/tasks",
@@ -95,7 +126,7 @@ def test_generate_creates_draft(tmp_app_data, monkeypatch):
     assert body["status"] == "draft"
     tid = body["id"]
 
-    g = client.post(f"/api/tasks/{tid}/generate")
+    g = _generate_with_confirmation(client, tid)
     assert g.status_code == 200
     gen = g.json()
     assert gen["status"] == "generated"
@@ -167,7 +198,7 @@ def test_generate_fails_without_model(tmp_app_data, monkeypatch):
         json={"title": "余额不足", "description": "余额不足应失败"},
     )
     tid = r.json()["id"]
-    g = client.post(f"/api/tasks/{tid}/generate")
+    g = _generate_with_confirmation(client, tid)
     assert g.status_code == 200
     body = g.json()
     assert body["status"] == "failed"
@@ -214,7 +245,7 @@ def test_generate_discards_partial_output_when_primary_and_lean_calls_fail(
         },
     ).json()["id"]
 
-    response = client.post(f"/api/tasks/{tid}/generate?wait=true")
+    response = _generate_with_confirmation(client, tid, query="?wait=true")
     assert response.status_code == 200
     assert response.json()["status"] == "failed"
     assert calls["n"] == 2
@@ -238,11 +269,15 @@ def test_review_failure_does_not_replace_completed_generation_stream(
         "app.api.tasks._GENERATE_CHAT_FN",
         lambda **kwargs: "# 完整用例\n\n## 预期结果\n成功",
     )
+    monkeypatch.setattr(
+        "app.services.task_pipeline._GENERATE_CHAT_FN",
+        lambda **kwargs: "# 完整用例\n\n## 预期结果\n成功",
+    )
     tid = client.post(
         "/api/tasks",
         json={"title": "生成后评审", "description": "验证流终态", "model_id": mid},
     ).json()["id"]
-    generated = client.post(f"/api/tasks/{tid}/generate")
+    generated = _generate_with_confirmation(client, tid)
     assert generated.json()["status"] == "generated"
     completed = task_stream.snapshot(tid)
     assert completed is not None
@@ -291,6 +326,7 @@ def test_generate_lean_fallback_on_primary_llm_error(tmp_app_data, monkeypatch):
         )
 
     monkeypatch.setattr("app.api.tasks._GENERATE_CHAT_FN", flaky_chat)
+    monkeypatch.setattr("app.services.task_pipeline._GENERATE_CHAT_FN", flaky_chat)
 
     tid = client.post(
         "/api/tasks",
@@ -302,7 +338,7 @@ def test_generate_lean_fallback_on_primary_llm_error(tmp_app_data, monkeypatch):
         },
     ).json()["id"]
 
-    g = client.post(f"/api/tasks/{tid}/generate")
+    g = _generate_with_confirmation(client, tid)
     assert g.status_code == 200
     body = g.json()
     assert body["status"] == "generated", body

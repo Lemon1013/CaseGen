@@ -1,4 +1,5 @@
 import json
+import time
 
 from fastapi.testclient import TestClient
 from sqlmodel import Session, select
@@ -53,6 +54,29 @@ def _create_model(client: TestClient) -> int:
     )
     assert r.status_code == 200
     return r.json()["id"]
+
+
+def _generate_with_confirmation(client: TestClient, task_id: int):
+    response = client.post(f"/api/tasks/{task_id}/generate")
+    assert response.status_code == 200
+    if response.json()["status"] == "awaiting_confirmation":
+        cp = client.get(f"/api/tasks/{task_id}/retrieval-checkpoint").json()
+        response = client.post(
+            f"/api/tasks/{task_id}/retrieval-checkpoint/confirm",
+            json={
+                "selected_citation_ids": [item["id"] for item in cp["candidate_citations"]],
+                "supplemental_text": "基于确认检索结果",
+                "expected_version": cp["version"],
+                "idempotency_key": f"review-test-{task_id}-{cp['version']}",
+            },
+        )
+        assert response.status_code == 200
+    for _ in range(80):
+        current = client.get(f"/api/tasks/{task_id}").json()
+        if current["status"] not in {"retrieving", "generating"}:
+            return current
+        time.sleep(0.05)
+    return current
 
 
 def test_review_optimize_apply_regenerate_finalize(tmp_app_data, monkeypatch):
@@ -115,6 +139,10 @@ def test_review_optimize_apply_regenerate_finalize(tmp_app_data, monkeypatch):
     monkeypatch.setattr("app.api.tasks._GENERATE_CHAT_FN", fake_chat)
     monkeypatch.setattr("app.api.tasks._REVIEW_CHAT_FN", fake_chat)
     monkeypatch.setattr("app.api.tasks._OPTIMIZE_CHAT_FN", fake_chat)
+    monkeypatch.setattr("app.services.task_pipeline._PIPELINE_CHAT_FN", fake_chat)
+    monkeypatch.setattr("app.services.task_pipeline._GENERATE_CHAT_FN", fake_chat)
+    monkeypatch.setattr("app.services.task_pipeline._REVIEW_CHAT_FN", fake_chat)
+    monkeypatch.setattr("app.services.task_pipeline._OPTIMIZE_CHAT_FN", fake_chat)
 
     r = client.post(
         "/api/tasks",
@@ -128,10 +156,9 @@ def test_review_optimize_apply_regenerate_finalize(tmp_app_data, monkeypatch):
     assert r.status_code == 200
     tid = r.json()["id"]
 
-    g = client.post(f"/api/tasks/{tid}/generate")
-    assert g.status_code == 200
-    assert g.json()["status"] == "generated"
-    assert g.json()["latest_draft_version"] == 1
+    generated = _generate_with_confirmation(client, tid)
+    assert generated["status"] == "generated"
+    assert generated["latest_draft_version"] == 1
 
     rev = client.post(f"/api/tasks/{tid}/review")
     assert rev.status_code == 200
@@ -173,6 +200,18 @@ def test_review_optimize_apply_regenerate_finalize(tmp_app_data, monkeypatch):
     regen = client.post(f"/api/tasks/{tid}/regenerate")
     assert regen.status_code == 200
     regen_body = regen.json()
+    if regen_body["status"] == "awaiting_confirmation":
+        cp = client.get(f"/api/tasks/{tid}/retrieval-checkpoint").json()
+        regen = client.post(
+            f"/api/tasks/{tid}/retrieval-checkpoint/confirm",
+            json={"selected_citation_ids": [x["id"] for x in cp["candidate_citations"]], "supplemental_text": "重生成确认", "expected_version": cp["version"], "idempotency_key": f"regen-{tid}-{cp['version']}"},
+        )
+        assert regen.status_code == 200
+    for _ in range(80):
+        regen_body = client.get(f"/api/tasks/{tid}").json()
+        if regen_body["status"] not in {"retrieving", "generating"}:
+            break
+        time.sleep(0.05)
     assert regen_body["status"] == "generated"
     assert regen_body["latest_draft_version"] == 2
 
@@ -208,12 +247,13 @@ def test_finalize_from_generated(tmp_app_data, monkeypatch):
         return "# 用例：x\n- 优先级：P1\n"
 
     monkeypatch.setattr("app.api.tasks._GENERATE_CHAT_FN", fake_chat)
+    monkeypatch.setattr("app.services.task_pipeline._GENERATE_CHAT_FN", fake_chat)
 
     tid = client.post(
         "/api/tasks",
         json={"title": "t", "description": "d", "model_id": mid},
     ).json()["id"]
-    assert client.post(f"/api/tasks/{tid}/generate").json()["status"] == "generated"
+    assert _generate_with_confirmation(client, tid)["status"] == "generated"
     fin = client.post(f"/api/tasks/{tid}/finalize")
     assert fin.status_code == 200
     assert fin.json()["status"] == "finalized"

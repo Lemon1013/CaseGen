@@ -30,7 +30,7 @@ def _migrate_sqlite_columns(engine) -> None:
         try:
             cols = conn.execute(text("PRAGMA table_info(task_citations)")).fetchall()
         except Exception:  # table may not exist yet
-            return
+            cols = []
         names = {row[1] for row in cols}
         alters: list[str] = []
         if "citation_type" not in names:
@@ -55,6 +55,47 @@ def _migrate_sqlite_columns(engine) -> None:
             )
         for sql in alters:
             conn.execute(text(sql))
+
+        checkpoint_cols = conn.execute(text("PRAGMA table_info(task_retrieval_checkpoints)")).fetchall()
+        if checkpoint_cols:
+            checkpoint_names = {row[1] for row in checkpoint_cols}
+            if "auto_review" not in checkpoint_names:
+                conn.execute(text("ALTER TABLE task_retrieval_checkpoints ADD COLUMN auto_review BOOLEAN NOT NULL DEFAULT 0"))
+            if "resume_claim_token" not in checkpoint_names:
+                conn.execute(text("ALTER TABLE task_retrieval_checkpoints ADD COLUMN resume_claim_token VARCHAR"))
+            if "resume_claimed_at" not in checkpoint_names:
+                conn.execute(text("ALTER TABLE task_retrieval_checkpoints ADD COLUMN resume_claimed_at DATETIME"))
+            if "resume_started_at" not in checkpoint_names:
+                conn.execute(text("ALTER TABLE task_retrieval_checkpoints ADD COLUMN resume_started_at DATETIME"))
+            if "resume_status" not in checkpoint_names:
+                conn.execute(text("ALTER TABLE task_retrieval_checkpoints ADD COLUMN resume_status VARCHAR"))
+
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS task_retrieval_checkpoints (
+                id INTEGER PRIMARY KEY,
+                task_id INTEGER NOT NULL,
+                attempt INTEGER NOT NULL DEFAULT 1,
+                version INTEGER NOT NULL DEFAULT 1,
+                status VARCHAR NOT NULL DEFAULT 'pending',
+                auto_review BOOLEAN NOT NULL DEFAULT 0,
+                resume_claim_token VARCHAR,
+                resume_claimed_at DATETIME,
+                resume_started_at DATETIME,
+                resume_status VARCHAR,
+                query TEXT NOT NULL DEFAULT '',
+                retrieval_json TEXT NOT NULL DEFAULT '{}',
+                candidate_citation_ids_json TEXT NOT NULL DEFAULT '[]',
+                selected_citation_ids_json TEXT NOT NULL DEFAULT '[]',
+                supplemental_text TEXT NOT NULL DEFAULT '',
+                decision_hash VARCHAR,
+                idempotency_key VARCHAR,
+                created_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL,
+                FOREIGN KEY(task_id) REFERENCES generation_tasks(id)
+            )
+        """))
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_task_retrieval_checkpoint_attempt ON task_retrieval_checkpoints(task_id, attempt)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_task_retrieval_checkpoint_task_status ON task_retrieval_checkpoints(task_id, status)"))
 
 
 def _migrate_model_defaults(engine) -> None:

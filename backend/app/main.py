@@ -23,6 +23,7 @@ from app.db import get_engine, init_db
 from app.services.auth import get_user_for_token
 from app.services.prompts_seed import seed_default_prompts
 from app.services.wiki_jobs import recover_ingest_jobs
+from app.services.task_jobs import recover_generation_jobs
 
 
 def _mount_frontend_dist(app: FastAPI) -> None:
@@ -58,6 +59,7 @@ def create_app() -> FastAPI:
     # scheduler itself has one worker, so repeated app construction does not
     # create a second concurrent Wiki ingest worker.
     recover_ingest_jobs()
+    recover_generation_jobs()
 
     app = FastAPI(title="CaseGen API", version="0.1.0")
     app.add_middleware(

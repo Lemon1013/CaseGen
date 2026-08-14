@@ -49,10 +49,20 @@ def test_concurrent_generate_requests_enqueue_only_one_background_job(
     tmp_app_data, monkeypatch
 ):
     client = TestClient(create_app())
+    model = client.post(
+        "/api/models",
+        json={
+            "name": "lock-model",
+            "base_url": "https://example.test/v1",
+            "api_key": "sk-lock",
+            "model_name": "fake",
+            "is_default": True,
+        },
+    ).json()
     task_id = int(
         client.post(
             "/api/tasks",
-            json={"title": "并发生成", "description": "只允许一个后台任务"},
+            json={"title": "并发生成", "description": "只允许一个后台任务", "model_id": model["id"]},
         ).json()["id"]
     )
     monkeypatch.setattr(tasks_api, "_PIPELINE_CHAT_FN", None)
