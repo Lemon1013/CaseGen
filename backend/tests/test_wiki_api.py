@@ -1,6 +1,10 @@
 from fastapi.testclient import TestClient
+from sqlmodel import Session
 
+from app.db import get_engine
+from app.models.entities import WikiPageRow
 from app.main import create_app
+from app.services.wiki_spaces import get_default_space, space_root
 from app.api import documents as documents_api
 
 
@@ -80,3 +84,33 @@ def test_upload_ingest_list_retrieve(tmp_app_data, monkeypatch):
     assert len(payload["hits"]) >= 1
     assert payload["hits"][0]["score"] > 0
     assert "余额" in payload["hits"][0]["title"] or "余额" in payload["hits"][0]["snippet"]
+
+
+def test_wiki_index_refreshes_stale_archived_content(tmp_app_data):
+    client = TestClient(create_app())
+    with Session(get_engine()) as session:
+        default = get_default_space(session)
+        assert default is not None and default.id is not None
+        page = WikiPageRow(
+            path="pages/rules/live.md",
+            title="当前规则",
+            page_type="rule",
+            page_key="rule.current",
+            domain="trading",
+            status="published",
+            space_id=default.id,
+        )
+        session.add(page)
+        session.commit()
+        root = space_root(default)
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "index.md").write_text(
+            "# Wiki Index\n\n| archived-page | archived |\n",
+            encoding="utf-8",
+        )
+
+    response = client.get("/api/wiki/index")
+    assert response.status_code == 200
+    content = response.json()["content"]
+    assert "archived-page" not in content
+    assert "当前规则" in content

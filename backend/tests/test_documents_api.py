@@ -147,6 +147,34 @@ def test_delete_document_archives_or_detaches_wiki_sources(tmp_app_data):
     assert client.get(f"/api/documents/{first['id']}/chunks").status_code == 404
     assert client.post(f"/api/documents/{first['id']}/ingest").status_code == 404
 
+    visible_pages = client.get("/api/wiki/pages").json()
+    assert {page["page_key"] for page in visible_pages} == {"rule.delete.shared-source"}
+    historical_pages = client.get("/api/wiki/pages", params={"include_archived": "true"}).json()
+    assert {page["page_key"] for page in historical_pages} == {
+        "rule.delete.only-source",
+        "rule.delete.shared-source",
+    }
+    archived_page = next(
+        page for page in historical_pages if page["page_key"] == "rule.delete.only-source"
+    )
+    assert client.get(f"/api/wiki/pages/{archived_page['id']}").status_code == 404
+    assert client.get(
+        f"/api/wiki/pages/{archived_page['id']}",
+        params={"include_archived": "true"},
+    ).status_code == 200
+    index = client.get("/api/wiki/index").json()["content"]
+    assert "rule.delete.only-source" not in index
+    assert "共享来源规则" in index
+    retrieved = client.post(
+        "/api/wiki/retrieve",
+        json={"query": "仅来自第一份文档", "top_k": 10},
+    )
+    assert retrieved.status_code == 200
+    assert all(
+        hit.get("page_key") != "rule.delete.only-source"
+        for hit in retrieved.json()["hits"]
+    )
+
     with Session(get_engine()) as session:
         document = session.get(Document, first["id"])
         assert document is not None and document.status == "deleted"

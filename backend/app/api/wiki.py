@@ -2,11 +2,18 @@ from __future__ import annotations
 
 import json
 import difflib
+import hashlib
+import os
+import shutil
+import stat
+import tempfile
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from sqlalchemy import text
 from sqlmodel import Session, select
 
 from app import config
@@ -17,8 +24,10 @@ from app.models.entities import (
     SourceChunk,
     WikiPageRevision,
     WikiPageRow,
+    WikiPageSource,
     WikiReviewItem,
     WikiSpace,
+    User,
 )
 from app.schemas.documents import SourceChunkOut
 from app.schemas.wiki import (
@@ -41,11 +50,17 @@ from app.schemas.wiki import (
     WikiRollbackIn,
     WikiRollbackOut,
     WikiSourceEvidenceOut,
+    WikiPurgePreviewOut,
+    WikiPurgeExecuteIn,
+    WikiPurgeExecuteOut,
+    WikiPurgeSpaceOut,
+    WikiPurgeCountsOut,
 )
 from app.services.retrieve import load_all_wiki_pages, rank_pages
 from app.services.source_chunks_store import load_all_source_chunks, rank_source_chunks
 from app.services.wiki_jobs import cancel_ingest_job, retry_failed_windows
 from app.services.wiki_index import rebuild_index
+from app.services.wiki_fts import rebuild_fts
 from app.services.wiki_log import log_review, log_rollback
 from app.services.wiki_overview import rebuild_overview
 from app.services.wiki_repository import (
@@ -53,6 +68,7 @@ from app.services.wiki_repository import (
     WikiPageNotFoundError,
     WikiRepository,
     page_key_lock,
+    page_path,
 )
 from app.services.wiki_schema import WikiFrontmatter, WikiPage, WikiSource
 from app.services.wiki_titles import display_title, is_technical_title
@@ -64,6 +80,584 @@ from app.services.wiki_spaces import (
 )
 
 router = APIRouter(tags=["wiki"])
+
+_PURGE_LOCK = threading.Lock()
+_PURGE_CONFIRMATION_PREFIX = "PURGE_ARCHIVED_WIKI"
+_OS_OPEN = os.open
+_OS_UNLINK = os.unlink
+_OS_RENAME = os.rename
+
+
+def _require_admin(request: Request) -> None:
+    # The test suite disables auth for legacy endpoints.  In production, the
+    # middleware always supplies request.state.user before this boundary.
+    if not config.AUTH_ENABLED:
+        raise HTTPException(status_code=503, detail="Administrator purge is unavailable while authentication is disabled")
+    user = getattr(request.state, "user", None)
+    if user is None or not bool(getattr(user, "is_active", False)) or getattr(user, "role", "") != "admin":
+        raise HTTPException(status_code=403, detail="Administrator access required")
+
+
+def _lexical_path(value: Path) -> Path:
+    """Normalize a path without resolving symlinks."""
+    return Path(os.path.abspath(os.fspath(value)))
+
+
+def _relative_identifier(path: Path, *, row_id: int | None = None) -> str:
+    root = _lexical_path(Path(config.WIKI_DIR))
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        return f"page:{row_id or 'unknown'}"
+
+
+def _canonical_purge_path(space: WikiSpace, row: WikiPageRow) -> Path | None:
+    if not row.page_key:
+        return None
+    try:
+        relative = page_path(row.page_type, row.page_key, space_slug=space.slug).relative_to(
+            _lexical_path(Path(config.WIKI_DIR))
+        )
+    except (TypeError, ValueError):
+        return None
+    return _lexical_path(Path(config.WIKI_DIR) / relative)
+
+
+def _legacy_owned_path(space: WikiSpace, candidate: Path) -> bool:
+    """Whether a non-canonical legacy path is provably owned by a space."""
+    root = _lexical_path(Path(config.WIKI_DIR))
+    try:
+        relative = candidate.relative_to(root)
+    except ValueError:
+        return False
+    # A row may only own a Markdown file below its space's pages subtree.  In
+    # particular, never treat the space root (index/overview/log) or sibling
+    # generated files as page-owned legacy content.
+    space_prefix = Path("spaces") / str(space.slug) / "pages"
+    if (
+        len(relative.parts) >= 2
+        and relative.parts[:3] == space_prefix.parts
+        and relative.name not in {"index.md", "overview.md", "log.md"}
+    ):
+        return True
+    # Pre-space rows used wiki/pages/<name>.md and are compatible only with
+    # the default space.  The old type directories are deliberately not
+    # accepted: they can contain indexes and other space-level artifacts.
+    return (
+        str(space.slug) == "default"
+        and len(relative.parts) >= 2
+        and relative.parts[0] == "pages"
+        and relative.name not in {"index.md", "overview.md", "log.md"}
+    )
+
+
+def _row_purge_path(space: WikiSpace, row: WikiPageRow) -> tuple[Path, str | None, str | None]:
+    """Return an owned, lexical path and a display identifier.
+
+    ``row.path`` is authoritative for legacy rows.  For keyed rows a path
+    mismatch is unsafe rather than silently deleting the generated canonical
+    file.  No ``resolve()`` or ``exists()`` call is used before lstat: either
+    operation can follow an attacker-controlled symlink.
+    """
+    raw = Path(str(row.path or ""))
+    candidate = _lexical_path(raw if raw.is_absolute() else Path(config.WIKI_DIR) / raw)
+    canonical = _canonical_purge_path(space, row)
+    if canonical is not None and candidate != canonical and not _legacy_owned_path(space, candidate):
+        return candidate, "row.path does not match canonical page path", _relative_identifier(candidate, row_id=row.id)
+    root = _lexical_path(Path(config.WIKI_DIR))
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        return candidate, "path escapes configured Wiki root", _relative_identifier(candidate, row_id=row.id)
+
+    # The authoritative check happens through the dir_fd/openat abstraction
+    # below.  Keep this lexical check only for a useful preview diagnostic;
+    # it never supplies the descriptor used by execute.
+    parent_fd = None
+    try:
+        parent_fd = _open_secure_parent(candidate)
+    except FileNotFoundError:
+        pass
+    except _PurgeUnsafeError as exc:
+        return candidate, str(exc), _relative_identifier(candidate, row_id=row.id)
+    except OSError as exc:
+        return candidate, f"cannot inspect path: {exc}", _relative_identifier(candidate, row_id=row.id)
+    finally:
+        if parent_fd is not None:
+            os.close(parent_fd)
+    return candidate, None, _relative_identifier(candidate, row_id=row.id)
+
+
+def _safe_purge_path(path: Path) -> tuple[Path, str | None]:
+    """Compatibility wrapper used by callers outside the snapshot builder."""
+    candidate = _lexical_path(path)
+    root = _lexical_path(Path(config.WIKI_DIR))
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        return candidate, "path escapes configured Wiki root"
+    parent_fd = None
+    try:
+        parent_fd = _open_secure_parent(candidate)
+    except FileNotFoundError:
+        return candidate, None
+    except _PurgeUnsafeError as exc:
+        return candidate, str(exc)
+    except OSError as exc:
+        return candidate, f"cannot inspect path: {exc}"
+    finally:
+        if parent_fd is not None:
+            os.close(parent_fd)
+    return candidate, None
+
+
+class _PurgeUnsafeError(OSError):
+    """A Wiki path failed the no-follow, directory-fd safety boundary."""
+
+
+class _PurgeStaleError(OSError):
+    """A file changed after the preview/backup fingerprint."""
+
+
+def _purge_dirfd_supported() -> bool:
+    # Keep capability detection stable if a caller monkeypatches an operation
+    # for failure injection; the actual operation below still uses os.unlink.
+    required = (_OS_OPEN, _OS_UNLINK, _OS_RENAME)
+    return (
+        all(operation in os.supports_dir_fd for operation in required)
+        and hasattr(os, "O_DIRECTORY")
+        and hasattr(os, "O_NOFOLLOW")
+    )
+
+
+def _secure_relative_parts(path: Path) -> tuple[Path, tuple[str, ...]]:
+    root = _lexical_path(Path(config.WIKI_DIR))
+    candidate = _lexical_path(path)
+    try:
+        relative = candidate.relative_to(root)
+    except ValueError as exc:
+        raise _PurgeUnsafeError("path escapes configured Wiki root") from exc
+    if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
+        raise _PurgeUnsafeError("invalid Wiki path")
+    return root, relative.parts
+
+
+def _open_secure_parent(path: Path) -> int:
+    """Open the candidate's parent by walking trusted dirfds, never paths."""
+    if not _purge_dirfd_supported():
+        raise _PurgeUnsafeError("secure Wiki purge is unsupported on this platform")
+    root, parts = _secure_relative_parts(path)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        fd = os.open(root, flags)
+    except OSError as exc:
+        if exc.errno in {getattr(os, "ELOOP", 40), getattr(os, "ENOTDIR", 20)}:
+            raise _PurgeUnsafeError("Wiki path contains a symlink or non-directory") from exc
+        raise
+    try:
+        for component in parts[:-1]:
+            try:
+                next_fd = os.open(component, flags, dir_fd=fd)
+            except OSError as exc:
+                if exc.errno in {getattr(os, "ELOOP", 40), getattr(os, "ENOTDIR", 20)}:
+                    raise _PurgeUnsafeError("Wiki path contains a symlink or non-directory") from exc
+                raise
+            os.close(fd)
+            fd = next_fd
+        return fd
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+
+
+def _fingerprint_fd(fd: int) -> dict[str, Any]:
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode):
+        return {"state": "unsafe", "mode": int(info.st_mode)}
+    digest = hashlib.sha256()
+    os.lseek(fd, 0, os.SEEK_SET)
+    while True:
+        chunk = os.read(fd, 1024 * 1024)
+        if not chunk:
+            break
+        digest.update(chunk)
+    return {
+        "state": "file",
+        "dev": int(info.st_dev),
+        "ino": int(info.st_ino),
+        "size": int(info.st_size),
+        "mtime_ns": int(info.st_mtime_ns),
+        "digest": digest.hexdigest(),
+    }
+
+
+def _open_secure_file(path: Path) -> tuple[int, int, str]:
+    parent_fd = _open_secure_parent(path)
+    _root, parts = _secure_relative_parts(path)
+    name = parts[-1]
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
+    except OSError as exc:
+        os.close(parent_fd)
+        if exc.errno in {getattr(os, "ELOOP", 40), getattr(os, "ENOTDIR", 20)}:
+            raise _PurgeUnsafeError("Wiki path contains a symlink or non-regular file") from exc
+        raise
+    return fd, parent_fd, name
+
+
+def _path_fingerprint(path: Path) -> dict[str, Any]:
+    try:
+        fd, parent_fd, _name = _open_secure_file(path)
+    except FileNotFoundError:
+        return {"state": "missing"}
+    except _PurgeUnsafeError as exc:
+        return {"state": "unsafe", "error": str(exc)}
+    try:
+        return _fingerprint_fd(fd)
+    finally:
+        os.close(fd)
+        os.close(parent_fd)
+
+
+def _backup_file(path: Path, backup_root: Path) -> Path | None:
+    """Copy one regular file through a fixed parent directory descriptor."""
+    fd = parent_fd = None
+    try:
+        try:
+            fd, parent_fd, _name = _open_secure_file(path)
+        except FileNotFoundError:
+            return None
+        rel = _secure_relative_parts(path)[1]
+        target = backup_root / Path(*rel)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with os.fdopen(fd, "rb", closefd=False) as source, target.open("wb") as destination:
+            shutil.copyfileobj(source, destination)
+        return target
+    except FileNotFoundError:
+        return None
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if parent_fd is not None:
+            try:
+                os.close(parent_fd)
+            except OSError:
+                pass
+
+
+def _restore_backups(backups: list[tuple[Path, Path]]) -> list[str]:
+    failures: list[str] = []
+    for original, backup in backups:
+        parent_fd = None
+        try:
+            parent_fd = _open_secure_parent(original)
+            _root, parts = _secure_relative_parts(original)
+            os.rename(os.fspath(backup), parts[-1], dst_dir_fd=parent_fd)
+        except FileNotFoundError:
+            failures.append(f"{original}: backup or destination parent is missing")
+        except _PurgeUnsafeError as exc:
+            failures.append(f"{original}: {exc}")
+        except Exception as exc:
+            failures.append(f"{original}: {exc}")
+        finally:
+            if parent_fd is not None:
+                try:
+                    os.close(parent_fd)
+                except OSError:
+                    pass
+    return failures
+
+
+def _unlink_secure_file(path: Path, expected: dict[str, Any]) -> None:
+    """Verify and unlink using one fixed parent descriptor."""
+    fd = parent_fd = None
+    try:
+        fd, parent_fd, name = _open_secure_file(path)
+        actual = _fingerprint_fd(fd)
+        if actual != expected:
+            raise _PurgeStaleError("path changed after backup")
+        os.unlink(name, dir_fd=parent_fd)
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if parent_fd is not None:
+            try:
+                os.close(parent_fd)
+            except OSError:
+                pass
+
+
+def _stable_datetime(value: Any) -> str | None:
+    return value.isoformat() if hasattr(value, "isoformat") else (str(value) if value is not None else None)
+
+
+def _child_plan_records(
+    revisions: list[WikiPageRevision],
+    sources: list[WikiPageSource],
+    reviews: list[WikiReviewItem],
+    page_id: int,
+) -> dict[str, list[dict[str, Any]]]:
+    """Return deterministic child content, not only database identifiers."""
+    return {
+        "revisions": [
+            {
+                "id": int(item.id or 0), "page_id": int(item.page_id), "revision": int(item.revision),
+                "frontmatter_json": item.frontmatter_json or "", "content_md": item.content_md or "",
+                "operation": item.operation or "", "job_id": int(item.job_id) if item.job_id is not None else None,
+                "reason": item.reason or "", "created_at": _stable_datetime(item.created_at),
+            }
+            for item in sorted((item for item in revisions if item.page_id == page_id), key=lambda value: int(value.id or 0))
+        ],
+        "page_sources": [
+            {
+                "id": int(item.id or 0), "page_id": int(item.page_id), "document_id": int(item.document_id),
+                "chunk_ids_json": item.chunk_ids_json or "[]", "clauses_json": item.clauses_json or "[]",
+                "created_at": _stable_datetime(item.created_at), "updated_at": _stable_datetime(item.updated_at),
+            }
+            for item in sorted((item for item in sources if item.page_id == page_id), key=lambda value: int(value.id or 0))
+        ],
+        "reviews": [
+            {
+                "id": int(item.id or 0), "page_id": int(item.page_id) if item.page_id is not None else None,
+                "job_id": int(item.job_id) if item.job_id is not None else None,
+                "space_id": int(item.space_id) if item.space_id is not None else None,
+                "kind": item.kind or "", "status": item.status or "", "reason": item.reason or "",
+                "candidate_frontmatter_json": item.candidate_frontmatter_json,
+                "candidate_content_md": item.candidate_content_md,
+                "payload_json": item.payload_json or "{}", "reviewed_at": _stable_datetime(item.reviewed_at),
+                "reviewed_by": item.reviewed_by, "decision_reason": item.decision_reason,
+                "created_at": _stable_datetime(item.created_at), "updated_at": _stable_datetime(item.updated_at),
+            }
+            for item in sorted((item for item in reviews if item.page_id == page_id), key=lambda value: int(value.id or 0))
+        ],
+    }
+
+
+def _purge_snapshot(session: Session) -> dict[str, Any]:
+    spaces = session.exec(select(WikiSpace).order_by(WikiSpace.id)).all()
+    grouped: list[dict[str, Any]] = []
+    missing: list[str] = []
+    unsafe: list[str] = []
+    active_jobs: list[int] = []
+    all_plan: list[dict[str, Any]] = []
+    for space in spaces:
+        if space.id is None:
+            continue
+        rows = session.exec(select(WikiPageRow).where(
+            WikiPageRow.status == "archived",
+            space_scope_clause(session, WikiPageRow.space_id, int(space.id)),
+        ).order_by(WikiPageRow.id)).all()
+        page_ids = [int(row.id) for row in rows if row.id is not None]
+        revisions = session.exec(select(WikiPageRevision).where(WikiPageRevision.page_id.in_(page_ids))).all() if page_ids else []
+        sources = session.exec(select(WikiPageSource).where(WikiPageSource.page_id.in_(page_ids))).all() if page_ids else []
+        reviews = session.exec(select(WikiReviewItem).where(WikiReviewItem.page_id.in_(page_ids))).all() if page_ids else []
+        jobs = session.exec(select(IngestJob).where(
+            space_scope_clause(session, IngestJob.space_id, int(space.id)),
+            IngestJob.status.in_(["queued", "running"]),
+        )).all()
+        active_jobs.extend(int(job.id) for job in jobs if job.id is not None)
+        files = 0
+        for row in rows:
+            path, problem, identifier = _row_purge_path(space, row)
+            fingerprint = _path_fingerprint(path)
+            if problem:
+                unsafe.append(f"{row.id}:{problem}")
+            elif fingerprint["state"] == "file":
+                files += 1
+            elif fingerprint["state"] == "missing":
+                missing.append(identifier)
+            else:
+                unsafe.append(f"{row.id}:path is not a regular file")
+            child_ids = _child_plan_records(revisions, sources, reviews, int(row.id))
+            all_plan.append({
+                "space_id": int(space.id),
+                "space_slug": space.slug,
+                "page_id": int(row.id or 0),
+                "revision": int(row.revision or 0),
+                "content_hash": row.content_hash or "",
+                "path": str(row.path or ""),
+                "path_identifier": identifier,
+                "file": fingerprint,
+                "children": child_ids,
+                "status": row.status,
+            })
+        grouped.append({"space_id": int(space.id), "space_name": space.name, "space_slug": space.slug, "pages": len(rows), "revisions": len(revisions), "page_sources": len(sources), "reviews": len(reviews), "files": files})
+    all_plan.sort(key=lambda item: (item["space_id"], item["page_id"]))
+    digest = hashlib.sha256(json.dumps(all_plan, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    totals = {key: sum(int(item[key]) for item in grouped) for key in ("pages", "revisions", "page_sources", "reviews", "files")}
+    return {"spaces": grouped, "totals": totals, "missing": missing, "unsafe": unsafe, "active_jobs": sorted(set(active_jobs)), "plan_hash": digest, "confirmation_text": f"{_PURGE_CONFIRMATION_PREFIX}:{digest}", "plan": all_plan}
+
+
+@router.get("/api/admin/wiki/purge/preview", response_model=WikiPurgePreviewOut)
+def preview_archived_wiki_purge(
+    request: Request,
+    session: Session = Depends(get_session),
+) -> WikiPurgePreviewOut:
+    _require_admin(request)
+    snapshot = _purge_snapshot(session)
+    warnings: list[str] = []
+    if snapshot["missing"]:
+        warnings.append("部分归档 Markdown 已缺失，将仅清理数据库记录")
+    if snapshot["unsafe"]:
+        warnings.append("存在不安全路径，执行将被阻止")
+    if snapshot["active_jobs"]:
+        warnings.append("存在 queued/running 摄入任务，执行将被阻止")
+    return WikiPurgePreviewOut(
+        scope="all",
+        confirmation_text=snapshot["confirmation_text"],
+        plan_hash=snapshot["plan_hash"],
+        spaces=[WikiPurgeSpaceOut.model_validate(item) for item in snapshot["spaces"]],
+        totals=WikiPurgeCountsOut.model_validate(snapshot["totals"]),
+        missing=snapshot["missing"],
+        unsafe=snapshot["unsafe"],
+        active_jobs=snapshot["active_jobs"],
+        warnings=warnings,
+    )
+
+
+@router.post("/api/admin/wiki/purge", response_model=WikiPurgeExecuteOut)
+def execute_archived_wiki_purge(
+    body: WikiPurgeExecuteIn,
+    request: Request,
+    session: Session = Depends(get_session),
+) -> WikiPurgeExecuteOut:
+    _require_admin(request)
+    if body.scope != "all":
+        raise HTTPException(status_code=422, detail="Only all scope is supported")
+    if not _PURGE_LOCK.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="Another purge is already running")
+    backups: list[tuple[Path, Path]] = []
+    expected_files: dict[Path, dict[str, Any]] = {}
+    backup_root: Path | None = None
+    try:
+        current = _purge_snapshot(session)
+        if body.plan_hash != current["plan_hash"] or body.confirmation_text != current["confirmation_text"]:
+            raise HTTPException(status_code=409, detail="Purge plan has changed; preview again")
+        if current["unsafe"]:
+            raise HTTPException(status_code=422, detail="Unsafe Wiki path blocks purge")
+        if current["active_jobs"]:
+            raise HTTPException(status_code=409, detail="Active ingest jobs block purge")
+        # Serialize writers at the database level as well as in-process.  The
+        # snapshot and the destructive second check now run under one SQLite
+        # write transaction, reducing cross-process races (the process lock is
+        # still retained for the common single-worker case).
+        session.rollback()
+        session.exec(text("BEGIN IMMEDIATE"))
+        locked = _purge_snapshot(session)
+        if body.plan_hash != locked["plan_hash"] or body.confirmation_text != locked["confirmation_text"]:
+            raise HTTPException(status_code=409, detail="Purge plan has changed; preview again")
+        if locked["unsafe"]:
+            raise HTTPException(status_code=422, detail="Unsafe Wiki path blocks purge")
+        if locked["active_jobs"]:
+            raise HTTPException(status_code=409, detail="Active ingest jobs block purge")
+        current = locked
+        plan = current["plan"]
+        if not plan:
+            session.rollback()
+            return WikiPurgeExecuteOut(status="completed_already_purged", plan_hash=current["plan_hash"], counts=WikiPurgeCountsOut())
+        page_ids = [int(item["page_id"]) for item in plan]
+        rows = session.exec(select(WikiPageRow).where(WikiPageRow.id.in_(page_ids))).all()
+        row_map = {int(row.id): row for row in rows if row.id is not None}
+        for item in plan:
+            row = row_map.get(int(item["page_id"]))
+            if row is None or row.status != "archived" or int(row.revision or 0) != int(item["revision"]):
+                raise HTTPException(status_code=409, detail="Purge plan is stale; preview again")
+            space = session.get(WikiSpace, int(item["space_id"]))
+            if space is None:
+                raise HTTPException(status_code=409, detail="Purge plan is stale; preview again")
+            path, problem, _identifier = _row_purge_path(space, row)
+            if problem or _path_fingerprint(path) != item["file"]:
+                raise HTTPException(status_code=409, detail="Purge plan is stale; preview again")
+            children = _child_plan_records(
+                session.exec(select(WikiPageRevision).where(WikiPageRevision.page_id == row.id)).all(),
+                session.exec(select(WikiPageSource).where(WikiPageSource.page_id == row.id)).all(),
+                session.exec(select(WikiReviewItem).where(WikiReviewItem.page_id == row.id)).all(),
+                int(row.id),
+            )
+            if children != item["children"]:
+                raise HTTPException(status_code=409, detail="Purge plan is stale; preview again")
+            if item["file"].get("state") not in {"file", "missing"}:
+                raise HTTPException(status_code=422, detail="Unsafe Wiki path blocks purge")
+        backup_root = Path(tempfile.mkdtemp(prefix="casegen-wiki-purge-", dir=str(config.DATA_DIR)))
+        for item in plan:
+            row = row_map[int(item["page_id"])]
+            space = session.get(WikiSpace, int(item["space_id"]))
+            path, problem, _identifier = _row_purge_path(space, row)
+            if problem:
+                raise HTTPException(status_code=422, detail="Unsafe Wiki path blocks purge")
+            try:
+                backup = _backup_file(path, backup_root) if item["file"].get("state") == "file" else None
+            except _PurgeUnsafeError as exc:
+                raise HTTPException(status_code=422, detail="Unsafe Wiki path blocks purge") from exc
+            except _PurgeStaleError as exc:
+                raise HTTPException(status_code=409, detail="Purge plan is stale; preview again") from exc
+            if item["file"].get("state") == "file" and backup is None:
+                raise HTTPException(status_code=409, detail="Purge plan is stale; preview again")
+            if backup is not None:
+                backups.append((path, backup))
+                expected_files[path] = item["file"]
+        for page_id in page_ids:
+            for model in (WikiPageSource, WikiPageRevision, WikiReviewItem):
+                for child in session.exec(select(model).where(model.page_id == page_id)).all():
+                    session.delete(child)
+            row = session.get(WikiPageRow, page_id)
+            if row is not None:
+                session.delete(row)
+        session.flush()
+        try:
+            for path, _backup in backups:
+                _unlink_secure_file(path, expected_files[path])
+        except Exception as exc:
+            session.rollback()
+            restore_failures = _restore_backups(backups)
+            detail = f"Purge failed; files restored: {exc}"
+            if restore_failures:
+                detail += "; CRITICAL restore failure: " + ", ".join(restore_failures)
+            if isinstance(exc, _PurgeUnsafeError):
+                status_code = 422
+            elif isinstance(exc, _PurgeStaleError):
+                status_code = 409
+            else:
+                status_code = 500
+            raise HTTPException(status_code=status_code, detail=detail) from exc
+        try:
+            session.commit()
+        except Exception as exc:
+            session.rollback()
+            restore_failures = _restore_backups(backups)
+            detail = f"Purge database commit failed; files restored: {exc}"
+            if restore_failures:
+                detail += "; CRITICAL restore failure: " + ", ".join(restore_failures)
+            raise HTTPException(status_code=500, detail=detail) from exc
+        if backup_root is not None:
+            shutil.rmtree(backup_root, ignore_errors=True)
+            backup_root = None
+        warnings: list[str] = []
+        space_ids = sorted({int(item["space_id"]) for item in plan})
+        for space_id in space_ids:
+            try:
+                remaining = session.exec(select(WikiPageRow).where(space_scope_clause(session, WikiPageRow.space_id, space_id))).all()
+                rebuild_index(remaining, session=session, space_id=space_id)
+                rebuild_overview(remaining, session=session, space_id=space_id)
+                rebuild_fts(session, space_id=space_id)
+                session.commit()
+            except Exception as exc:
+                session.rollback()
+                warnings.append(f"space {space_id} derived rebuild failed: {exc}")
+        return WikiPurgeExecuteOut(status="completed_with_warnings" if warnings else "completed", plan_hash=current["plan_hash"], counts=WikiPurgeCountsOut.model_validate(current["totals"]), warnings=warnings)
+    finally:
+        if backup_root is not None:
+            shutil.rmtree(backup_root, ignore_errors=True)
+        _PURGE_LOCK.release()
 
 
 def _space_for_row(session: Session, row: WikiPageRow):
@@ -699,14 +1293,14 @@ def retry_ingest_failed_windows(
 @router.get("/api/wiki/pages", response_model=List[WikiPageOut])
 def list_wiki_pages(
     space_id: Optional[int] = Query(default=None),
+    include_archived: bool = Query(default=False),
     session: Session = Depends(get_session),
 ) -> list[WikiPageOut]:
     sid = resolve_space_id(session, space_id)
-    rows = session.exec(
-        select(WikiPageRow)
-        .where(space_scope_clause(session, WikiPageRow.space_id, sid))
-        .order_by(WikiPageRow.id.desc())
-    ).all()
+    statement = select(WikiPageRow).where(space_scope_clause(session, WikiPageRow.space_id, sid))
+    if not include_archived:
+        statement = statement.where(WikiPageRow.status != "archived")
+    rows = session.exec(statement.order_by(WikiPageRow.id.desc())).all()
     return [_to_page_out(r, include_content=False, session=session) for r in rows]
 
 
@@ -714,12 +1308,15 @@ def list_wiki_pages(
 def get_wiki_page(
     page_id: int,
     space_id: Optional[int] = Query(default=None),
+    include_archived: bool = Query(default=False),
     session: Session = Depends(get_session),
 ) -> WikiPageOut:
     row = session.get(WikiPageRow, page_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Wiki page not found")
     _page_scope(session, row, resolve_space_id(session, space_id))
+    if row.status == "archived" and not include_archived:
+        raise HTTPException(status_code=404, detail="Wiki page not found")
     return _to_page_out(row, include_content=True, session=session)
 
 
@@ -1054,11 +1651,13 @@ def get_wiki_index(
 ) -> WikiIndexOut:
     config.ensure_data_dirs()
     space = resolve_space(session, space_id)
-    index_path = space_root(space) / "index.md"
-    if not index_path.exists():
-        content = "# Wiki Index\n\n"
-    else:
-        content = index_path.read_text(encoding="utf-8", errors="replace")
+    sid = int(space.id or 0)
+    rows = session.exec(
+        select(WikiPageRow)
+        .where(space_scope_clause(session, WikiPageRow.space_id, sid))
+        .order_by(WikiPageRow.id)
+    ).all()
+    content = rebuild_index(rows, session=session, space_id=sid)
     return WikiIndexOut(content=content, path=f"wiki/spaces/{space.slug}/index.md")
 
 

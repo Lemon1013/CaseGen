@@ -8,13 +8,14 @@ from sqlmodel import Session
 
 from app import config
 from app.db import get_engine, init_db
-from app.models.entities import Document, SourceChunk, WikiPageRow
+from app.models.entities import Document, SourceChunk, WikiPageRow, WikiSpace
 from app.services.hybrid_retrieve import _one_hop_expand, hybrid_retrieve
 from app.services.source_chunks_store import replace_chunks_for_document
 from app.services.task_pipeline import assemble_task_context
-from app.services.wiki_fts import index_counts
+from app.services.wiki_fts import index_counts, rebuild_fts, search_wiki, upsert_wiki_page
 from app.services.wiki_repository import WikiRepository
 from app.services.wiki_schema import WikiFrontmatter, WikiPage
+from app.services.wiki_spaces import get_default_space, resolve_space_id
 
 
 FIXTURE = Path(__file__).resolve().parents[2] / "fixtures" / "wiki_retrieval_eval.json"
@@ -146,6 +147,147 @@ def test_fts_projection_updates_incrementally(tmp_app_data):
         counts = index_counts(session)
         assert counts["wiki_pages"] == 1
         assert counts["source_chunks"] == 1
+
+
+def test_fts_default_status_filter_excludes_archived_pages(tmp_app_data):
+    init_db()
+    with Session(get_engine()) as session:
+        space_id = resolve_space_id(session)
+        config.WIKI_PAGES_DIR.mkdir(parents=True, exist_ok=True)
+        for page_id, key, status in (
+            (1, "rule.visible", "published"),
+            (2, "rule.historical", "archived"),
+        ):
+            relative = f"pages/rules/{key}.md"
+            target = config.WIKI_DIR / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("集合竞价历史规则", encoding="utf-8")
+            session.add(
+                WikiPageRow(
+                    id=page_id,
+                    path=relative,
+                    title=key,
+                    page_type="rule",
+                    page_key=key,
+                    domain="trading",
+                    status=status,
+                    space_id=space_id,
+                )
+            )
+        session.commit()
+        rebuild_fts(session, space_id=space_id)
+
+        default_hits = search_wiki(session, "集合竞价", status=None, space_id=space_id)
+        assert {hit["page_key"] for hit in default_hits} == {"rule.visible"}
+        assert not search_wiki(
+            session,
+            "集合竞价",
+            status="archived",
+            space_id=space_id,
+        )
+
+
+def test_fts_archive_upsert_removes_existing_projection(tmp_app_data):
+    init_db()
+    with Session(get_engine()) as session:
+        space_id = resolve_space_id(session)
+        page = WikiPageRow(
+            path="pages/rules/archive-upsert.md",
+            title="增量归档规则",
+            page_type="rule",
+            page_key="rule.archive-upsert",
+            domain="trading",
+            status="published",
+            space_id=space_id,
+        )
+        session.add(page)
+        session.commit()
+        rebuild_fts(session, [page], [], space_id=space_id)
+        assert index_counts(session, space_id=space_id)["wiki_pages"] == 1
+
+        page.status = "archived"
+        session.add(page)
+        session.commit()
+        result = upsert_wiki_page(session, page, "增量归档规则正文")
+        assert result["action"] == "delete"
+        assert index_counts(session, space_id=space_id)["wiki_pages"] == 0
+        assert not search_wiki(session, "增量归档", space_id=space_id)
+
+
+def test_rebuild_fts_explicit_rows_respects_space_scope(tmp_app_data):
+    init_db()
+    with Session(get_engine()) as session:
+        default = get_default_space(session)
+        assert default is not None and default.id is not None
+        project = WikiSpace(name="重建项目", slug="rebuild-project", status="active")
+        session.add(project)
+        session.flush()
+        assert project.id is not None
+        default_page = WikiPageRow(
+            path="pages/rules/default-rebuild.md",
+            title="默认重建规则",
+            page_type="rule",
+            page_key="rule.default-rebuild",
+            status="published",
+            space_id=default.id,
+        )
+        project_page = WikiPageRow(
+            path="pages/rules/project-rebuild.md",
+            title="项目重建规则",
+            page_type="rule",
+            page_key="rule.project-rebuild",
+            status="published",
+            space_id=project.id,
+        )
+        session.add(default_page)
+        session.add(project_page)
+        session.commit()
+
+        rebuild_fts(session, [default_page, project_page], [], space_id=project.id)
+        assert index_counts(session, space_id=project.id)["wiki_pages"] == 1
+        assert index_counts(session, space_id=default.id)["wiki_pages"] == 0
+
+        rebuild_fts(session, [default_page, project_page], [], space_id=default.id)
+        assert index_counts(session, space_id=default.id)["wiki_pages"] == 1
+        assert search_wiki(session, "默认重建", space_id=default.id)
+        assert not search_wiki(session, "项目重建", space_id=default.id)
+
+
+def test_rebuild_fts_default_clears_empty_space_legacy_rows(tmp_app_data):
+    init_db()
+    with Session(get_engine()) as session:
+        default = get_default_space(session)
+        assert default is not None and default.id is not None
+        page = WikiPageRow(
+            path="pages/rules/default-empty-space.md",
+            title="默认空空间规则",
+            page_type="rule",
+            page_key="rule.default-empty-space",
+            status="published",
+            space_id=default.id,
+        )
+        session.add(page)
+        session.commit()
+        upsert_wiki_page(
+            session,
+            {
+                "id": 999,
+                "space_id": "",
+                "page_key": "rule.legacy-empty-space",
+                "title": "空空间旧规则",
+                "page_type": "rule",
+                "status": "published",
+                "body": "空空间旧规则正文",
+            },
+        )
+        assert index_counts(session, space_id=default.id)["wiki_pages"] == 1
+
+        rebuild_fts(session, [page], [], space_id=default.id)
+        assert index_counts(session, space_id=default.id)["wiki_pages"] == 1
+        assert all(
+            hit["page_key"] != "rule.legacy-empty-space"
+            for hit in search_wiki(session, "空空间旧规则", space_id=default.id)
+        )
 
 
 def test_wiki_results_expand_only_one_hop_and_deduplicate():
