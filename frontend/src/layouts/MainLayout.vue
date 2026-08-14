@@ -219,7 +219,11 @@ onMounted(loadDefaultModel)
 }
 
 .sidebar {
-  position: relative;
+  position: fixed;
+  inset: 0 auto 0 0;
+  width: 228px !important;
+  height: 100vh;
+  z-index: 30;
   background: linear-gradient(180deg, #0b1220 0%, var(--cg-sidebar) 40%, #05080f 100%);
   color: var(--cg-text-on-dark);
   display: flex;
@@ -276,6 +280,8 @@ onMounted(loadDefaultModel)
   gap: 2px;
   padding: 14px 10px;
   flex: 1;
+  min-height: 0;
+  overflow-y: auto;
 }
 
 .nav-group {
@@ -425,6 +431,7 @@ onMounted(loadDefaultModel)
 
 .body {
   flex: 1;
+  margin-left: 228px;
   min-width: 0;
   min-height: 100vh;
   background: var(--cg-bg-glow);
@@ -516,6 +523,17 @@ onMounted(loadDefaultModel)
 }
 
 @media (max-width: 900px) {
+  .sidebar {
+    position: relative;
+    inset: auto;
+    width: 228px !important;
+    height: auto;
+  }
+
+  .body {
+    margin-left: 0;
+  }
+
   .topbar {
     padding: 12px 16px;
   }
