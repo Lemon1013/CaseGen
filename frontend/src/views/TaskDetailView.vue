@@ -33,6 +33,9 @@ import {
   type TaskItem,
   type TaskStreamPayload,
   updateTaskModel,
+  confirmRetrievalCheckpoint,
+  getRetrievalCheckpoint,
+  type RetrievalCheckpoint,
 } from '../api/tasks'
 import { listModels, type ModelConfig } from '../api/models'
 
@@ -47,6 +50,10 @@ const events = ref<TaskEvent[]>([])
 const reviews = ref<ReviewResult[]>([])
 const revisions = ref<PromptRevision[]>([])
 const citations = ref<TaskCitation[]>([])
+const checkpoint = ref<RetrievalCheckpoint | null>(null)
+const selectedCitationIds = ref<number[]>([])
+const supplementalText = ref('')
+const confirmingCheckpoint = ref(false)
 const models = ref<ModelConfig[]>([])
 const activeDraftTab = ref('')
 
@@ -140,6 +147,15 @@ async function loadAll() {
     reviews.value = rev
     revisions.value = revs
     citations.value = c
+    if (t.status === 'awaiting_confirmation') {
+      checkpoint.value = await getRetrievalCheckpoint(id)
+      selectedCitationIds.value = checkpoint.value.selected_citation_ids.length
+        ? [...checkpoint.value.selected_citation_ids]
+        : checkpoint.value.candidate_citations.map((item) => item.id)
+      supplementalText.value = checkpoint.value.supplemental_text || ''
+    } else {
+      checkpoint.value = null
+    }
     models.value = modelRows
     retryModelId.value =
       t.model_id ?? modelRows.find((model) => model.is_default)?.id ?? modelRows[0]?.id ?? null
@@ -152,6 +168,28 @@ async function loadAll() {
     }
   } finally {
     if (id === taskId.value) loading.value = false
+  }
+}
+
+async function confirmCheckpoint() {
+  if (!task.value || !checkpoint.value || confirmingCheckpoint.value) return
+  if (!selectedCitationIds.value.length && !supplementalText.value.trim()) {
+    ElMessage.warning('至少选择一条引用或填写补充上下文')
+    return
+  }
+  confirmingCheckpoint.value = true
+  try {
+    task.value = await confirmRetrievalCheckpoint(task.value.id, {
+      selected_citation_ids: selectedCitationIds.value,
+      supplemental_text: supplementalText.value,
+      expected_version: checkpoint.value.version,
+      idempotency_key: `task-${task.value.id}-checkpoint-${checkpoint.value.id}-v${checkpoint.value.version}`,
+    })
+    await refreshLight()
+  } catch (err) {
+    ElMessage.error(`确认失败：${(err as Error).message}`)
+  } finally {
+    confirmingCheckpoint.value = false
   }
 }
 
@@ -174,6 +212,20 @@ async function refreshLight(): Promise<boolean> {
     reviews.value = rev
     revisions.value = revs
     citations.value = c
+    if (t.status === 'awaiting_confirmation') {
+      const fresh = await getRetrievalCheckpoint(id)
+      if (!checkpoint.value || checkpoint.value.id !== fresh.id || checkpoint.value.version !== fresh.version) {
+        checkpoint.value = fresh
+        selectedCitationIds.value = fresh.selected_citation_ids.length
+          ? [...fresh.selected_citation_ids]
+          : fresh.candidate_citations.map((item) => item.id)
+        supplementalText.value = fresh.supplemental_text || ''
+      }
+    } else {
+      checkpoint.value = null
+      selectedCitationIds.value = []
+      supplementalText.value = ''
+    }
     if (d.length && !d.some((x) => String(x.id) === activeDraftTab.value)) {
       activeDraftTab.value = String(d[0].id)
     }
@@ -572,7 +624,14 @@ function onOptimize() {
   return runAction('优化 Prompt', optimizePromptTask)
 }
 
-function onRegenerate() {
+async function onRegenerate() {
+  try {
+    await ElMessageBox.confirm('再生成将重新检索并覆盖当前生成流程，是否继续？', '再生成确认', {
+      type: 'warning',
+    })
+  } catch {
+    return
+  }
   return runAction('再生成', regenerateTask)
 }
 
@@ -739,6 +798,20 @@ onUnmounted(() => {
       style="margin-bottom: 16px"
     />
 
+    <el-card v-if="task?.status === 'awaiting_confirmation' && checkpoint" shadow="never" class="block checkpoint-card">
+      <template #header>检索结果确认</template>
+      <p class="meta">请确认将用于生成的知识引用，可取消不相关条目。</p>
+      <el-checkbox-group v-model="selectedCitationIds" class="checkpoint-list">
+        <el-checkbox v-for="item in checkpoint.candidate_citations" :key="item.id" :label="item.id" class="checkpoint-item">
+          <span class="checkpoint-title">{{ item.title }}</span>
+          <span class="checkpoint-meta">{{ item.citation_type }} · score {{ item.score.toFixed(3) }} · {{ item.path }}</span>
+          <span class="checkpoint-snippet">{{ item.snippet || item.content_excerpt }}</span>
+        </el-checkbox>
+      </el-checkbox-group>
+      <el-input v-model="supplementalText" type="textarea" :rows="4" maxlength="10000" show-word-limit placeholder="补充上下文（可选）" />
+      <el-button type="primary" :loading="confirmingCheckpoint" :disabled="!selectedCitationIds.length && !supplementalText.trim()" @click="confirmCheckpoint">确认并生成</el-button>
+    </el-card>
+
     <el-alert
       v-if="task?.error_message || liveStreamError"
       type="error"
@@ -857,7 +930,9 @@ onUnmounted(() => {
                   已定稿并导入
                 </el-tag>
               </div>
-              <MarkdownView :content="d.content_md" />
+              <div class="draft-scroll">
+                <MarkdownView :content="d.content_md" />
+              </div>
             </el-tab-pane>
           </el-tabs>
           <el-empty v-else description="暂无草稿" :image-size="64" />
@@ -970,6 +1045,79 @@ onUnmounted(() => {
 .block {
   margin-bottom: 16px;
   border-radius: var(--cg-radius) !important;
+}
+
+.draft-scroll {
+  min-height: 0;
+  max-height: clamp(320px, calc(100vh - 360px), 760px);
+  overflow-y: auto;
+}
+
+@media (max-width: 900px) {
+  .draft-scroll {
+    max-height: none;
+    overflow: visible;
+  }
+}
+
+.checkpoint-list {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 10px;
+  max-height: clamp(260px, calc(100vh - 420px), 540px);
+  overflow-y: auto;
+  overflow-x: hidden;
+  margin: 12px 0;
+  min-width: 0;
+}
+
+.checkpoint-item {
+  display: flex;
+  align-items: flex-start;
+  width: 100%;
+  min-width: 0;
+  min-height: 32px;
+  height: auto;
+  margin-right: 0;
+  box-sizing: border-box;
+  white-space: normal;
+  border: 1px solid var(--cg-border);
+  border-radius: var(--cg-radius-sm);
+  padding: 10px;
+}
+
+.checkpoint-item :deep(.el-checkbox__input) {
+  flex: 0 0 auto;
+  margin-top: 2px;
+}
+
+.checkpoint-item :deep(.el-checkbox__label) {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-width: 0;
+  max-width: 100%;
+  line-height: 1.45;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.checkpoint-title,
+.checkpoint-meta,
+.checkpoint-snippet {
+  display: block;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.checkpoint-title { font-weight: 700; }
+.checkpoint-meta { color: var(--cg-text-muted); font-size: 12px; }
+.checkpoint-snippet { color: var(--cg-text-secondary); font-size: 12px; margin-top: 4px; }
+
+@media (max-width: 900px) {
+  .checkpoint-list { max-height: none; overflow: visible; }
 }
 
 .block :deep(.el-card__header) {

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import hashlib
 from collections.abc import Iterable, Mapping
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
@@ -18,6 +19,7 @@ from app.models.entities import (
     Requirement,
     ReviewResult,
     TaskCitation,
+    TaskRetrievalCheckpoint,
 )
 from app.services.llm import LLMError, chat_completion
 from app.services.retrieve import load_all_wiki_pages, rank_pages
@@ -708,6 +710,15 @@ def _build_messages(
     ]
 
 
+def _append_supplemental_context(messages: list[dict[str, str]], supplemental_text: str) -> None:
+    """Attach user-confirmed context consistently to every generation attempt."""
+    text = (supplemental_text or "").strip()
+    if text and messages:
+        messages[-1]["content"] += (
+            "\n\n# 用户补充上下文（仅作为人工确认后的附加输入）\n" + text
+        )
+
+
 def _resolve_chat_fn(
     chat_fn: Optional[ChatFn],
     stage_fn: Optional[ChatFn] = None,
@@ -948,6 +959,7 @@ def run_generate(
     session: Session,
     task_id: int,
     chat_fn: Optional[ChatFn] = None,
+    auto_review: bool = False,
 ) -> GenerationTask:
     task = session.get(GenerationTask, task_id)
     if task is None:
@@ -971,106 +983,127 @@ def run_generate(
         )
 
     try:
-        # Always re-retrieve: draft/failed/regenerating → retrieving
+        # Fail before changing state or touching the retriever when the task
+        # has no usable model configuration.
+        try:
+            _resolve_model(session, task)
+        except Exception as exc:  # noqa: BLE001
+            return _fail_task(session, task, str(exc), publish_stream=True)
+
+        checkpoint = session.exec(
+            select(TaskRetrievalCheckpoint)
+            .where(TaskRetrievalCheckpoint.task_id == task.id)
+            .where(TaskRetrievalCheckpoint.status == "confirmed")
+            .order_by(col(TaskRetrievalCheckpoint.attempt).desc())
+        ).first()
+        resume_confirmed = checkpoint is not None and task.status in {"generating", "awaiting_confirmation"}
+        # New attempts always retrieve first. A confirmed checkpoint is the
+        # sole path that resumes generation without calling the retriever.
         if task.status in ("draft", "failed", "regenerating"):
             _set_status(task, "retrieving")
             session.add(task)
             append_event(session, task.id, "retrieve", "开始混合检索（Wiki + 原文块）")
             session.commit()
             session.refresh(task)
-        elif task.status != "retrieving":
+        elif not resume_confirmed and task.status != "retrieving":
             raise InvalidTransition(
                 f"Cannot start generate from status {task.status!r}"
             )
 
-        task_stream.status(
-            stream_task_id,
-            status="retrieving",
-            message="正在检索 Wiki 与原文证据",
-        )
-
-        query = _build_query(requirement)
-        resolved_space_id = resolve_space_id(session, task.wiki_space_id)
-        if task.wiki_space_id is None:
-            task.wiki_space_id = resolved_space_id
-            session.add(task)
-            session.commit()
-        from app.services.hybrid_retrieve import hybrid_retrieve
-
-        retrieved = hybrid_retrieve(
-            session,
-            query,
-            wiki_k=config.RETRIEVE_WIKI_TOP_K,
-            source_k=config.RETRIEVE_SOURCE_TOP_K,
-            top_k=config.RETRIEVE_WIKI_TOP_K + config.RETRIEVE_SOURCE_TOP_K,
-            space_id=resolved_space_id,
-        )
-        context = assemble_task_context(
-            retrieved.get("wiki_hits") or [],
-            retrieved.get("source_hits") or [],
-            query=query,
-            include_explain=True,
-        )
-        wiki_hits = list(context["wiki_hits"])
-        source_hits = list(context["source_hits"])
-
-        _clear_citations(session, task.id)
-        for citation in context["citations"]:
-            cids = list(citation.get("clause_ids") or [])
-            session.add(
-                TaskCitation(
+        if resume_confirmed:
+            payload = json.loads(checkpoint.retrieval_json or "{}")
+            if not isinstance(payload, dict) or not isinstance(payload.get("context"), dict):
+                raise ValueError("Invalid retrieval checkpoint payload")
+            query = checkpoint.query
+            all_context = payload.get("context") or {}
+            selected_ids = {str(x) for x in json.loads(checkpoint.selected_citation_ids_json or "[]")}
+            selected_citations = {
+                str(item.get("task_citation_id")) for item in (all_context.get("citations") or [])
+                if str(item.get("task_citation_id")) in selected_ids
+            }
+            if selected_ids - selected_citations:
+                raise ValueError("Selected citation is missing from retrieval checkpoint")
+            wiki_hits = [h for h in all_context.get("wiki_hits", []) if str(h.get("task_citation_id")) in selected_citations]
+            source_hits = [h for h in all_context.get("source_hits", []) if str(h.get("task_citation_id")) in selected_citations]
+            context = assemble_task_context(wiki_hits, source_hits, query=query, include_explain=True)
+            supplemental_text = checkpoint.supplemental_text or ""
+        else:
+            task_stream.status(stream_task_id, status="retrieving", message="正在检索 Wiki 与原文证据")
+            query = _build_query(requirement)
+            resolved_space_id = resolve_space_id(session, task.wiki_space_id)
+            if task.wiki_space_id is None:
+                task.wiki_space_id = resolved_space_id
+                session.add(task)
+                session.commit()
+            from app.services.hybrid_retrieve import hybrid_retrieve
+            retrieved = hybrid_retrieve(
+                session, query,
+                wiki_k=config.RETRIEVE_WIKI_TOP_K,
+                source_k=config.RETRIEVE_SOURCE_TOP_K,
+                top_k=config.RETRIEVE_WIKI_TOP_K + config.RETRIEVE_SOURCE_TOP_K,
+                space_id=resolved_space_id,
+            )
+            context = assemble_task_context(
+                retrieved.get("wiki_hits") or [], retrieved.get("source_hits") or [],
+                query=query, include_explain=True,
+            )
+            wiki_hits = list(context["wiki_hits"])
+            source_hits = list(context["source_hits"])
+            _clear_citations(session, task.id)
+            citation_rows = []
+            for citation in context["citations"]:
+                cids = list(citation.get("clause_ids") or [])
+                row = TaskCitation(
                     task_id=task.id,
                     citation_type=citation.get("citation_type") or "wiki",
                     wiki_page_id=citation.get("wiki_page_id"),
                     source_chunk_id=citation.get("source_chunk_id"),
-                    title=citation.get("title") or "",
-                    path=citation.get("path") or "",
-                    score=float(citation.get("score") or 0.0),
-                    snippet=citation.get("snippet") or "",
+                    title=citation.get("title") or "", path=citation.get("path") or "",
+                    score=float(citation.get("score") or 0.0), snippet=citation.get("snippet") or "",
                     content_excerpt=citation.get("content_excerpt") or "",
-                    clause_ids_json=json.dumps(cids, ensure_ascii=False),
-                    # Only explicit query clauses survive context assembly.
-                    anchor_clause=citation.get("anchor_clause"),
+                    clause_ids_json=json.dumps(cids, ensure_ascii=False), anchor_clause=citation.get("anchor_clause"),
                 )
-            )
-        hit_count = len(context["citations"])
-        explicit_anchors = context["explicit_anchor_clause_ids"]
-        append_event(
-            session,
-            task.id,
-            "retrieve",
-            f"检索完成：Wiki {len(wiki_hits)} + 原文 {len(source_hits)}"
-            + (
-                f"（用户显式条款锚定 {len(explicit_anchors)}）"
-                if explicit_anchors
-                else ""
-            ),
-            detail={
-                "query": query,
-                "wiki_hit_count": len(wiki_hits),
-                "source_hit_count": len(source_hits),
-                "hit_count": hit_count,
-                "clause_ids": context["explicit_clause_ids"],
-                "anchored_clause_ids": explicit_anchors,
-                "context_budgets": context["budgets"],
-                "context_explain": context.get("explain"),
-            },
-        )
-        if hit_count == 0:
-            append_event(
-                session,
-                task.id,
-                "retrieve",
-                "警告：未检索到 Wiki 或原文块，将仅基于需求生成",
-            )
-        session.commit()
-        session.refresh(task)
+                session.add(row)
+                citation_rows.append(row)
+            session.flush()
+            for citation, row in zip(context["citations"], citation_rows):
+                citation["task_citation_id"] = row.id
+            # ``assemble_task_context`` preserves the normalized hit order:
+            # Wiki hits first, followed by source hits. Assign IDs by that
+            # deterministic order, never by title/snippet (duplicates are
+            # valid and must remain independently selectable).
+            wiki_count = len(wiki_hits)
+            for index, hit in enumerate(wiki_hits):
+                if index < len(context["citations"]):
+                    hit["task_citation_id"] = context["citations"][index].get("task_citation_id")
+            for index, hit in enumerate(source_hits):
+                citation_index = wiki_count + index
+                if citation_index < len(context["citations"]):
+                    hit["task_citation_id"] = context["citations"][citation_index].get("task_citation_id")
+            hit_count = len(context["citations"])
+            explicit_anchors = context["explicit_anchor_clause_ids"]
+            append_event(session, task.id, "retrieve", f"检索完成：Wiki {len(wiki_hits)} + 原文 {len(source_hits)}", detail={"query": query, "hit_count": hit_count, "context_budgets": context["budgets"], "context_explain": context.get("explain")})
+            if hit_count == 0:
+                append_event(session, task.id, "retrieve", "警告：未检索到 Wiki 或原文块，将仅基于需求生成")
+            # Store the lossless retrieval/context snapshot before asking for a decision.
+            attempt = (session.exec(select(func.max(TaskRetrievalCheckpoint.attempt)).where(TaskRetrievalCheckpoint.task_id == task.id)).one() or 0) + 1
+            snapshot = {"context": context}
+            snapshot_json = json.dumps(snapshot, ensure_ascii=False, default=str)
+            checkpoint = TaskRetrievalCheckpoint(task_id=task.id, attempt=int(attempt), status="pending", auto_review=auto_review, query=query, retrieval_json=snapshot_json, candidate_citation_ids_json=json.dumps([r.id for r in citation_rows]), version=1)
+            session.add(checkpoint)
+            _set_status(task, "awaiting_confirmation")
+            append_event(session, task.id, "retrieve", "检索完成，等待人工确认")
+            session.commit()
+            session.refresh(task)
+            task_stream.status(stream_task_id, status="awaiting_confirmation", message="检索完成，请确认引用后继续生成")
+            return task
 
-        _set_status(task, "generating")
-        session.add(task)
-        append_event(session, task.id, "generate", "开始调用 LLM 生成用例")
-        session.commit()
-        session.refresh(task)
+        if task.status != "generating":
+            _set_status(task, "generating")
+            session.add(task)
+            append_event(session, task.id, "generate", "开始调用 LLM 生成用例")
+            session.commit()
+            session.refresh(task)
         task_stream.status(
             stream_task_id,
             status="generating",
@@ -1085,6 +1118,7 @@ def run_generate(
         messages = _build_messages(
             system_prompt, requirement, wiki_context, source_context, index_context
         )
+        _append_supplemental_context(messages, supplemental_text)
 
         def publish_attempt(attempt: int, reset: bool) -> None:
             if reset:
@@ -1153,6 +1187,7 @@ def run_generate(
                 lean_source,
                 lean_context["index_context"],
             )
+            _append_supplemental_context(lean_messages, supplemental_text)
             append_event(
                 session,
                 task.id,

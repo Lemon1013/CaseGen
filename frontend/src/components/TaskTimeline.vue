@@ -37,6 +37,15 @@ function stepType(step: string): '' | 'success' | 'warning' | 'info' | 'danger' 
 <style scoped>
 .timeline-wrap {
   padding: 4px 8px;
+  max-height: clamp(280px, calc(100vh - 260px), 720px);
+  overflow-y: auto;
+}
+
+@media (max-width: 900px) {
+  .timeline-wrap {
+    max-height: none;
+    overflow: visible;
+  }
 }
 
 .ev-step {

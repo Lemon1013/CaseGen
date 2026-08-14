@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import secrets
 import json
 import time
+from datetime import datetime, timezone
 from typing import AsyncIterator, List, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
@@ -20,6 +23,7 @@ from app.models.entities import (
     ReviewResult,
     SourceChunk,
     TaskCitation,
+    TaskRetrievalCheckpoint,
     TaskEvent,
     TestCase,
     WikiPageRow,
@@ -36,6 +40,8 @@ from app.schemas.tasks import (
     TaskEventOut,
     TaskModelUpdate,
     TaskOut,
+    RetrievalCheckpointConfirm,
+    RetrievalCheckpointOut,
 )
 from app.services.task_events import append_event
 from app.services.task_jobs import (
@@ -52,6 +58,8 @@ from app.services.task_pipeline import (
     run_optimize_prompt,
     run_regenerate,
     run_review,
+    _resolve_model,
+    _fail_task,
 )
 from app.services.task_state import InvalidTransition, transition
 from app.services.task_stream import encode_sse, task_stream
@@ -70,7 +78,7 @@ _BUSY = frozenset(
     {"retrieving", "generating", "reviewing", "optimizing", "regenerating"}
 )
 _STREAM_ACTIVE_STATUSES = frozenset({"retrieving", "generating", "regenerating"})
-_STREAM_TERMINAL_STATUSES = frozenset({"generated", "reviewed", "finalized", "failed"})
+_STREAM_TERMINAL_STATUSES = frozenset({"generated", "reviewed", "finalized", "failed", "awaiting_confirmation"})
 _STREAM_HEARTBEAT_SEC = 15.0
 _STREAM_POLL_INTERVAL_SEC = 0.2
 
@@ -79,6 +87,8 @@ def _stream_terminal_for_status(status: str) -> str | None:
     if status == "failed":
         return "failed"
     if status in {"generated", "reviewed", "finalized"}:
+        return "completed"
+    if status == "awaiting_confirmation":
         return "completed"
     return None
 
@@ -172,6 +182,28 @@ def _latest_review_row(session: Session, task_id: int) -> Optional[ReviewResult]
 def _citation_count(session: Session, task_id: int) -> int:
     rows = session.exec(select(TaskCitation).where(TaskCitation.task_id == task_id)).all()
     return len(rows)
+
+
+def _checkpoint_out(session: Session, checkpoint: TaskRetrievalCheckpoint) -> RetrievalCheckpointOut:
+    selected = [int(x) for x in json.loads(checkpoint.selected_citation_ids_json or "[]")]
+    candidates = [int(x) for x in json.loads(checkpoint.candidate_citation_ids_json or "[]")]
+    rows = session.exec(select(TaskCitation).where(TaskCitation.id.in_(candidates)).order_by(col(TaskCitation.id))).all()
+    available = {
+        row.id: TaskCitationOut(
+            id=row.id, title=row.title, path=row.path, score=row.score, snippet=row.snippet,
+            wiki_page_id=row.wiki_page_id, citation_type=getattr(row, "citation_type", "wiki"),
+            source_chunk_id=getattr(row, "source_chunk_id", None), content_excerpt=getattr(row, "content_excerpt", "") or "",
+            clause_ids=json.loads(getattr(row, "clause_ids_json", "[]") or "[]"), anchor_clause=getattr(row, "anchor_clause", None),
+        ) for row in rows
+    }
+    return RetrievalCheckpointOut(
+        id=checkpoint.id, task_id=checkpoint.task_id, attempt=checkpoint.attempt,
+        version=checkpoint.version, status=checkpoint.status, query=checkpoint.query,
+        auto_review=bool(checkpoint.auto_review),
+        candidate_citations=[available[row.id] for row in rows if row.id in available],
+        selected_citation_ids=selected, supplemental_text=checkpoint.supplemental_text or "",
+        idempotency_key=checkpoint.idempotency_key, created_at=checkpoint.created_at, updated_at=checkpoint.updated_at,
+    )
 
 
 def _review_to_out(row: ReviewResult) -> ReviewResultOut:
@@ -308,7 +340,7 @@ def create_task(
     if body.run_generate:
         if _force_sync("generate", wait):
             _start_live_generate_stream(task, "开始生成测试用例")
-            run_generate(session, task.id, chat_fn=_chat_for("generate"))
+            run_generate(session, task.id, chat_fn=_chat_for("generate"), auto_review=body.auto_review)
             session.refresh(task)
             if body.auto_review and task.status == "generated":
                 run_review(session, task.id, chat_fn=_chat_for("review"))
@@ -440,6 +472,73 @@ def stream_task(task_id: int) -> StreamingResponse:
     )
 
 
+@router.get("/{task_id}/retrieval-checkpoint", response_model=RetrievalCheckpointOut)
+def get_retrieval_checkpoint(task_id: int, session: Session = Depends(get_session)) -> RetrievalCheckpointOut:
+    task = session.get(GenerationTask, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    checkpoint = session.exec(
+        select(TaskRetrievalCheckpoint)
+        .where(TaskRetrievalCheckpoint.task_id == task_id)
+        .order_by(col(TaskRetrievalCheckpoint.attempt).desc())
+    ).first()
+    if checkpoint is None:
+        raise HTTPException(status_code=404, detail="Retrieval checkpoint not found")
+    return _checkpoint_out(session, checkpoint)
+
+
+@router.post("/{task_id}/retrieval-checkpoint/confirm", response_model=TaskOut)
+def confirm_retrieval_checkpoint(
+    task_id: int,
+    body: RetrievalCheckpointConfirm,
+    background_tasks: BackgroundTasks,
+    session: Session = Depends(get_session),
+) -> TaskOut:
+    with task_locks.hold(task_id):
+        task = session.get(GenerationTask, task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="Task not found")
+        checkpoint = session.exec(
+            select(TaskRetrievalCheckpoint)
+            .where(TaskRetrievalCheckpoint.task_id == task_id)
+            .order_by(col(TaskRetrievalCheckpoint.attempt).desc())
+        ).first()
+        if checkpoint is None:
+            raise HTTPException(status_code=404, detail="Retrieval checkpoint not found")
+        selected = list(dict.fromkeys(int(x) for x in body.selected_citation_ids))
+        candidate_ids = set(int(x) for x in json.loads(checkpoint.candidate_citation_ids_json or "[]"))
+        actual_ids = {int(row.id) for row in session.exec(select(TaskCitation).where(TaskCitation.task_id == task_id, TaskCitation.id.in_(candidate_ids))).all()}
+        if any(x not in actual_ids for x in selected):
+            raise HTTPException(status_code=422, detail="Selected citation does not belong to checkpoint")
+        if not selected and not body.supplemental_text.strip():
+            raise HTTPException(status_code=422, detail="Select a citation or provide supplemental context")
+        payload_hash = hashlib.sha256(json.dumps({"selected": selected, "supplemental_text": body.supplemental_text}, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+        if checkpoint.status == "confirmed":
+            if checkpoint.decision_hash == payload_hash and checkpoint.idempotency_key == body.idempotency_key:
+                return to_task_out(session, task)
+            raise HTTPException(status_code=409, detail="Checkpoint already confirmed")
+        if checkpoint.version != body.expected_version:
+            raise HTTPException(status_code=409, detail="Stale retrieval checkpoint version")
+        checkpoint.status = "confirmed"
+        checkpoint.selected_citation_ids_json = json.dumps(selected)
+        checkpoint.supplemental_text = body.supplemental_text.strip()
+        checkpoint.decision_hash = payload_hash
+        checkpoint.idempotency_key = body.idempotency_key
+        checkpoint.resume_claim_token = secrets.token_urlsafe(24)
+        checkpoint.resume_claimed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        checkpoint.resume_status = "claimed"
+        session.add(checkpoint)
+        task.status = transition(task.status, "generating")
+        task.error_message = None
+        session.add(task)
+        append_event(session, task.id, "retrieve", "人工确认检索结果，继续生成", detail={"selected_citation_ids": selected})
+        session.commit()
+        session.refresh(task)
+        _start_live_generate_stream(task, "已确认检索结果，开始生成")
+        background_tasks.add_task(job_generate, task_id, bool(checkpoint.auto_review), checkpoint.id, checkpoint.resume_claim_token)
+        return to_task_out(session, task)
+
+
 @router.get("/{task_id}", response_model=TaskOut)
 def get_task(task_id: int, session: Session = Depends(get_session)) -> TaskOut:
     task = session.get(GenerationTask, task_id)
@@ -520,7 +619,7 @@ def _delete_task_locked(task_id: int, session: Session) -> dict:
         else None
     )
 
-    for model in (TaskCitation, CaseDraft, ReviewResult, PromptRevision, TaskEvent):
+    for model in (TaskCitation, TaskRetrievalCheckpoint, CaseDraft, ReviewResult, PromptRevision, TaskEvent):
         rows = session.exec(select(model).where(model.task_id == task_id)).all()
         for row in rows:
             session.delete(row)
@@ -585,9 +684,18 @@ def _generate_task_locked(
         # Already running — do not double-schedule
         return to_task_out(session, task)
 
+    if task.status == "awaiting_confirmation":
+        return to_task_out(session, task)
+
+    try:
+        _resolve_model(session, task)
+    except Exception as exc:  # noqa: BLE001
+        _start_live_generate_stream(task, "生成失败")
+        return to_task_out(session, _fail_task(session, task, str(exc), publish_stream=True))
+
     if _force_sync("generate", wait):
         _start_live_generate_stream(task, "开始生成测试用例")
-        task = run_generate(session, task_id, chat_fn=_chat_for("generate"))
+        task = run_generate(session, task_id, chat_fn=_chat_for("generate"), auto_review=auto_review)
         if auto_review and task.status == "generated":
             task = run_review(session, task_id, chat_fn=_chat_for("review"))
         return to_task_out(session, task)
@@ -595,7 +703,7 @@ def _generate_task_locked(
     if task.status not in ("draft", "failed", "regenerating"):
         # Preserve envelope: pipeline marks failed + error_message
         _start_live_generate_stream(task, "开始生成测试用例")
-        task = run_generate(session, task_id, chat_fn=_chat_for("generate"))
+        task = run_generate(session, task_id, chat_fn=_chat_for("generate"), auto_review=auto_review)
         return to_task_out(session, task)
 
     task = _begin_status(
@@ -630,6 +738,9 @@ def _review_task_locked(
         raise HTTPException(status_code=404, detail="Task not found")
 
     if task.status in _BUSY:
+        return to_task_out(session, task)
+
+    if task.status == "awaiting_confirmation":
         return to_task_out(session, task)
 
     if _force_sync("review", wait):

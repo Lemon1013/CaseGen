@@ -307,6 +307,37 @@ class TaskCitation(SQLModel, table=True):
     anchor_clause: Optional[str] = None
 
 
+class TaskRetrievalCheckpoint(SQLModel, table=True):
+    """Durable evidence snapshot awaiting an explicit generation decision."""
+
+    __tablename__ = "task_retrieval_checkpoints"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    task_id: int = Field(foreign_key="generation_tasks.id", index=True)
+    attempt: int = Field(default=1, index=True)
+    version: int = Field(default=1, index=True)
+    status: str = Field(default="pending", index=True)
+    auto_review: bool = False
+    resume_claim_token: Optional[str] = None
+    resume_claimed_at: Optional[datetime] = None
+    resume_started_at: Optional[datetime] = None
+    resume_status: Optional[str] = None
+    query: str = ""
+    retrieval_json: str = "{}"
+    candidate_citation_ids_json: str = "[]"
+    selected_citation_ids_json: str = "[]"
+    supplemental_text: str = ""
+    decision_hash: Optional[str] = None
+    idempotency_key: Optional[str] = None
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow, sa_column_kwargs={"onupdate": _utcnow})
+
+    __table_args__ = (
+        UniqueConstraint("task_id", "attempt", name="uq_task_retrieval_checkpoint_attempt"),
+        Index("ix_task_retrieval_checkpoint_task_status", "task_id", "status"),
+    )
+
+
 class CaseDraft(SQLModel, table=True):
     __tablename__ = "case_drafts"
 

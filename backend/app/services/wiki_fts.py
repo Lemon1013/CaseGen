@@ -419,6 +419,18 @@ def upsert_wiki_page(target: Any, page: Any = None, content: str | None = None, 
     with _connection_scope(target) as connection:
         status = _require(connection)
         page_id, values = _page_values(page or fields, content, **fields)
+        if values.get("status") == "archived":
+            _execute(connection, f"DELETE FROM {WIKI_FTS_TABLE} WHERE rowid = :row_id", {"row_id": page_id})
+            return FtsOperationResult(
+                {
+                    "available": True,
+                    "fallback_required": False,
+                    "table": WIKI_FTS_TABLE,
+                    "id": page_id,
+                    "action": "delete",
+                    "tokenizer": status.tokenizer,
+                }
+            )
         _upsert(connection, WIKI_FTS_TABLE, values)
         return FtsOperationResult({"available": True, "fallback_required": False, "table": WIKI_FTS_TABLE, "id": page_id, "action": "upsert", "tokenizer": status.tokenizer})
 
@@ -457,14 +469,16 @@ def _rows_from_target(target: Any, connection: Any, table: str, space_id: int | 
             from app.models.entities import SourceChunk, WikiPageRow
             model = WikiPageRow if table == WIKI_FTS_TABLE else SourceChunk
             statement = select(model)
-            if space_id is not None and hasattr(model, "space_id"):
-                statement = statement.where(model.space_id == int(space_id))
             return list(target.exec(statement).all())
         source_table = "wiki_pages" if table == WIKI_FTS_TABLE else "source_chunks"
         sql = f"SELECT * FROM {source_table}"
         params: tuple[Any, ...] = ()
         if space_id is not None:
-            sql += " WHERE space_id = ?"
+            default_space_id = _default_space_id(connection)
+            if default_space_id is not None and int(space_id) == int(default_space_id):
+                sql += " WHERE space_id = ? OR space_id IS NULL"
+            else:
+                sql += " WHERE space_id = ?"
             params = (int(space_id),)
         result = _execute(connection, sql, params)
         rows = result.fetchall()
@@ -473,16 +487,79 @@ def _rows_from_target(target: Any, connection: Any, table: str, space_id: int | 
         return []
 
 
+def _default_space_id(connection: Any) -> int | None:
+    try:
+        result = _execute(connection, "SELECT id FROM wiki_spaces WHERE slug = 'default' LIMIT 1")
+        row = result.fetchone()
+        return int(row[0]) if row and row[0] is not None else None
+    except Exception:
+        return None
+
+
+def _filter_rows_for_space(
+    rows: list[Any],
+    *,
+    space_id: int | None,
+    default_space_id: int | None,
+) -> list[Any]:
+    if space_id is None:
+        return rows
+    include_legacy_null = default_space_id is not None and int(space_id) == int(default_space_id)
+    filtered: list[Any] = []
+    for row in rows:
+        raw_space_id = _get(row, "space_id")
+        if raw_space_id is None:
+            if include_legacy_null:
+                filtered.append(row)
+            continue
+        try:
+            if int(raw_space_id) == int(space_id):
+                filtered.append(row)
+        except (TypeError, ValueError):
+            continue
+    return filtered
+
+
 def rebuild_fts(target: Any, wiki_pages: Any = None, source_chunks: Any = None, *, clear: bool = True, space_id: int | None = None) -> FtsOperationResult:
     """Idempotently rebuild both indexes; supplied rows may be ORM or mappings."""
     with _connection_scope(target) as connection:
         status = _require(connection)
         pages = list(wiki_pages) if wiki_pages is not None else _rows_from_target(target, connection, WIKI_FTS_TABLE, space_id)
+        default_space_id = _default_space_id(connection) if space_id is not None else None
+        pages = _filter_rows_for_space(
+            pages,
+            space_id=space_id,
+            default_space_id=default_space_id,
+        )
+        # Archived pages remain in the canonical repository for history, but
+        # must never be projected into the default knowledge-search index.
+        pages = [
+            page for page in pages
+            if str(_get(page, "status", "published")) != "archived"
+        ]
         chunks = list(source_chunks) if source_chunks is not None else _rows_from_target(target, connection, SOURCE_CHUNKS_FTS_TABLE, space_id)
+        chunks = _filter_rows_for_space(
+            chunks,
+            space_id=space_id,
+            default_space_id=default_space_id,
+        )
         deleted_pages = deleted_chunks = 0
         if clear:
-            scope_clause = " WHERE space_id = :space_id" if space_id is not None else ""
-            scope_params = {"space_id": int(space_id)} if space_id is not None else {}
+            include_legacy_null = (
+                space_id is not None
+                and default_space_id is not None
+                and int(space_id) == int(default_space_id)
+            )
+            if include_legacy_null:
+                scope_clause = (
+                    " WHERE space_id = :space_id OR space_id IS NULL OR space_id = ''"
+                )
+            else:
+                scope_clause = " WHERE space_id = :space_id" if space_id is not None else ""
+            # FTS metadata columns are stored as text, so bind the scope as a
+            # string. SQLite otherwise treats ``space_id = 1`` differently
+            # from ``space_id = '1'`` for the virtual table.
+            scope_params = {"space_id": str(int(space_id))} if space_id is not None else {}
             page_count_result = _execute(connection, f"SELECT count(*) FROM {WIKI_FTS_TABLE}{scope_clause}", scope_params)
             chunk_count_result = _execute(connection, f"SELECT count(*) FROM {SOURCE_CHUNKS_FTS_TABLE}{scope_clause}", scope_params)
             deleted_pages = int(page_count_result.scalar_one() if hasattr(page_count_result, "scalar_one") else page_count_result.fetchone()[0])
@@ -490,9 +567,25 @@ def rebuild_fts(target: Any, wiki_pages: Any = None, source_chunks: Any = None, 
             _execute(connection, f"DELETE FROM {WIKI_FTS_TABLE}{scope_clause}", scope_params)
             _execute(connection, f"DELETE FROM {SOURCE_CHUNKS_FTS_TABLE}{scope_clause}", scope_params)
         for page in pages:
-            _upsert(connection, WIKI_FTS_TABLE, _page_values(page)[1])
+            overrides = {}
+            if (
+                space_id is not None
+                and default_space_id is not None
+                and _get(page, "space_id") is None
+                and int(space_id) == int(default_space_id)
+            ):
+                overrides["space_id"] = int(space_id)
+            _upsert(connection, WIKI_FTS_TABLE, _page_values(page, **overrides)[1])
         for chunk in chunks:
-            _upsert(connection, SOURCE_CHUNKS_FTS_TABLE, _source_values(chunk)[1])
+            overrides = {}
+            if (
+                space_id is not None
+                and default_space_id is not None
+                and _get(chunk, "space_id") is None
+                and int(space_id) == int(default_space_id)
+            ):
+                overrides["space_id"] = int(space_id)
+            _upsert(connection, SOURCE_CHUNKS_FTS_TABLE, _source_values(chunk, **overrides)[1])
         return FtsOperationResult({"available": True, "fallback_required": False, "tokenizer": status.tokenizer, "wiki_pages": len(pages), "source_chunks": len(chunks), "deleted_wiki_pages": deleted_pages, "deleted_source_chunks": deleted_chunks, "action": "rebuild"})
 
 
@@ -510,8 +603,12 @@ def index_counts(target: Any, *, space_id: int | None = None) -> dict[str, Any]:
             sql = f"SELECT count(*) FROM {table}"
             params: tuple[Any, ...] = ()
             if space_id is not None:
-                sql += " WHERE space_id = ?"
-                params = (int(space_id),)
+                default_space_id = _default_space_id(connection)
+                if default_space_id is not None and int(space_id) == int(default_space_id):
+                    sql += " WHERE space_id = ? OR space_id IS NULL OR space_id = ''"
+                else:
+                    sql += " WHERE space_id = ?"
+                params = (str(int(space_id)),)
             result = _execute(connection, sql, params)
             if hasattr(result, "scalar_one"):
                 return int(result.scalar_one())
@@ -568,7 +665,10 @@ def _search(target: Any, table: str, query: str, *, limit: int, offset: int, wei
             if value is not None and name in columns and name in {"space_id", "status", "domain", "page_type", "source_document_id", "document_id"}:
                 where.append(f"{table}.{name} = :filter_{name}")
                 params[f"filter_{name}"] = str(value)
-        if table == WIKI_FTS_TABLE and not include_archived and "status" not in filters:
+        # Archived pages are historical-only.  A status filter does not
+        # implicitly opt into history; callers must explicitly request
+        # include_archived=True.
+        if table == WIKI_FTS_TABLE and not include_archived:
             where.append(f"{table}.status != 'archived'")
         selected = ", ".join(f"{table}.{name} AS {name}" for name in columns)
         highlighted = ", ".join(f"highlight({table}, {searchable_start + index}, :open_tag, :close_tag) AS h_{name}" for index, name in enumerate(_SEARCH_FIELDS))

@@ -218,3 +218,50 @@ class WikiRollbackIn(BaseModel):
 
 class WikiRollbackOut(WikiRevisionOut):
     pass
+
+
+class WikiPurgeSpaceOut(BaseModel):
+    space_id: int
+    space_name: str
+    space_slug: str
+    pages: int = 0
+    revisions: int = 0
+    page_sources: int = 0
+    reviews: int = 0
+    files: int = 0
+
+
+class WikiPurgeCountsOut(BaseModel):
+    pages: int = 0
+    revisions: int = 0
+    page_sources: int = 0
+    reviews: int = 0
+    files: int = 0
+
+
+class WikiPurgePreviewOut(BaseModel):
+    scope: str = "all"
+    confirmation_text: str
+    plan_hash: str
+    spaces: List[WikiPurgeSpaceOut] = Field(default_factory=list)
+    totals: WikiPurgeCountsOut = Field(default_factory=WikiPurgeCountsOut)
+    missing: List[str] = Field(default_factory=list)
+    unsafe: List[str] = Field(default_factory=list)
+    active_jobs: List[int] = Field(default_factory=list)
+    warnings: List[str] = Field(default_factory=list)
+
+
+class WikiPurgeExecuteIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    scope: str = "all"
+    plan_hash: str = Field(min_length=1)
+    confirmation_text: str = Field(min_length=1)
+
+
+class WikiPurgeExecuteOut(BaseModel):
+    status: str
+    scope: str = "all"
+    plan_hash: str
+    counts: WikiPurgeCountsOut = Field(default_factory=WikiPurgeCountsOut)
+    warnings: List[str] = Field(default_factory=list)

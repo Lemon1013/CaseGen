@@ -260,15 +260,17 @@ def build_index_entries(
             or (include_legacy_null and _get(page, "space_id", default=None) is None)
         ]
     source_ids, source_counts = _source_maps(session, space_id)
-    entries = [
-        page_descriptor(
+    entries = []
+    for page in pages:
+        entry = page_descriptor(
             page,
             source_ids=source_ids,
             source_counts=source_counts,
             space_id=space_id,
         )
-        for page in pages
-    ]
+        if entry.get("status") == "archived":
+            continue
+        entries.append(entry)
     return sorted(entries, key=lambda item: (item["domain"], item["page_type"], item["title"], item["page_key"]))
 
 

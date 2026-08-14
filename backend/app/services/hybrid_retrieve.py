@@ -215,7 +215,11 @@ def _fts_rankings(
             return [], [], "heuristic_fallback", wiki_raw.error or source_raw.error
         page_by_id = {page.get("id"): page for page in pages}
         chunk_by_id = {chunk.get("id"): chunk for chunk in chunks}
-        wiki_hits = [{**page_by_id.get(hit.get("id"), {}), **hit} for hit in wiki_raw]
+        wiki_hits = [
+            {**page_by_id.get(hit.get("id"), {}), **hit}
+            for hit in wiki_raw
+            if hit.get("status") != "archived"
+        ]
         source_hits = [{**chunk_by_id.get(hit.get("id"), {}), **hit} for hit in source_raw]
         return wiki_hits, source_hits, "fts5_hybrid", None
     except Exception as exc:

@@ -1,5 +1,55 @@
 import { api } from './client'
 
+export interface WikiPurgeSpace {
+  space_id: number
+  space_name: string
+  space_slug: string
+  pages: number
+  revisions: number
+  page_sources: number
+  reviews: number
+  files: number
+}
+
+export interface WikiPurgeCounts {
+  pages: number
+  revisions: number
+  page_sources: number
+  reviews: number
+  files: number
+}
+
+export interface WikiPurgePreview {
+  scope: string
+  confirmation_text: string
+  plan_hash: string
+  spaces: WikiPurgeSpace[]
+  totals: WikiPurgeCounts
+  missing: string[]
+  unsafe: string[]
+  active_jobs: number[]
+  warnings: string[]
+}
+
+export interface WikiPurgeResult {
+  status: string
+  scope: string
+  plan_hash: string
+  counts: WikiPurgeCounts
+  warnings: string[]
+}
+
+export function previewArchivedWikiPurge() {
+  return api<WikiPurgePreview>('/api/admin/wiki/purge/preview')
+}
+
+export function purgeArchivedWiki(body: { scope: string; plan_hash: string; confirmation_text: string }) {
+  return api<WikiPurgeResult>('/api/admin/wiki/purge', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  })
+}
+
 export interface WikiPage {
   id: number
   path: string
@@ -166,8 +216,11 @@ export interface SourceChunk {
   end_char: number
 }
 
-export function listWikiPages(spaceId?: number) {
-  const query = spaceId ? `?space_id=${spaceId}` : ''
+export function listWikiPages(spaceId?: number, includeArchived = false) {
+  const params = new URLSearchParams()
+  if (spaceId) params.set('space_id', String(spaceId))
+  if (includeArchived) params.set('include_archived', 'true')
+  const query = params.toString() ? `?${params.toString()}` : ''
   return api<WikiPage[]>(`/api/wiki/pages${query}`)
 }
 
@@ -177,8 +230,11 @@ export interface WikiReviewBatchResult {
   skipped: Array<{ review_id: number; reason: string }>
 }
 
-export function getWikiPage(id: number, spaceId?: number) {
-  const query = spaceId ? `?space_id=${spaceId}` : ''
+export function getWikiPage(id: number, spaceId?: number, includeArchived = false) {
+  const params = new URLSearchParams()
+  if (spaceId) params.set('space_id', String(spaceId))
+  if (includeArchived) params.set('include_archived', 'true')
+  const query = params.toString() ? `?${params.toString()}` : ''
   return api<WikiPage>(`/api/wiki/pages/${id}${query}`)
 }
 

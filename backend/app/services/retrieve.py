@@ -192,6 +192,8 @@ def rank_pages(
         return []
     scored: list[dict[str, Any]] = []
     for p in pages:
+        if p.get("status") == "archived":
+            continue
         if types and p.get("page_type") not in types:
             continue
         s = score_text(
@@ -242,7 +244,13 @@ def load_all_wiki_pages(
     from app.services.wiki_spaces import resolve_space_id, space_scope_clause
 
     def _read_rows(sess: Session, sid: int) -> list[dict[str, Any]]:
-        rows = sess.exec(select(WikiPageRow).where(space_scope_clause(sess, WikiPageRow.space_id, sid))).all()
+        rows = sess.exec(
+            select(WikiPageRow)
+            .where(
+                space_scope_clause(sess, WikiPageRow.space_id, sid),
+                WikiPageRow.status != "archived",
+            )
+        ).all()
         page_ids = [row.id for row in rows if row.id is not None]
         source_statement = select(WikiPageSource)
         if page_ids:

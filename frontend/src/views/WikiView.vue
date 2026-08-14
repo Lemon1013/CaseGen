@@ -101,34 +101,36 @@ function itemKey(kind: 'wiki' | 'source', id: number | null | undefined) {
 
 const allItems = computed<ListItem[]>(() => {
   if (hits.value) {
-    return hits.value.map((h) => {
-      const source = isSourceHit(h)
-      const kind = source ? 'source' : 'wiki'
-      const id = source ? h.source_chunk_id ?? h.id : h.id
-      return {
-        id,
-        title: h.title,
-        path: h.path,
-        page_type: h.page_type || (source ? 'source_chunk' : 'page'),
-        tags: h.tags || [],
-        score: h.score,
-        snippet: h.snippet || '',
-        citation_type: kind,
-        source_chunk_id: h.source_chunk_id ?? (source ? h.id : null),
-        content: h.content,
-        start_char: h.start_char,
-        end_char: h.end_char,
-        clause_ids: h.clause_ids || [],
-        anchor_clause: h.anchor_clause,
-        page_key: h.page_key,
-        domain: h.domain,
-        status: h.status,
-        revision: h.revision,
-        source_document_id: h.source_document_id,
-        explain: h.explain,
-        key: itemKey(kind, id),
-      }
-    })
+    return hits.value
+      .filter((h) => h.status !== 'archived')
+      .map((h) => {
+        const source = isSourceHit(h)
+        const kind = source ? 'source' : 'wiki'
+        const id = source ? h.source_chunk_id ?? h.id : h.id
+        return {
+          id,
+          title: h.title,
+          path: h.path,
+          page_type: h.page_type || (source ? 'source_chunk' : 'page'),
+          tags: h.tags || [],
+          score: h.score,
+          snippet: h.snippet || '',
+          citation_type: kind,
+          source_chunk_id: h.source_chunk_id ?? (source ? h.id : null),
+          content: h.content,
+          start_char: h.start_char,
+          end_char: h.end_char,
+          clause_ids: h.clause_ids || [],
+          anchor_clause: h.anchor_clause,
+          page_key: h.page_key,
+          domain: h.domain,
+          status: h.status,
+          revision: h.revision,
+          source_document_id: h.source_document_id,
+          explain: h.explain,
+          key: itemKey(kind, id),
+        }
+      })
   }
   return pages.value.map((p) => ({
     id: p.id,
@@ -197,7 +199,9 @@ function expansionLabel(explain?: Record<string, unknown> | null) {
 async function loadPages() {
   loading.value = true
   try {
-    pages.value = currentSpace.value ? await listWikiPages(currentSpace.value.id) : []
+    pages.value = currentSpace.value
+      ? (await listWikiPages(currentSpace.value.id)).filter((page) => page.status !== 'archived')
+      : []
   } catch (e) {
     ElMessage.error(`加载 Wiki 页面失败：${(e as Error).message}`)
   } finally {
@@ -336,9 +340,9 @@ async function search() {
   searching.value = true
   try {
     const res = await retrieveWiki(q, 20, currentSpace.value?.id)
-    hits.value = res.hits
+    hits.value = res.hits.filter((hit) => hit.status !== 'archived')
     retrievalMode.value = res.retrieval_mode || ''
-    if (!res.hits.length) {
+    if (!hits.value.length) {
       ElMessage.info('未检索到相关页面')
     } else {
       // Auto-open first hit so user sees content immediately

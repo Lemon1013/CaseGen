@@ -9,6 +9,7 @@ from app.models.entities import SourceChunk
 from app.services.source_chunking import chunk_text
 from app.services.source_chunks_store import replace_chunks_for_document
 from app.api import documents as documents_api
+import time
 
 
 def test_chunk_text_splits_long_doc():
@@ -127,6 +128,7 @@ def test_generate_hybrid_citations(tmp_app_data, monkeypatch):
         return "# 用例：不可撤单\n- 关联知识：[1][S1]\n"
 
     monkeypatch.setattr("app.api.tasks._GENERATE_CHAT_FN", fake_chat)
+    monkeypatch.setattr("app.services.task_pipeline._GENERATE_CHAT_FN", fake_chat)
 
     tid = client.post(
         "/api/tasks",
@@ -140,7 +142,29 @@ def test_generate_hybrid_citations(tmp_app_data, monkeypatch):
 
     gen = client.post(f"/api/tasks/{tid}/generate")
     assert gen.status_code == 200
-    assert gen.json()["status"] == "generated"
+    assert gen.json()["status"] == "awaiting_confirmation"
+    checkpoint = client.get(f"/api/tasks/{tid}/retrieval-checkpoint")
+    assert checkpoint.status_code == 200
+    checkpoint_body = checkpoint.json()
+    candidate_types = {item.get("citation_type") for item in checkpoint_body["candidate_citations"]}
+    assert "wiki" in candidate_types
+    assert "source" in candidate_types
+    confirm = client.post(
+        f"/api/tasks/{tid}/retrieval-checkpoint/confirm",
+        json={
+            "selected_citation_ids": [item["id"] for item in checkpoint_body["candidate_citations"]],
+            "supplemental_text": "",
+            "expected_version": checkpoint_body["version"],
+            "idempotency_key": f"source-chunks-{tid}-{checkpoint_body['version']}",
+        },
+    )
+    assert confirm.status_code == 200
+    for _ in range(80):
+        current = client.get(f"/api/tasks/{tid}").json()
+        if current["status"] not in {"retrieving", "generating"}:
+            break
+        time.sleep(0.05)
+    assert current["status"] == "generated"
 
     cites = client.get(f"/api/tasks/{tid}/citations").json()
     types = {c.get("citation_type") for c in cites}

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { useAuthStore } from '../authStore'
 import {
   createWikiSpace,
   listWikiSpaces,
@@ -9,6 +10,7 @@ import {
   type WikiSpace,
   type WikiSpaceStatus,
 } from '../api/wikiSpaces'
+import { previewArchivedWikiPurge, purgeArchivedWiki, type WikiPurgePreview } from '../api/wiki'
 
 const spaces = ref<WikiSpace[]>([])
 const loading = ref(false)
@@ -17,6 +19,12 @@ const editing = ref<WikiSpace | null>(null)
 const form = reactive({ name: '', slug: '', description: '' })
 const statusFilter = ref<'all' | WikiSpaceStatus>('all')
 const statusChangingId = ref<number | null>(null)
+const auth = useAuthStore()
+const purgeDialogVisible = ref(false)
+const purgePreview = ref<WikiPurgePreview | null>(null)
+const purgeLoading = ref(false)
+const purgeExecuting = ref(false)
+const purgeConfirmation = ref('')
 const activeCount = computed(() => spaces.value.filter((space) => space.status === 'active').length)
 const archivedCount = computed(() => spaces.value.filter((space) => space.status === 'archived').length)
 const visibleSpaces = computed(() =>
@@ -33,6 +41,42 @@ async function load() {
     ElMessage.error(`加载 Wiki 空间失败：${(error as Error).message}`)
   } finally {
     loading.value = false
+  }
+}
+
+async function openPurge() {
+  purgeLoading.value = true
+  try {
+    purgePreview.value = await previewArchivedWikiPurge()
+    purgeConfirmation.value = ''
+    purgeDialogVisible.value = true
+  } catch (error) {
+    ElMessage.error(`预览归档清理失败：${(error as Error).message}`)
+  } finally {
+    purgeLoading.value = false
+  }
+}
+
+async function executePurge() {
+  const preview = purgePreview.value
+  if (
+    !preview ||
+    preview.totals.pages === 0 ||
+    preview.unsafe.length > 0 ||
+    preview.active_jobs.length > 0 ||
+    purgeConfirmation.value !== preview.confirmation_text
+  ) return
+  purgeExecuting.value = true
+  try {
+    const result = await purgeArchivedWiki({ scope: preview.scope, plan_hash: preview.plan_hash, confirmation_text: purgeConfirmation.value })
+    ElMessage.success(`已清理 ${result.counts.pages} 个归档页面`)
+    purgeDialogVisible.value = false
+    await load()
+  } catch (error) {
+    const message = (error as Error).message
+    ElMessage.error(message.includes('409') ? '清理计划已变化或存在活动任务，请重新预览后再试' : `归档清理失败：${message}`)
+  } finally {
+    purgeExecuting.value = false
   }
 }
 
@@ -121,6 +165,7 @@ onMounted(load)
           <el-option label="已归档" value="archived" />
         </el-select>
         <el-button type="primary" @click="openCreate">新建空间</el-button>
+        <el-button v-if="auth.user?.role === 'admin'" type="danger" :loading="purgeLoading" @click="openPurge">清理归档 Wiki</el-button>
       </div>
     </div>
 
@@ -191,6 +236,32 @@ onMounted(load)
       <template #footer>
         <el-button @click="dialogVisible = false">取消</el-button>
         <el-button type="primary" @click="save">保存</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="purgeDialogVisible" title="清理所有归档 Wiki 内容" width="680px" :close-on-click-modal="!purgeExecuting" :close-on-press-escape="!purgeExecuting" :show-close="!purgeExecuting">
+      <template v-if="purgePreview">
+        <el-alert v-if="purgePreview.warnings.length" type="warning" :closable="false" title="执行前检查">
+          <div v-for="warning in purgePreview.warnings" :key="warning">{{ warning }}</div>
+        </el-alert>
+        <el-alert v-if="purgePreview.unsafe.length || purgePreview.active_jobs.length" type="error" :closable="false" title="当前计划不可执行">
+          <div v-if="purgePreview.unsafe.length">存在 {{ purgePreview.unsafe.length }} 个不安全路径，已阻止删除。</div>
+          <div v-if="purgePreview.active_jobs.length">存在活动摄入任务（{{ purgePreview.active_jobs.length }} 个），请等待任务结束后刷新预览。</div>
+        </el-alert>
+        <el-table :data="purgePreview.spaces" size="small" class="purge-table">
+          <el-table-column prop="space_name" label="空间" />
+          <el-table-column prop="pages" label="页面" />
+          <el-table-column prop="revisions" label="修订" />
+          <el-table-column prop="page_sources" label="来源" />
+          <el-table-column prop="reviews" label="审核" />
+          <el-table-column prop="files" label="文件" />
+        </el-table>
+        <p>总计：{{ purgePreview.totals.pages }} 页面，{{ purgePreview.totals.files }} 个 Markdown 文件</p>
+        <el-input v-model="purgeConfirmation" :disabled="purgeExecuting" placeholder="请输入服务端 confirmation_text" />
+      </template>
+      <template #footer>
+        <el-button :disabled="purgeExecuting" @click="purgeDialogVisible = false">取消</el-button>
+        <el-button type="danger" :loading="purgeExecuting" :disabled="!purgePreview || purgePreview.totals.pages === 0 || purgePreview.unsafe.length > 0 || purgePreview.active_jobs.length > 0 || purgeConfirmation !== purgePreview.confirmation_text" @click="executePurge">永久清理</el-button>
       </template>
     </el-dialog>
   </div>
