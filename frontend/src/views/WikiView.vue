@@ -740,14 +740,14 @@ watch(
 }
 
 .page-item:hover {
-  border-color: rgba(79, 124, 255, 0.35);
+  border-color: rgba(var(--cg-primary-rgb), 0.35);
   box-shadow: var(--cg-shadow);
 }
 
 .page-item.active {
   border-color: var(--cg-border-strong);
-  box-shadow: 0 0 0 1px rgba(79, 124, 255, 0.12), var(--cg-shadow);
-  background: linear-gradient(90deg, rgba(79, 124, 255, 0.06), #fff 40%);
+  box-shadow: 0 0 0 1px rgba(var(--cg-primary-rgb), 0.12), var(--cg-shadow);
+  background: linear-gradient(90deg, rgba(var(--cg-primary-rgb), 0.06), var(--cg-surface) 40%);
 }
 
 .page-item.active::before {

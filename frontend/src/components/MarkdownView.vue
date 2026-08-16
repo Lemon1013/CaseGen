@@ -126,7 +126,7 @@ function onClick(e: MouseEvent) {
   padding: 0.2em 0.8em;
   border-left: 4px solid var(--cg-primary);
   color: var(--cg-text-secondary);
-  background: rgba(79, 124, 255, 0.05);
+  background: rgba(var(--cg-primary-rgb), 0.05);
 }
 
 .markdown-view :deep(table) {

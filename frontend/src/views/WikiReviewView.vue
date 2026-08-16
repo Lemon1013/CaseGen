@@ -745,7 +745,7 @@ watch(
 }
 
 .review-item.active {
-  background: linear-gradient(90deg, rgba(79, 124, 255, 0.07), #fff 55%);
+  background: linear-gradient(90deg, rgba(var(--cg-primary-rgb), 0.07), var(--cg-surface) 55%);
 }
 
 .review-item-title,

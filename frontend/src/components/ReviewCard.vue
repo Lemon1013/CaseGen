@@ -112,7 +112,7 @@ const highScore = computed(() => score.value != null && score.value >= 80)
 }
 
 .score.good {
-  background: linear-gradient(135deg, rgba(18, 184, 134, 0.16), rgba(79, 124, 255, 0.1));
+  background: linear-gradient(135deg, rgba(18, 184, 134, 0.16), rgba(var(--cg-primary-rgb), 0.1));
   color: var(--cg-accent);
   border-color: rgba(18, 184, 134, 0.3);
 }

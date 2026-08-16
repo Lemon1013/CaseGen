@@ -12,7 +12,6 @@ import {
   finalizeTask,
   generateTask,
   getTask,
-  IN_PROGRESS_STATUSES,
   listCitations,
   listDrafts,
   listEvents,
@@ -21,6 +20,7 @@ import {
   optimizePromptTask,
   regenerateTask,
   reviewTask,
+  shouldPollTaskStatus,
   statusLabel,
   statusTagType,
   taskStreamUrl,
@@ -35,7 +35,14 @@ import {
   updateTaskModel,
   confirmRetrievalCheckpoint,
   getRetrievalCheckpoint,
+  getTestPointCheckpoint,
+  editTestPoints,
+  confirmTestPoints,
+  getTaskCoverage,
   type RetrievalCheckpoint,
+  type TestPointCheckpoint,
+  type TestPointItem,
+  type CoverageSummary,
 } from '../api/tasks'
 import { listModels, type ModelConfig } from '../api/models'
 
@@ -54,6 +61,10 @@ const checkpoint = ref<RetrievalCheckpoint | null>(null)
 const selectedCitationIds = ref<number[]>([])
 const supplementalText = ref('')
 const confirmingCheckpoint = ref(false)
+const testPointCheckpoint = ref<TestPointCheckpoint | null>(null)
+const testPoints = ref<TestPointItem[]>([])
+const confirmingTestPoints = ref(false)
+const coverage = ref<CoverageSummary | null>(null)
 const models = ref<ModelConfig[]>([])
 const activeDraftTab = ref('')
 
@@ -82,8 +93,12 @@ let postGenerationConfirmTimer: number | null = null
 let postGenerationConfirmTaskId: number | null = null
 let postGenerationConfirmAttempts = 0
 let postGenerationConfirmEpoch = 0
+let dataRequestSequence = 0
+let latestAppliedDataRequest = 0
+let refreshInFlightSequence: number | null = null
+let loadSequence = 0
 
-const LIVE_STREAM_STATUSES = new Set(['retrieving', 'generating', 'regenerating'])
+const LIVE_STREAM_STATUSES = new Set(['retrieving', 'generating_test_points', 'generating', 'regenerating'])
 const LIVE_STREAM_MAX_RECONNECTS = 3
 const POST_GENERATION_CONFIRM_DELAY_MS = 400
 const POST_GENERATION_CONFIRM_ATTEMPTS = 10
@@ -91,7 +106,7 @@ const POST_GENERATION_CONFIRM_ATTEMPTS = 10
 const taskId = computed(() => Number(route.params.id))
 
 const isBusy = computed(() =>
-  task.value ? IN_PROGRESS_STATUSES.has(task.value.status) : false,
+  shouldPollTaskStatus(task.value?.status),
 )
 
 const isLiveGeneration = computed(() =>
@@ -126,9 +141,78 @@ const highlightFinal = computed(() => {
   return Boolean(r.payload?.ready_for_final) || r.score >= 80
 })
 
+function formatCoverage(value: number): string {
+  return `${value}%`
+}
+
+function nextDataRequest(): number {
+  dataRequestSequence += 1
+  return dataRequestSequence
+}
+
+function canApplyDataRequest(id: number, sequence: number): boolean {
+  return id === taskId.value && sequence >= latestAppliedDataRequest
+}
+
+function markDataRequestApplied(sequence: number) {
+  latestAppliedDataRequest = sequence
+}
+
+function invalidatePendingDataReads() {
+  markDataRequestApplied(nextDataRequest())
+}
+
+function applyTaskUpdate(updated: TaskItem) {
+  invalidatePendingDataReads()
+  task.value = updated
+}
+
+function hydrateRetrievalEditor(fresh: RetrievalCheckpoint) {
+  const changed = !checkpoint.value
+    || checkpoint.value.id !== fresh.id
+    || checkpoint.value.version !== fresh.version
+  checkpoint.value = fresh
+  if (!changed) return
+  selectedCitationIds.value = fresh.selected_citation_ids.length
+    ? [...fresh.selected_citation_ids]
+    : fresh.candidate_citations.map((item) => item.id)
+  supplementalText.value = fresh.supplemental_text || ''
+}
+
+function hydrateTestPointEditor(fresh: TestPointCheckpoint) {
+  const changed = !testPointCheckpoint.value
+    || testPointCheckpoint.value.id !== fresh.id
+    || testPointCheckpoint.value.version !== fresh.version
+  testPointCheckpoint.value = fresh
+  if (changed) testPoints.value = fresh.points.map((item) => ({ ...item }))
+}
+
+function syncCheckpointEditors(
+  status: string,
+  retrievalFresh: RetrievalCheckpoint | null,
+  testPointFresh: TestPointCheckpoint | null,
+) {
+  if (status === 'awaiting_confirmation' && retrievalFresh) {
+    hydrateRetrievalEditor(retrievalFresh)
+  } else {
+    checkpoint.value = null
+    selectedCitationIds.value = []
+    supplementalText.value = ''
+  }
+
+  if (status === 'awaiting_test_point_confirmation' && testPointFresh) {
+    hydrateTestPointEditor(testPointFresh)
+  } else {
+    testPointCheckpoint.value = null
+    testPoints.value = []
+  }
+}
+
 async function loadAll() {
   const id = taskId.value
   if (!id || Number.isNaN(id)) return
+  const requestSequence = nextDataRequest()
+  const currentLoadSequence = ++loadSequence
   loading.value = true
   try {
     const [t, d, e, rev, revs, c, modelRows] = await Promise.all([
@@ -140,22 +224,23 @@ async function loadAll() {
       listCitations(id),
       listModels().catch(() => [] as ModelConfig[]),
     ])
-    if (id !== taskId.value) return
+    const retrievalFresh = t.status === 'awaiting_confirmation'
+      ? await getRetrievalCheckpoint(id)
+      : null
+    const testPointFresh = t.status === 'awaiting_test_point_confirmation'
+      ? await getTestPointCheckpoint(id).catch(() => null)
+      : null
+    const coverageFresh = await getTaskCoverage(id).catch(() => null)
+    if (!canApplyDataRequest(id, requestSequence)) return
+    markDataRequestApplied(requestSequence)
     task.value = t
     drafts.value = d
     events.value = e
     reviews.value = rev
     revisions.value = revs
     citations.value = c
-    if (t.status === 'awaiting_confirmation') {
-      checkpoint.value = await getRetrievalCheckpoint(id)
-      selectedCitationIds.value = checkpoint.value.selected_citation_ids.length
-        ? [...checkpoint.value.selected_citation_ids]
-        : checkpoint.value.candidate_citations.map((item) => item.id)
-      supplementalText.value = checkpoint.value.supplemental_text || ''
-    } else {
-      checkpoint.value = null
-    }
+    syncCheckpointEditors(t.status, retrievalFresh, testPointFresh)
+    coverage.value = coverageFresh
     models.value = modelRows
     retryModelId.value =
       t.model_id ?? modelRows.find((model) => model.is_default)?.id ?? modelRows[0]?.id ?? null
@@ -163,11 +248,11 @@ async function loadAll() {
       activeDraftTab.value = String(d[0].id)
     }
   } catch (err) {
-    if (id === taskId.value) {
+    if (canApplyDataRequest(id, requestSequence)) {
       ElMessage.error(`加载任务失败：${(err as Error).message}`)
     }
   } finally {
-    if (id === taskId.value) loading.value = false
+    if (id === taskId.value && currentLoadSequence === loadSequence) loading.value = false
   }
 }
 
@@ -179,13 +264,14 @@ async function confirmCheckpoint() {
   }
   confirmingCheckpoint.value = true
   try {
-    task.value = await confirmRetrievalCheckpoint(task.value.id, {
+    const updated = await confirmRetrievalCheckpoint(task.value.id, {
       selected_citation_ids: selectedCitationIds.value,
       supplemental_text: supplementalText.value,
       expected_version: checkpoint.value.version,
       idempotency_key: `task-${task.value.id}-checkpoint-${checkpoint.value.id}-v${checkpoint.value.version}`,
     })
-    await refreshLight()
+    applyTaskUpdate(updated)
+    await refreshLight(true)
   } catch (err) {
     ElMessage.error(`确认失败：${(err as Error).message}`)
   } finally {
@@ -193,9 +279,12 @@ async function confirmCheckpoint() {
   }
 }
 
-async function refreshLight(): Promise<boolean> {
+async function refreshLight(force = false): Promise<boolean> {
   const id = taskId.value
   if (!id || Number.isNaN(id)) return false
+  if (refreshInFlightSequence !== null && !force) return false
+  const requestSequence = nextDataRequest()
+  refreshInFlightSequence = requestSequence
   try {
     const [t, d, e, rev, revs, c] = await Promise.all([
       getTask(id),
@@ -205,27 +294,23 @@ async function refreshLight(): Promise<boolean> {
       listRevisions(id),
       listCitations(id),
     ])
-    if (id !== taskId.value) return false
+    const retrievalFresh = t.status === 'awaiting_confirmation'
+      ? await getRetrievalCheckpoint(id)
+      : null
+    const testPointFresh = t.status === 'awaiting_test_point_confirmation'
+      ? await getTestPointCheckpoint(id).catch(() => null)
+      : null
+    const coverageFresh = await getTaskCoverage(id).catch(() => null)
+    if (!canApplyDataRequest(id, requestSequence)) return false
+    markDataRequestApplied(requestSequence)
     task.value = t
     drafts.value = d
     events.value = e
     reviews.value = rev
     revisions.value = revs
     citations.value = c
-    if (t.status === 'awaiting_confirmation') {
-      const fresh = await getRetrievalCheckpoint(id)
-      if (!checkpoint.value || checkpoint.value.id !== fresh.id || checkpoint.value.version !== fresh.version) {
-        checkpoint.value = fresh
-        selectedCitationIds.value = fresh.selected_citation_ids.length
-          ? [...fresh.selected_citation_ids]
-          : fresh.candidate_citations.map((item) => item.id)
-        supplementalText.value = fresh.supplemental_text || ''
-      }
-    } else {
-      checkpoint.value = null
-      selectedCitationIds.value = []
-      supplementalText.value = ''
-    }
+    syncCheckpointEditors(t.status, retrievalFresh, testPointFresh)
+    coverage.value = coverageFresh
     if (d.length && !d.some((x) => String(x.id) === activeDraftTab.value)) {
       activeDraftTab.value = String(d[0].id)
     }
@@ -233,13 +318,79 @@ async function refreshLight(): Promise<boolean> {
   } catch {
     // keep polling; surface hard errors on manual actions
     return false
+  } finally {
+    if (refreshInFlightSequence === requestSequence) refreshInFlightSequence = null
   }
+}
+
+function addTestPoint() {
+  const next = testPoints.value.length + 1
+  testPoints.value.push({
+    id: -Date.now(), task_id: taskId.value, checkpoint_id: testPointCheckpoint.value?.id || 0,
+    stable_key: `TP-${String(next).padStart(3, '0')}`, title: '', verification_goal: '',
+    dimension: task.value?.test_dimensions?.[0] || 'positive', priority: 'P1', sort_order: next - 1,
+    is_selected: true, is_excluded: false, citation_ids: [], created_at: '', updated_at: '',
+  })
+}
+
+function removeTestPoint(index: number) {
+  testPoints.value.splice(index, 1)
+  testPoints.value.forEach((item, itemIndex) => { item.sort_order = itemIndex })
+}
+
+function pointPayload() {
+  return testPoints.value.map((item, index) => ({
+    stable_key: item.stable_key,
+    title: item.title,
+    verification_goal: item.verification_goal,
+    dimension: item.dimension,
+    priority: item.priority,
+    sort_order: index,
+    is_selected: item.is_selected,
+    is_excluded: item.is_excluded,
+    citation_ids: item.citation_ids,
+  }))
+}
+
+async function saveTestPoints() {
+  if (!testPointCheckpoint.value) return
+  confirmingTestPoints.value = true
+  try {
+    const saved = await editTestPoints(taskId.value, {
+      expected_version: testPointCheckpoint.value.version,
+      points: pointPayload(),
+    })
+    invalidatePendingDataReads()
+    testPointCheckpoint.value = saved
+    testPoints.value = saved.points.map((item) => ({ ...item }))
+    ElMessage.success('测试点编辑已保存')
+  } catch (err) {
+    ElMessage.error(`保存测试点失败：${(err as Error).message}`)
+  } finally {
+    confirmingTestPoints.value = false
+  }
+}
+
+async function confirmTestPointStage() {
+  if (!task.value || !testPointCheckpoint.value) return
+  confirmingTestPoints.value = true
+  try {
+    const updated = await confirmTestPoints(task.value.id, {
+      expected_version: testPointCheckpoint.value.version,
+      idempotency_key: `task-${task.value.id}-test-points-${testPointCheckpoint.value.id}-v${testPointCheckpoint.value.version}`,
+      points: pointPayload(),
+    })
+    applyTaskUpdate(updated)
+    await refreshLight(true)
+    ElMessage.success('测试点已确认，开始生成完整用例')
+  } catch (err) { ElMessage.error(`确认测试点失败：${(err as Error).message}`) }
+  finally { confirmingTestPoints.value = false }
 }
 
 function startPolling() {
   stopPolling()
   pollTimer = window.setInterval(() => {
-    if (isBusy.value) {
+    if (shouldPollTaskStatus(task.value?.status)) {
       void refreshLight()
     }
   }, 2000)
@@ -570,7 +721,7 @@ function syncLiveStream() {
     if (isFailed) {
       clearLivePreview()
       liveStreamError.value = task.value?.error_message || liveStreamError.value
-    } else if (task.value && !IN_PROGRESS_STATUSES.has(task.value.status)) {
+    } else if (task.value && !shouldPollTaskStatus(task.value.status)) {
       clearLivePreview()
       liveStageMessage.value = ''
       liveStageStatus.value = ''
@@ -594,10 +745,10 @@ async function runAction(
   try {
     ElMessage.info(`已提交${label}…`)
     const updated = await fn(task.value.id)
-    task.value = updated
-    await refreshLight()
+    applyTaskUpdate(updated)
+    await refreshLight(true)
     // 后台任务：接口快速返回 in-progress，由轮询刷新结果，按钮不必一直转
-    if (IN_PROGRESS_STATUSES.has(updated.status)) {
+    if (shouldPollTaskStatus(updated.status)) {
       ElMessage.success(`${label}已在后台执行，状态会自动刷新`)
     } else if (updated.status === 'failed') {
       ElMessage.error(`${label}失败：${updated.error_message || '未知错误'}`)
@@ -606,7 +757,7 @@ async function runAction(
     }
   } catch (e) {
     ElMessage.error(`${label}失败：${(e as Error).message}`)
-    await refreshLight()
+    await refreshLight(true)
   } finally {
     acting.value = false
   }
@@ -665,7 +816,8 @@ async function onSwitchModelAndRetry() {
   }
   acting.value = true
   try {
-    task.value = await updateTaskModel(task.value.id, retryModelId.value)
+    const updated = await updateTaskModel(task.value.id, retryModelId.value)
+    applyTaskUpdate(updated)
     ElMessage.success('模型已切换，正在重新生成')
   } catch (e) {
     ElMessage.error(`切换模型失败：${(e as Error).message}`)
@@ -696,20 +848,22 @@ async function confirmApply() {
   }
   acting.value = true
   try {
-    await applyPrompt(task.value.id, {
+    const applied = await applyPrompt(task.value.id, {
       revision_id: selectedRevision.value.id,
       mode: applyMode.value,
       content: editedPromptContent.value,
     })
+    applyTaskUpdate(applied)
     ElMessage.success(
       applyMode.value === 'global' ? '已全局启用新 Prompt' : '已仅对本任务应用 Prompt',
     )
     applyDialogVisible.value = false
     if (alsoRegenerate.value) {
-      await regenerateTask(task.value.id)
+      const regenerated = await regenerateTask(task.value.id)
+      applyTaskUpdate(regenerated)
       ElMessage.success('已触发再生成')
     }
-    await refreshLight()
+    await refreshLight(true)
   } catch (e) {
     ElMessage.error(`应用失败：${(e as Error).message}`)
   } finally {
@@ -731,6 +885,8 @@ watch(
 )
 
 watch(taskId, () => {
+  invalidatePendingDataReads()
+  refreshInFlightSequence = null
   activeDraftTab.value = ''
   cancelPostGenerationConfirmation()
   clearLiveStreamConnection({ clearPreview: true, clearStage: true })
@@ -784,7 +940,7 @@ onUnmounted(() => {
         <p class="title-line">{{ task?.title || '（无标题）' }}</p>
       </div>
       <div class="page-actions">
-        <el-button @click="refreshLight">刷新</el-button>
+        <el-button @click="refreshLight()">刷新</el-button>
       </div>
     </div>
 
@@ -810,6 +966,25 @@ onUnmounted(() => {
       </el-checkbox-group>
       <el-input v-model="supplementalText" type="textarea" :rows="4" maxlength="10000" show-word-limit placeholder="补充上下文（可选）" />
       <el-button type="primary" :loading="confirmingCheckpoint" :disabled="!selectedCitationIds.length && !supplementalText.trim()" @click="confirmCheckpoint">确认并生成</el-button>
+    </el-card>
+
+    <el-card v-if="(task?.status === 'awaiting_test_point_confirmation' || task?.status === 'generating_test_points') && testPointCheckpoint" shadow="never" class="block checkpoint-card test-point-card">
+      <template #header>
+        <div class="card-head"><span>测试点确认</span><el-tag type="warning" size="small">先确认测试点，再生成完整用例</el-tag></div>
+      </template>
+      <p class="meta">可编辑标题、验证目标、维度、优先级、选择状态和引用；删除或排除不需要的测试点。</p>
+      <div v-for="(point, index) in testPoints" :key="point.id" class="test-point-editor">
+        <div class="test-point-editor-head"><strong>{{ point.stable_key }}</strong><el-button link type="danger" @click="removeTestPoint(index)">删除</el-button></div>
+        <el-input v-model="point.title" placeholder="测试点标题" class="point-title-input" />
+        <el-input v-model="point.verification_goal" type="textarea" :rows="2" placeholder="验证目标" />
+        <div class="point-controls">
+          <el-select v-model="point.dimension" style="width: 150px"><el-option v-for="dimension in (task?.test_dimensions || [])" :key="dimension" :label="dimension" :value="dimension" /></el-select>
+          <el-select v-model="point.priority" style="width: 110px"><el-option label="P0" value="P0" /><el-option label="P1" value="P1" /><el-option label="P2" value="P2" /></el-select>
+          <el-checkbox v-model="point.is_selected">选中</el-checkbox>
+          <el-checkbox v-model="point.is_excluded">排除</el-checkbox>
+        </div>
+      </div>
+      <div class="point-actions"><el-button @click="addTestPoint">新增测试点</el-button><el-button :loading="confirmingTestPoints" :disabled="task?.status !== 'awaiting_test_point_confirmation'" @click="saveTestPoints">保存编辑</el-button><el-button type="primary" :loading="confirmingTestPoints" :disabled="task?.status !== 'awaiting_test_point_confirmation'" @click="confirmTestPointStage">保存并确认测试点</el-button></div>
     </el-card>
 
     <el-alert
@@ -945,6 +1120,20 @@ onUnmounted(() => {
           <TaskTimeline :events="events" />
         </el-card>
 
+        <el-card v-if="coverage" shadow="never" class="block">
+          <template #header>覆盖概览</template>
+          <el-progress :percentage="coverage.coverage_percent" :format="formatCoverage" />
+          <div class="coverage-stats">已覆盖 {{ coverage.covered_test_points }} / {{ coverage.selected_test_points }} 个选中测试点；未覆盖 {{ coverage.uncovered_test_points }} 个</div>
+          <el-collapse>
+            <el-collapse-item title="测试点明细" name="points">
+              <div v-for="point in coverage.points" :key="point.stable_key" class="coverage-row"><el-tag size="small" :type="point.covered ? 'success' : 'warning'">{{ point.covered ? '已覆盖' : '未覆盖' }}</el-tag><span>{{ point.stable_key }} · {{ point.title }}</span><small>{{ point.priority }} · {{ point.dimension }}</small></div>
+            </el-collapse-item>
+            <el-collapse-item title="引用使用明细" name="citations">
+              <div v-for="citation in coverage.citations" :key="citation.citation_id" class="coverage-row"><el-tag size="small" :type="citation.used ? 'success' : 'info'">{{ citation.used ? '已使用' : '未使用' }}</el-tag><span>[{{ citation.citation_id }}] {{ citation.title }}</span><small>{{ citation.test_point_keys.join('、') || '无测试点' }}</small></div>
+            </el-collapse-item>
+          </el-collapse>
+        </el-card>
+
         <el-card shadow="never" class="block">
           <CitationList
             :citations="citations"
@@ -1033,8 +1222,8 @@ onUnmounted(() => {
   border: 1px solid var(--cg-border);
   background: linear-gradient(
     135deg,
-    rgba(79, 124, 255, 0.06),
-    rgba(139, 92, 246, 0.05)
+    rgba(var(--cg-primary-rgb), 0.06),
+    rgba(var(--cg-primary-2-rgb), 0.05)
   );
 }
 

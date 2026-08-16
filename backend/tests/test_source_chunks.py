@@ -127,8 +127,28 @@ def test_generate_hybrid_citations(tmp_app_data, monkeypatch):
         assert "原文" in joined or "Source" in joined or "[S1]" in joined or "不接受撤单" in joined
         return "# 用例：不可撤单\n- 关联知识：[1][S1]\n"
 
+    point_payload = json.dumps(
+        {
+            "test_points": [
+                {
+                    "stable_key": "TP-001",
+                    "title": "验证不可撤单窗口",
+                    "verification_goal": "验证确认的 Wiki 和原文引用支持该规则",
+                    "dimension": "boundary",
+                    "priority": "P1",
+                    "citation_ids": ["1", "S1"],
+                }
+            ]
+        },
+        ensure_ascii=False,
+    )
+
     monkeypatch.setattr("app.api.tasks._GENERATE_CHAT_FN", fake_chat)
     monkeypatch.setattr("app.services.task_pipeline._GENERATE_CHAT_FN", fake_chat)
+    monkeypatch.setattr("app.api.tasks._TEST_POINTS_CHAT_FN", lambda **kwargs: point_payload)
+    monkeypatch.setattr(
+        "app.services.task_pipeline._TEST_POINTS_CHAT_FN", lambda **kwargs: point_payload
+    )
 
     tid = client.post(
         "/api/tasks",
@@ -161,7 +181,19 @@ def test_generate_hybrid_citations(tmp_app_data, monkeypatch):
     assert confirm.status_code == 200
     for _ in range(80):
         current = client.get(f"/api/tasks/{tid}").json()
-        if current["status"] not in {"retrieving", "generating"}:
+        if current["status"] == "awaiting_test_point_confirmation":
+            point_checkpoint = client.get(f"/api/tasks/{tid}/test-points").json()
+            point_confirm = client.post(
+                f"/api/tasks/{tid}/test-points/confirm",
+                json={
+                    "points": point_checkpoint["points"],
+                    "expected_version": point_checkpoint["version"],
+                    "idempotency_key": f"source-points-{tid}-{point_checkpoint['version']}",
+                },
+            )
+            assert point_confirm.status_code == 200
+            continue
+        if current["status"] not in {"retrieving", "generating", "generating_test_points"}:
             break
         time.sleep(0.05)
     assert current["status"] == "generated"

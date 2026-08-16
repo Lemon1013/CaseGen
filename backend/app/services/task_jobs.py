@@ -17,7 +17,12 @@ from typing import Optional
 from sqlmodel import Session
 
 from app.db import get_engine
-from app.models.entities import GenerationTask, CaseDraft, TaskRetrievalCheckpoint
+from app.models.entities import (
+    CaseDraft,
+    GenerationTask,
+    TaskRetrievalCheckpoint,
+    TaskTestPointCheckpoint,
+)
 from sqlalchemy import exists, update, or_
 from sqlmodel import select
 from app.services.task_events import append_event
@@ -53,6 +58,11 @@ class _JobClaim:
     launch_created_at: datetime | None = None
     checkpoint_id: int | None = None
     claim_token: str | None = None
+    checkpoint_kind: str = "retrieval"
+
+
+def _checkpoint_model(kind: str):
+    return TaskTestPointCheckpoint if kind == "test_points" else TaskRetrievalCheckpoint
 
 
 def _claim_job(
@@ -62,6 +72,7 @@ def _claim_job(
     require_stream: bool,
     checkpoint_id: int | None = None,
     claim_token: str | None = None,
+    checkpoint_kind: str = "retrieval",
 ) -> _JobClaim:
     """Atomically verify a background job still owns its task before running.
 
@@ -86,7 +97,7 @@ def _claim_job(
             if task is None or task.status not in expected_statuses:
                 return _JobClaim(False)
             if checkpoint_id is not None:
-                checkpoint = session.get(TaskRetrievalCheckpoint, checkpoint_id)
+                checkpoint = session.get(_checkpoint_model(checkpoint_kind), checkpoint_id)
                 if checkpoint is None or checkpoint.task_id != task_id:
                     return _JobClaim(False)
                 if claim_token is None or checkpoint.resume_claim_token != claim_token:
@@ -94,7 +105,14 @@ def _claim_job(
                 if checkpoint.resume_status not in (None, "claimed"):
                     return _JobClaim(False)
             launch_created_at = task.created_at
-        return _JobClaim(True, expected_stream_id, launch_created_at, checkpoint_id, claim_token)
+        return _JobClaim(
+            True,
+            expected_stream_id,
+            launch_created_at,
+            checkpoint_id,
+            claim_token,
+            checkpoint_kind,
+        )
 
 
 def _consume_resume_claim(claim: _JobClaim) -> bool:
@@ -104,11 +122,11 @@ def _consume_resume_claim(claim: _JobClaim) -> bool:
     now = _utcnow()
     with Session(get_engine()) as session:
         result = session.exec(
-            update(TaskRetrievalCheckpoint)
-            .where(TaskRetrievalCheckpoint.id == claim.checkpoint_id)
-            .where(TaskRetrievalCheckpoint.status == "confirmed")
-            .where(TaskRetrievalCheckpoint.resume_claim_token == claim.claim_token)
-            .where(TaskRetrievalCheckpoint.resume_started_at.is_(None))
+            update(_checkpoint_model(claim.checkpoint_kind))
+            .where(_checkpoint_model(claim.checkpoint_kind).id == claim.checkpoint_id)
+            .where(_checkpoint_model(claim.checkpoint_kind).status == "confirmed")
+            .where(_checkpoint_model(claim.checkpoint_kind).resume_claim_token == claim.claim_token)
+            .where(_checkpoint_model(claim.checkpoint_kind).resume_started_at.is_(None))
             .values(resume_started_at=now, resume_status="running", updated_at=now)
         )
         if result.rowcount != 1:
@@ -123,10 +141,10 @@ def _finish_resume_claim(claim: _JobClaim, status: str) -> None:
         return
     with Session(get_engine()) as session:
         session.exec(
-            update(TaskRetrievalCheckpoint)
-            .where(TaskRetrievalCheckpoint.id == claim.checkpoint_id)
-            .where(TaskRetrievalCheckpoint.resume_claim_token == claim.claim_token)
-            .where(TaskRetrievalCheckpoint.resume_status == "running")
+            update(_checkpoint_model(claim.checkpoint_kind))
+            .where(_checkpoint_model(claim.checkpoint_kind).id == claim.checkpoint_id)
+            .where(_checkpoint_model(claim.checkpoint_kind).resume_claim_token == claim.claim_token)
+            .where(_checkpoint_model(claim.checkpoint_kind).resume_status == "running")
             .values(resume_status=status, updated_at=_utcnow())
         )
         session.commit()
@@ -138,6 +156,7 @@ def _fail_if_stuck(session: Session, task_id: int, message: str) -> bool:
         return False
     if task.status in (
         "retrieving",
+        "generating_test_points",
         "generating",
         "reviewing",
         "optimizing",
@@ -151,16 +170,22 @@ def _fail_if_stuck(session: Session, task_id: int, message: str) -> bool:
     return False
 
 
-def _heartbeat_resume_claim(checkpoint_id: int, claim_token: str, stop_event: threading.Event, interval: float = 30.0) -> None:
+def _heartbeat_resume_claim(
+    checkpoint_id: int,
+    claim_token: str,
+    stop_event: threading.Event,
+    interval: float = 30.0,
+    checkpoint_kind: str = "retrieval",
+) -> None:
     """Refresh a running lease until the worker finishes or loses ownership."""
     while not stop_event.wait(interval):
         now = _utcnow()
         with Session(get_engine()) as session:
             result = session.exec(
-                update(TaskRetrievalCheckpoint)
-                .where(TaskRetrievalCheckpoint.id == checkpoint_id)
-                .where(TaskRetrievalCheckpoint.resume_claim_token == claim_token)
-                .where(TaskRetrievalCheckpoint.resume_status == "running")
+                update(_checkpoint_model(checkpoint_kind))
+                .where(_checkpoint_model(checkpoint_kind).id == checkpoint_id)
+                .where(_checkpoint_model(checkpoint_kind).resume_claim_token == claim_token)
+                .where(_checkpoint_model(checkpoint_kind).resume_status == "running")
                 .values(resume_claimed_at=now, updated_at=now)
             )
             session.commit()
@@ -230,13 +255,20 @@ def _mark_job_failed(
             )
 
 
-def job_generate(task_id: int, auto_review: bool = False, checkpoint_id: int | None = None, claim_token: str | None = None) -> None:
+def job_generate(
+    task_id: int,
+    auto_review: bool = False,
+    checkpoint_id: int | None = None,
+    claim_token: str | None = None,
+    checkpoint_kind: str = "retrieval",
+) -> None:
     claim = _claim_job(
         task_id,
-        expected_statuses=frozenset({"retrieving", "generating"}),
+        expected_statuses=frozenset({"retrieving", "generating_test_points", "generating"}),
         require_stream=True,
         checkpoint_id=checkpoint_id,
         claim_token=claim_token,
+        checkpoint_kind=checkpoint_kind,
     )
     if not claim.claimed:
         return
@@ -247,7 +279,7 @@ def job_generate(task_id: int, auto_review: bool = False, checkpoint_id: int | N
     if claim.checkpoint_id is not None and claim.claim_token is not None:
         heartbeat_thread = threading.Thread(
             target=_heartbeat_resume_claim,
-            args=(claim.checkpoint_id, claim.claim_token, heartbeat_stop),
+            args=(claim.checkpoint_id, claim.claim_token, heartbeat_stop, 30.0, claim.checkpoint_kind),
             daemon=True,
         )
         heartbeat_thread.start()
@@ -278,49 +310,96 @@ def job_generate(task_id: int, auto_review: bool = False, checkpoint_id: int | N
 
 
 def recover_generation_jobs() -> list[int]:
-    """Resume confirmed generation tasks left behind by a process restart."""
+    """Resume either stage of the durable two-checkpoint generation flow."""
+
     with Session(get_engine()) as session:
-        rows = session.exec(
-            select(GenerationTask.id, TaskRetrievalCheckpoint.id, TaskRetrievalCheckpoint.auto_review)
-            .join(TaskRetrievalCheckpoint, TaskRetrievalCheckpoint.task_id == GenerationTask.id)
-            .where(GenerationTask.status == "generating")
-            .where(TaskRetrievalCheckpoint.status == "confirmed")
-            .where(~exists().where(CaseDraft.task_id == GenerationTask.id))
-            .order_by(TaskRetrievalCheckpoint.attempt.desc())
+        tasks = session.exec(
+            select(GenerationTask)
+            .where(GenerationTask.status.in_({"generating_test_points", "generating"}))
+            .order_by(GenerationTask.id.asc())
         ).all()
-        latest_by_task = {}
-        for row in rows:
-            latest_by_task.setdefault(int(row[0]), row)
-        claimed_rows = []
-        for task_id, row in latest_by_task.items():
-            current = session.get(TaskRetrievalCheckpoint, int(row[1]))
-            now = _utcnow()
-            if current is None or (
+        claimed_rows: list[tuple[int, int, bool, str, str]] = []
+        now = _utcnow()
+        for task in tasks:
+            task_id = int(task.id)
+            kind = "retrieval" if task.status == "generating_test_points" else "test_points"
+            model = _checkpoint_model(kind)
+            statement = (
+                select(model)
+                .where(model.task_id == task_id)
+                .where(model.status == "confirmed")
+                .order_by(model.attempt.desc())
+            )
+            current = session.exec(statement).first()
+            # Old databases/tasks may be mid-generation without a test-point
+            # checkpoint.  Migrate them to the explicit test-point stage
+            # before claiming the confirmed retrieval lease; never schedule a
+            # legacy task directly into complete-case generation.
+            if current is None and task.status == "generating":
+                kind = "retrieval"
+                model = TaskRetrievalCheckpoint
+                current = session.exec(
+                    select(model)
+                    .where(model.task_id == task_id)
+                    .where(model.status == "confirmed")
+                    .order_by(model.attempt.desc())
+                ).first()
+                if current is not None:
+                    task.status = transition(task.status, "generating_test_points")
+                    task.updated_at = now
+                    session.add(task)
+                    append_event(
+                        session,
+                        task_id,
+                        "recovery",
+                        "兼容恢复：旧生成任务迁移到测试点生成阶段",
+                        detail={"retrieval_checkpoint_id": current.id},
+                    )
+            if current is None:
+                continue
+            if task.status == "generating" and session.exec(
+                select(CaseDraft.id).where(CaseDraft.task_id == task_id)
+            ).first() is not None:
+                continue
+            if (
                 current.resume_claim_token is not None
+                and current.resume_status in {"claimed", "running"}
                 and (current.resume_claimed_at is None or current.resume_claimed_at >= now - timedelta(minutes=5))
             ):
                 continue
             token = secrets.token_urlsafe(24)
             result = session.exec(
-                update(TaskRetrievalCheckpoint)
-                .where(TaskRetrievalCheckpoint.id == int(row[1]))
-                .where(TaskRetrievalCheckpoint.status == "confirmed")
+                update(model)
+                .where(model.id == int(current.id))
+                .where(model.status == "confirmed")
                 .where(
                     or_(
-                        TaskRetrievalCheckpoint.resume_claim_token.is_(None),
-                        TaskRetrievalCheckpoint.resume_claimed_at < (now - timedelta(minutes=5)),
+                        model.resume_claim_token.is_(None),
+                        model.resume_claimed_at < (now - timedelta(minutes=5)),
+                        model.resume_status == "completed",
                     )
                 )
-                .values(resume_claim_token=token, resume_claimed_at=now, resume_status="claimed", resume_started_at=None, updated_at=now)
+                .values(
+                    resume_claim_token=token,
+                    resume_claimed_at=now,
+                    resume_status="claimed",
+                    resume_started_at=None,
+                    updated_at=now,
+                )
             )
             if result.rowcount != 1:
                 continue
-            claimed_rows.append((task_id, int(row[1]), bool(row[2]), token))
+            claimed_rows.append((task_id, int(current.id), bool(getattr(current, "auto_review", False)), token, kind))
         session.commit()
     ids = [int(row[0]) for row in claimed_rows]
-    for task_id, checkpoint_id, auto_review, token in claimed_rows:
-        task_stream.start(task_id, status="generating", message="恢复中断的生成任务")
-        threading.Thread(target=job_generate, args=(task_id, auto_review, checkpoint_id, token), daemon=True).start()
+    for task_id, checkpoint_id, auto_review, token, kind in claimed_rows:
+        status = "generating_test_points" if kind == "retrieval" else "generating"
+        task_stream.start(task_id, status=status, message="恢复中断的生成任务")
+        threading.Thread(
+            target=job_generate,
+            args=(task_id, auto_review, checkpoint_id, token, kind),
+            daemon=True,
+        ).start()
     return ids
 
 

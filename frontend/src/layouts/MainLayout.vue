@@ -18,6 +18,7 @@ import {
 } from '@element-plus/icons-vue'
 import { listModels, type ModelConfig } from '../api/models'
 import { useAuthStore } from '../authStore'
+import BrandMark from '../components/BrandMark.vue'
 
 const route = useRoute()
 const auth = useAuthStore()
@@ -103,9 +104,7 @@ onMounted(loadDefaultModel)
     <el-aside width="228px" class="sidebar">
       <div class="sidebar-accent" />
       <div class="logo">
-        <div class="logo-mark">
-          <el-icon :size="16"><Collection /></el-icon>
-        </div>
+        <BrandMark class="logo-mark" :size="36" title="CaseGen 用例叠层" />
         <div class="logo-text">
           <div class="logo-title">CaseGen</div>
           <div class="logo-sub">AI 测试用例平台</div>
@@ -224,7 +223,7 @@ onMounted(loadDefaultModel)
   width: 228px !important;
   height: 100vh;
   z-index: 30;
-  background: linear-gradient(180deg, #0b1220 0%, var(--cg-sidebar) 40%, #05080f 100%);
+  background: linear-gradient(180deg, var(--cg-sidebar-elevated) 0%, var(--cg-sidebar) 40%, var(--cg-sidebar) 100%);
   color: var(--cg-text-on-dark);
   display: flex;
   flex-direction: column;
@@ -239,7 +238,7 @@ onMounted(loadDefaultModel)
   right: 0;
   height: 2px;
   background: var(--cg-gradient-brand);
-  box-shadow: 0 0 18px rgba(79, 124, 255, 0.65);
+  box-shadow: 0 0 18px var(--cg-brand-glow);
 }
 
 .logo {
@@ -251,14 +250,8 @@ onMounted(loadDefaultModel)
 }
 
 .logo-mark {
-  width: 36px;
-  height: 36px;
-  border-radius: 10px;
-  display: grid;
-  place-items: center;
-  background: var(--cg-gradient-brand);
-  color: #fff;
-  box-shadow: 0 0 0 4px rgba(79, 124, 255, 0.15), 0 8px 20px rgba(79, 124, 255, 0.35);
+  flex: 0 0 auto;
+  filter: drop-shadow(0 8px 16px var(--cg-brand-shadow));
 }
 
 .logo-title {
@@ -342,12 +335,8 @@ onMounted(loadDefaultModel)
 
 .nav-group-toggle.active {
   color: #fff;
-  background: linear-gradient(
-    90deg,
-    rgba(79, 124, 255, 0.22),
-    rgba(139, 92, 246, 0.12)
-  );
-  box-shadow: inset 0 0 0 1px rgba(79, 124, 255, 0.18);
+  background: var(--cg-sidebar-active);
+  box-shadow: inset 0 0 0 1px var(--cg-sidebar-active-border);
 }
 
 .nav-group-toggle.active::before {
@@ -387,12 +376,8 @@ onMounted(loadDefaultModel)
 
 .nav-item.active {
   color: #fff;
-  background: linear-gradient(
-    90deg,
-    rgba(79, 124, 255, 0.22),
-    rgba(139, 92, 246, 0.12)
-  );
-  box-shadow: inset 0 0 0 1px rgba(79, 124, 255, 0.18);
+  background: var(--cg-sidebar-active);
+  box-shadow: inset 0 0 0 1px var(--cg-sidebar-active-border);
 }
 
 .nav-item.active::before {
@@ -408,6 +393,12 @@ onMounted(loadDefaultModel)
 
 .nav-icon {
   opacity: 0.9;
+}
+
+.nav-item:focus-visible,
+.nav-group-toggle:focus-visible {
+  outline: 2px solid var(--cg-primary);
+  outline-offset: 2px;
 }
 
 .sidebar-footer {

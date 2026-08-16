@@ -1,4 +1,5 @@
 import json
+import json
 import time
 
 import threading
@@ -46,7 +47,36 @@ def _retrieve_hits(*_args, **_kwargs):
     }
 
 
-def _confirm(client: TestClient, task_id: int, selected: list[int], supplemental: str = "", **extra):
+def _install_point_chat(monkeypatch):
+    payload = json.dumps(
+        {
+            "test_points": [
+                {
+                    "stable_key": "TP-001",
+                    "title": "验证已确认引用",
+                    "verification_goal": "验证确认后的需求行为",
+                    "dimension": "positive",
+                    "priority": "P1",
+                    "citation_ids": [],
+                }
+            ]
+        },
+        ensure_ascii=False,
+    )
+    monkeypatch.setattr("app.api.tasks._TEST_POINTS_CHAT_FN", lambda **kwargs: payload)
+    monkeypatch.setattr("app.services.task_pipeline._TEST_POINTS_CHAT_FN", lambda **kwargs: payload)
+
+
+def _confirm(
+    client: TestClient,
+    task_id: int,
+    selected: list[int],
+    supplemental: str = "",
+    monkeypatch=None,
+    **extra,
+):
+    if monkeypatch is not None:
+        _install_point_chat(monkeypatch)
     checkpoint = client.get(f"/api/tasks/{task_id}/retrieval-checkpoint").json()
     payload = {
         "selected_citation_ids": selected,
@@ -59,7 +89,19 @@ def _confirm(client: TestClient, task_id: int, selected: list[int], supplemental
     if response.status_code == 200:
         for _ in range(80):
             current = client.get(f"/api/tasks/{task_id}").json()
-            if current["status"] not in {"generating", "retrieving"}:
+            if current["status"] == "awaiting_test_point_confirmation":
+                point_checkpoint = client.get(f"/api/tasks/{task_id}/test-points").json()
+                point_response = client.post(
+                    f"/api/tasks/{task_id}/test-points/confirm",
+                    json={
+                        "points": point_checkpoint["points"],
+                        "expected_version": point_checkpoint["version"],
+                        "idempotency_key": f"checkpoint-points-{task_id}-{point_checkpoint['version']}",
+                    },
+                )
+                assert point_response.status_code == 200
+                continue
+            if current["status"] not in {"generating", "retrieving", "generating_test_points"}:
                 return type("Response", (), {"status_code": 200, "json": lambda self: current})()
             time.sleep(0.05)
     return response
@@ -114,7 +156,7 @@ def test_confirm_subset_and_supplemental_resumes_once_without_retrieve(tmp_app_d
     assert client.post(f"/api/tasks/{task_id}/generate").json()["status"] == "awaiting_confirmation"
     checkpoint = client.get(f"/api/tasks/{task_id}/retrieval-checkpoint").json()
     second_id = checkpoint["candidate_citations"][1]["id"]
-    response = _confirm(client, task_id, [second_id], "只关注 B 规则")
+    response = _confirm(client, task_id, [second_id], "只关注 B 规则", monkeypatch)
     assert response.status_code == 200
     assert response.json()["status"] == "generated", {
         "task": response.json(),
@@ -145,7 +187,7 @@ def test_duplicate_titles_use_distinct_citation_identity(tmp_app_data, monkeypat
     )
     client.post(f"/api/tasks/{task_id}/generate")
     cp = client.get(f"/api/tasks/{task_id}/retrieval-checkpoint").json()
-    _confirm(client, task_id, [cp["candidate_citations"][1]["id"]])
+    _confirm(client, task_id, [cp["candidate_citations"][1]["id"]], monkeypatch=monkeypatch)
     assert "B 规则内容" in messages[0]
     assert "A 规则内容" not in messages[0]
 
@@ -161,13 +203,13 @@ def test_checkpoint_validation_idempotency_and_cross_task(tmp_app_data, monkeypa
     client.post(f"/api/tasks/{second}/generate")
     first_cp = client.get(f"/api/tasks/{first}/retrieval-checkpoint").json()
     second_cp = client.get(f"/api/tasks/{second}/retrieval-checkpoint").json()
-    empty = _confirm(client, first, [])
+    empty = _confirm(client, first, [], monkeypatch=monkeypatch)
     assert empty.status_code == 422
-    cross = _confirm(client, first, [second_cp["candidate_citations"][0]["id"]])
+    cross = _confirm(client, first, [second_cp["candidate_citations"][0]["id"]], monkeypatch=monkeypatch)
     assert cross.status_code == 422
-    stale = _confirm(client, first, [first_cp["candidate_citations"][0]["id"]], expected_version=999)
+    stale = _confirm(client, first, [first_cp["candidate_citations"][0]["id"]], monkeypatch=monkeypatch, expected_version=999)
     assert stale.status_code == 409
-    confirmed = _confirm(client, first, [first_cp["candidate_citations"][0]["id"]])
+    confirmed = _confirm(client, first, [first_cp["candidate_citations"][0]["id"]], monkeypatch=monkeypatch)
     assert confirmed.status_code == 200
     repeated = client.post(
         f"/api/tasks/{first}/retrieval-checkpoint/confirm",

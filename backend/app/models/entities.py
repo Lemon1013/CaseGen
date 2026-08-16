@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import Index, UniqueConstraint, text
+from sqlalchemy import Column, ForeignKey, Index, Integer, UniqueConstraint, text
 from sqlmodel import Field, SQLModel
 
 
@@ -276,6 +276,11 @@ class GenerationTask(SQLModel, table=True):
     review_model_id: Optional[int] = None
     prompt_template_id: Optional[int] = None
     temp_prompt_content: Optional[str] = None
+    # Persisted generation strategy.  These fields deliberately live on the
+    # task instead of the requirement so retries and resumed jobs use the
+    # exact strategy selected when the task was created.
+    generation_granularity: str = "standard"
+    test_dimensions_json: str = '["positive", "negative", "boundary"]'
     error_message: Optional[str] = None
     # The exact draft selected for final import.  These fields were added
     # after the original task workflow; they remain nullable so old rows and
@@ -284,6 +289,26 @@ class GenerationTask(SQLModel, table=True):
     finalized_at: Optional[datetime] = None
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow, sa_column_kwargs={"onupdate": _utcnow})
+
+
+class TaskReferenceCase(SQLModel, table=True):
+    """Immutable prompt-only snapshot of a reference test case."""
+
+    __tablename__ = "task_reference_cases"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    task_id: int = Field(foreign_key="generation_tasks.id", index=True)
+    source_case_id: Optional[int] = Field(default=None, index=True)
+    source_case_key: Optional[str] = ""
+    title_snapshot: str = ""
+    content_md_snapshot: str = ""
+    content_hash: str = ""
+    source: str = "case_library"  # case_library | manual
+    created_at: datetime = Field(default_factory=_utcnow)
+
+    __table_args__ = (
+        Index("ix_task_reference_cases_task_source", "task_id", "source"),
+    )
 
 
 class TaskCitation(SQLModel, table=True):
@@ -338,6 +363,81 @@ class TaskRetrievalCheckpoint(SQLModel, table=True):
     )
 
 
+class TaskTestPointCheckpoint(SQLModel, table=True):
+    """Durable, versioned checkpoint for human confirmation of test points."""
+
+    __tablename__ = "task_test_point_checkpoints"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    task_id: int = Field(foreign_key="generation_tasks.id", index=True)
+    retrieval_checkpoint_id: Optional[int] = Field(
+        default=None,
+        sa_column=Column(
+            Integer,
+            ForeignKey("task_retrieval_checkpoints.id", ondelete="CASCADE"),
+            nullable=True,
+            index=True,
+        ),
+    )
+    attempt: int = Field(default=1, index=True)
+    version: int = Field(default=1, index=True)
+    status: str = Field(default="pending", index=True)
+    auto_review: bool = False
+    decision_hash: Optional[str] = None
+    idempotency_key: Optional[str] = None
+    resume_claim_token: Optional[str] = None
+    resume_claimed_at: Optional[datetime] = None
+    resume_started_at: Optional[datetime] = None
+    resume_status: Optional[str] = None
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow, sa_column_kwargs={"onupdate": _utcnow})
+
+    __table_args__ = (
+        UniqueConstraint("task_id", "attempt", name="uq_task_test_point_checkpoint_attempt"),
+        Index("ix_task_test_point_checkpoint_task_status", "task_id", "status"),
+    )
+
+
+class TestPoint(SQLModel, table=True):
+    """Normalized current test point proposed for a task."""
+
+    __tablename__ = "test_points"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    task_id: int = Field(foreign_key="generation_tasks.id", index=True)
+    checkpoint_id: int = Field(foreign_key="task_test_point_checkpoints.id", index=True)
+    stable_key: str = Field(index=True)
+    title: str
+    verification_goal: str = ""
+    dimension: str = "positive"
+    priority: str = "P1"
+    sort_order: int = 0
+    is_selected: bool = True
+    is_excluded: bool = False
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow, sa_column_kwargs={"onupdate": _utcnow})
+
+    __table_args__ = (
+        UniqueConstraint("checkpoint_id", "stable_key", name="uq_test_points_checkpoint_key"),
+        Index("ix_test_points_task_current_order", "task_id", "checkpoint_id", "sort_order"),
+    )
+
+
+class TestPointCitation(SQLModel, table=True):
+    """Normalized citation -> test point relationship."""
+
+    __tablename__ = "test_point_citations"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    test_point_id: int = Field(foreign_key="test_points.id", index=True)
+    citation_id: int = Field(foreign_key="task_citations.id", index=True)
+    created_at: datetime = Field(default_factory=_utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("test_point_id", "citation_id", name="uq_test_point_citations"),
+    )
+
+
 class CaseDraft(SQLModel, table=True):
     __tablename__ = "case_drafts"
 
@@ -347,6 +447,22 @@ class CaseDraft(SQLModel, table=True):
     content_md: str
     prompt_version_ref: Optional[str] = None
     created_at: datetime = Field(default_factory=_utcnow)
+
+
+class DraftTestPointLink(SQLModel, table=True):
+    """Normalized generated-draft case section -> test point relationship."""
+
+    __tablename__ = "draft_test_point_links"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    draft_id: int = Field(foreign_key="case_drafts.id", index=True)
+    case_key: str = Field(index=True)
+    test_point_id: int = Field(foreign_key="test_points.id", index=True)
+    created_at: datetime = Field(default_factory=_utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("draft_id", "case_key", "test_point_id", name="uq_draft_test_point_link"),
+    )
 
 
 class ReviewResult(SQLModel, table=True):
@@ -398,6 +514,7 @@ class TestCase(SQLModel, table=True):
     case_key: str = Field(index=True)
     title: str = ""
     content_md: str = ""
+    priority: str = Field(default="P1", index=True)
     status: str = Field(default="active", index=True)
     revision: int = Field(default=1)
     # Source references are intentionally not foreign keys: deleting a task
@@ -424,6 +541,28 @@ class TestCase(SQLModel, table=True):
         # diagnostic warning can be emitted instead of an opaque create_all
         # IntegrityError.
         Index("ix_test_cases_requirement_case_key", "requirement_id", "case_key"),
+    )
+
+
+class TestPointCaseLink(SQLModel, table=True):
+    """Normalized confirmed test point -> imported current case relationship."""
+
+    __tablename__ = "test_point_case_links"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    test_point_id: int = Field(foreign_key="test_points.id", index=True)
+    test_case_id: int = Field(
+        sa_column=Column(
+            Integer,
+            ForeignKey("test_cases.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        )
+    )
+    created_at: datetime = Field(default_factory=_utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("test_point_id", "test_case_id", name="uq_test_point_case_link"),
     )
 
 
