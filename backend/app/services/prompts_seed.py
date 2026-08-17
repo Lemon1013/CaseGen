@@ -9,8 +9,10 @@ from app.models.entities import PromptTemplate
 
 PROMPT_TYPES = (
     "generate",
+    "test_points",
     "review",
     "optimize",
+    "requirement_optimize",
     "wiki_analyze",
     "wiki_write",
 )
@@ -19,7 +21,7 @@ DEFAULT_PROMPTS_DIR = Path(__file__).resolve().parents[1] / "default_prompts"
 
 # Bump this only when the bundled prompt contract changes. Recognized v1 hashes
 # let existing installations upgrade without replacing a user-created prompt.
-BUNDLED_PROMPT_VERSION = 5
+BUNDLED_PROMPT_VERSION = 6
 _LEGACY_DEFAULT_HASHES: dict[str, frozenset[str]] = {
     "generate": frozenset(
         {
@@ -33,12 +35,14 @@ _LEGACY_DEFAULT_HASHES: dict[str, frozenset[str]] = {
             "d0880132a4281dbfc3f2b8e5b0e9e25fac0f9ccbf2a367175f926ba5498fb74b",
         }
     ),
+    "test_points": frozenset(),
     "optimize": frozenset(
         {
             "ac8acfdc68fa6e00979b853dfcd33214892912444e629d9afbba0289e3d8a66b",
             "161d4dfe7adffa4d3a99ce23264b806f1c1353850b45eb2d72e578f4c36f879f",
         }
     ),
+    "requirement_optimize": frozenset(),
     "wiki_analyze": frozenset(
         {
             "7db70a093e6d4a15be629f8c4c5e75cc6d3cefb925b76a3daec0c7adb5bab288",

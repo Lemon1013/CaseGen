@@ -40,6 +40,10 @@ export interface TaskItem {
   finalized_at?: string | null
   imported_case_ids?: number[]
   imported_case_count?: number
+  generation_granularity: 'compact' | 'standard' | 'detailed' | string
+  test_dimensions: string[]
+  reference_case_count: number
+  test_point_count: number
   created_at: string
   updated_at: string
 }
@@ -54,6 +58,10 @@ export interface TaskCreate {
   auto_review?: boolean
   run_generate?: boolean
   wiki_space_id?: number
+  generation_granularity?: 'compact' | 'standard' | 'detailed'
+  test_dimensions?: string[]
+  reference_case_ids?: number[]
+  reference_text?: string
 }
 
 export interface CaseDraft {
@@ -127,6 +135,80 @@ export interface RetrievalCheckpoint {
   updated_at: string
 }
 
+export interface TaskReferenceCase {
+  id: number
+  task_id: number
+  source_case_id: number | null
+  source_case_key: string | null
+  title_snapshot: string
+  content_md_snapshot: string
+  content_hash: string
+  source: 'case_library' | 'manual' | string
+  created_at: string
+}
+
+export interface TestPointItem {
+  id: number
+  task_id: number
+  checkpoint_id: number
+  stable_key: string
+  title: string
+  verification_goal: string
+  dimension: string
+  priority: 'P0' | 'P1' | 'P2' | string
+  sort_order: number
+  is_selected: boolean
+  is_excluded: boolean
+  citation_ids: number[]
+  created_at: string
+  updated_at: string
+}
+
+export interface TestPointCheckpoint {
+  id: number
+  task_id: number
+  retrieval_checkpoint_id: number | null
+  attempt: number
+  version: number
+  status: string
+  points: TestPointItem[]
+  idempotency_key: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface CoveragePoint {
+  stable_key: string
+  title: string
+  priority: string
+  dimension: string
+  selected: boolean
+  excluded: boolean
+  covered: boolean
+  case_ids: number[]
+  citation_ids: number[]
+}
+
+export interface CoverageCitation {
+  citation_id: number
+  title: string
+  path: string
+  test_point_keys: string[]
+  case_ids: number[]
+  used: boolean
+}
+
+export interface CoverageSummary {
+  task_id: number
+  total_test_points: number
+  selected_test_points: number
+  covered_test_points: number
+  uncovered_test_points: number
+  coverage_percent: number
+  points: CoveragePoint[]
+  citations: CoverageCitation[]
+}
+
 export type ApplyPromptMode = 'global' | 'task_temp'
 
 export const IN_PROGRESS_STATUSES = new Set([
@@ -135,8 +217,12 @@ export const IN_PROGRESS_STATUSES = new Set([
   'reviewing',
   'optimizing',
   'regenerating',
-  'awaiting_confirmation',
+  'generating_test_points',
 ])
+
+export function shouldPollTaskStatus(status: string | null | undefined): boolean {
+  return Boolean(status && IN_PROGRESS_STATUSES.has(status))
+}
 
 export function listTasks() {
   return api<TaskItem[]>('/api/tasks')
@@ -233,11 +319,83 @@ export function confirmRetrievalCheckpoint(id: number, body: { selected_citation
   })
 }
 
+export function optimizeRequirement(body: {
+  title: string
+  description: string
+  focus_tags?: string[]
+  model_id?: number | null
+}) {
+  return api<{
+    title: string
+    description: string
+    questions: string[]
+    prompt_type: string
+  }>('/api/tasks/requirement-optimize', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  })
+}
+
+export function getTestPointCheckpoint(id: number) {
+  return api<TestPointCheckpoint>(`/api/tasks/${id}/test-points`)
+}
+
+export function editTestPoints(id: number, body: {
+  points: Array<Partial<TestPointItem> & {
+    stable_key: string
+    title: string
+    verification_goal: string
+    dimension: string
+    priority: string
+    sort_order: number
+    is_selected: boolean
+    is_excluded: boolean
+    citation_ids: number[]
+  }>
+  expected_version: number
+}) {
+  return api<TestPointCheckpoint>(`/api/tasks/${id}/test-points`, {
+    method: 'PUT',
+    body: JSON.stringify(body),
+  })
+}
+
+export function confirmTestPoints(id: number, body: {
+  points: Array<{
+    stable_key: string
+    title: string
+    verification_goal: string
+    dimension: string
+    priority: string
+    sort_order: number
+    is_selected: boolean
+    is_excluded: boolean
+    citation_ids: number[]
+  }>
+  expected_version: number
+  idempotency_key: string
+}) {
+  return api<TaskItem>(`/api/tasks/${id}/test-points/confirm`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  })
+}
+
+export function listTaskReferences(id: number) {
+  return api<TaskReferenceCase[]>(`/api/tasks/${id}/references`)
+}
+
+export function getTaskCoverage(id: number) {
+  return api<CoverageSummary>(`/api/tasks/${id}/coverage`)
+}
+
 export function statusLabel(status: string): string {
   const map: Record<string, string> = {
     draft: '草稿',
     retrieving: '检索中',
     awaiting_confirmation: '等待确认',
+    generating_test_points: '生成测试点中',
+    awaiting_test_point_confirmation: '等待测试点确认',
     generating: '生成中',
     generated: '已生成',
     reviewing: '评审中',
@@ -258,6 +416,9 @@ export function statusTagType(status: string): '' | 'success' | 'warning' | 'inf
     case 'reviewed':
       return 'info'
     case 'retrieving':
+    case 'awaiting_confirmation':
+    case 'generating_test_points':
+    case 'awaiting_test_point_confirmation':
     case 'generating':
     case 'reviewing':
     case 'optimizing':

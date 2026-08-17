@@ -55,6 +55,7 @@ def _case_out(session: Session, row: TestCase) -> TestCaseOut:
         content_md=row.content_md,
         content=row.content_md,
         status=row.status,
+        priority=getattr(row, "priority", None) or "P1",
         revision=int(row.revision),
         source_task_id=row.source_task_id,
         source_draft_id=row.source_draft_id,
@@ -176,6 +177,7 @@ def list_cases(
     include_archived: bool = Query(default=False),
     keyword: str | None = Query(default=None, max_length=200),
     status: str | None = Query(default=None),
+    priority: str | None = Query(default=None),
     session: Session = Depends(get_session),
 ) -> list[TestCaseOut]:
     statement = select(TestCase)
@@ -187,6 +189,10 @@ def list_cases(
         statement = statement.where(TestCase.status == status)
     elif not include_archived:
         statement = statement.where(TestCase.status != "archived")
+    if priority not in {None, "", "P0", "P1", "P2"}:
+        raise HTTPException(status_code=422, detail="priority must be P0, P1 or P2")
+    if priority:
+        statement = statement.where(TestCase.priority == priority)
     if keyword and keyword.strip():
         pattern = f"%{keyword.strip()}%"
         statement = statement.join(Requirement, TestCase.requirement_id == Requirement.id).where(
@@ -289,6 +295,7 @@ def create_case(
         case_key=case_key,
         title=title,
         content_md=content,
+        priority=body.priority,
         status="active",
         revision=1,
     )
@@ -325,7 +332,8 @@ def update_case(
     before = row.content_md
     title_changed = body.title is not None and body.title != row.title
     content_changed = content is not None and content != row.content_md
-    if not title_changed and not content_changed:
+    priority_changed = body.priority is not None and body.priority != (getattr(row, "priority", None) or "P1")
+    if not title_changed and not content_changed and not priority_changed:
         return _case_out(session, row)
     if body.title is not None:
         title = body.title.strip()
@@ -334,6 +342,8 @@ def update_case(
         row.title = title
     if content is not None:
         row.content_md = content
+    if body.priority is not None:
+        row.priority = body.priority
     row.revision += 1
     row.updated_at = _utcnow()
     session.add(row)
@@ -349,6 +359,7 @@ def update_case(
         source_draft_id=row.source_draft_id,
         source_case_key=row.source_case_key,
         title_changed=title_changed,
+        changed_fields={"priority"} if priority_changed else None,
     )
     session.commit()
     session.refresh(row)

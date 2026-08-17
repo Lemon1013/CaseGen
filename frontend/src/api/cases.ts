@@ -6,6 +6,7 @@ export interface TestCaseItem {
   case_key: string
   source_case_key: string | null
   title: string
+  priority: 'P0' | 'P1' | 'P2' | string
   content_md: string
   content?: string | null
   status: 'active' | 'archived' | string
@@ -44,12 +45,14 @@ export function listCases(opts?: {
   include_archived?: boolean
   keyword?: string
   status?: 'active' | 'archived' | ''
+  priority?: 'P0' | 'P1' | 'P2' | ''
 }) {
   const query = new URLSearchParams()
   if (opts?.requirement_id != null) query.set('requirement_id', String(opts.requirement_id))
   if (opts?.include_archived) query.set('include_archived', 'true')
   if (opts?.keyword?.trim()) query.set('keyword', opts.keyword.trim())
   if (opts?.status) query.set('status', opts.status)
+  if (opts?.priority) query.set('priority', opts.priority)
   const suffix = query.toString() ? `?${query.toString()}` : ''
   return api<TestCaseItem[]>(`/api/cases${suffix}`)
 }
@@ -65,6 +68,7 @@ export function updateCase(
     content_md?: string
     expected_revision?: number
     reason?: string
+    priority?: 'P0' | 'P1' | 'P2'
   },
 ) {
   return api<TestCaseItem>(`/api/cases/${id}`, {

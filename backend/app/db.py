@@ -508,6 +508,103 @@ def _migrate_case_management_schema(engine) -> None:
             )
 
 
+def _migrate_test_design_schema(engine) -> None:
+    """Upgrade the task/test-point schema for existing SQLite databases.
+
+    ``SQLModel.metadata.create_all`` creates the new normalized tables, but it
+    intentionally does not alter columns on tables that already exist.  Keep
+    this migration additive and idempotent so old task rows remain readable
+    with the standard strategy defaults.
+    """
+
+    with engine.begin() as conn:
+        generation_columns = {
+            str(row[1])
+            for row in conn.execute(text('PRAGMA table_info("generation_tasks")')).fetchall()
+        }
+        if generation_columns:
+            if "generation_granularity" not in generation_columns:
+                conn.execute(
+                    text(
+                        'ALTER TABLE "generation_tasks" '
+                        'ADD COLUMN "generation_granularity" VARCHAR NOT NULL DEFAULT \'standard\''
+                    )
+                )
+            if "test_dimensions_json" not in generation_columns:
+                conn.execute(
+                    text(
+                        'ALTER TABLE "generation_tasks" '
+                        'ADD COLUMN "test_dimensions_json" TEXT NOT NULL '
+                        'DEFAULT \'["positive", "negative", "boundary"]\''
+                    )
+                )
+
+        case_columns = {
+            str(row[1])
+            for row in conn.execute(text('PRAGMA table_info("test_cases")')).fetchall()
+        }
+        if case_columns and "priority" not in case_columns:
+            conn.execute(
+                text(
+                    'ALTER TABLE "test_cases" '
+                    'ADD COLUMN "priority" VARCHAR NOT NULL DEFAULT \'P1\''
+                )
+            )
+        if case_columns:
+            conn.execute(
+                text(
+                    'CREATE INDEX IF NOT EXISTS "ix_test_cases_priority" '
+                    'ON "test_cases" ("priority")'
+                )
+            )
+
+        # Fresh databases already contain these tables from create_all.  The
+        # conditional indexes also repair databases created by an intermediate
+        # build where table creation succeeded but index creation did not.
+        for table, column in (
+            ("task_reference_cases", "task_id"),
+            ("task_test_point_checkpoints", "task_id"),
+            ("test_points", "task_id"),
+            ("test_point_citations", "test_point_id"),
+            ("draft_test_point_links", "draft_id"),
+            ("test_point_case_links", "test_point_id"),
+        ):
+            exists = conn.execute(
+                text(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=:table_name"
+                ),
+                {"table_name": table},
+            ).first()
+            if exists:
+                conn.execute(
+                    text(
+                        f'CREATE INDEX IF NOT EXISTS "ix_{table}_{column}" '
+                        f'ON "{table}" ("{column}")'
+                    )
+                )
+
+        point_checkpoint_exists = conn.execute(
+            text(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='task_test_point_checkpoints'"
+            )
+        ).first()
+        if point_checkpoint_exists:
+            point_checkpoint_columns = {
+                str(row[1])
+                for row in conn.execute(
+                    text('PRAGMA table_info("task_test_point_checkpoints")')
+                ).fetchall()
+            }
+            if "auto_review" not in point_checkpoint_columns:
+                conn.execute(
+                    text(
+                        'ALTER TABLE "task_test_point_checkpoints" '
+                        'ADD COLUMN "auto_review" BOOLEAN NOT NULL DEFAULT 0'
+                    )
+                )
+
+
 def init_db() -> None:
     from app.models import entities  # noqa: F401
     from app.services.wiki_migrate import backup_before_wiki_migration, migrate_wiki_schema
@@ -525,6 +622,7 @@ def init_db() -> None:
     _migrate_sqlite_columns(engine)
     _migrate_model_defaults(engine)
     _migrate_case_management_schema(engine)
+    _migrate_test_design_schema(engine)
 
 
 def get_session():

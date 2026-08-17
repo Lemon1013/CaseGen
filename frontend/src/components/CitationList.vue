@@ -339,8 +339,8 @@ const bodyText = computed(() => {
 }
 
 .item:hover {
-  border-color: rgba(79, 124, 255, 0.45);
-  box-shadow: 0 4px 14px rgba(79, 124, 255, 0.1);
+  border-color: rgba(var(--cg-primary-rgb), 0.45);
+  box-shadow: 0 4px 14px rgba(var(--cg-primary-rgb), 0.1);
   transform: translateY(-1px);
 }
 
@@ -359,8 +359,8 @@ const bodyText = computed(() => {
   flex-shrink: 0;
   font-weight: 700;
   font-size: 12px;
-  color: var(--cg-primary, #4f7cff);
-  background: rgba(79, 124, 255, 0.1);
+  color: var(--cg-primary);
+  background: rgba(var(--cg-primary-rgb), 0.1);
   border-radius: 4px;
   padding: 1px 6px;
   line-height: 1.5;
@@ -411,7 +411,7 @@ const bodyText = computed(() => {
   margin-top: 8px;
   margin-left: 36px;
   font-size: 12px;
-  color: var(--cg-primary, #4f7cff);
+  color: var(--cg-primary);
   font-weight: 500;
 }
 

@@ -29,12 +29,14 @@ const requirements = ref<RequirementSummary[]>([])
 const includeArchived = ref(false)
 const keyword = ref('')
 const statusFilter = ref<'active' | 'archived' | ''>('')
+const priorityFilter = ref<'P0' | 'P1' | 'P2' | ''>('')
 const selectedIds = ref<Set<number>>(new Set())
 const collapsedRequirementIds = ref<Set<number>>(new Set())
 const selected = computed(() => cases.value.filter((row) => selectedIds.value.has(row.id)))
 const editing = ref<TestCaseItem | null>(null)
 const editContent = ref('')
 const editTitle = ref('')
+const editPriority = ref<'P0' | 'P1' | 'P2'>('P1')
 const saving = ref(false)
 const logs = ref<TestCaseOperationLog[]>([])
 const logCase = ref<TestCaseItem | null>(null)
@@ -107,6 +109,7 @@ async function load() {
         include_archived: includeArchived.value,
         keyword: keyword.value,
         status: statusFilter.value,
+        priority: priorityFilter.value,
       }),
       api<RequirementSummary[]>('/api/requirements'),
     ])
@@ -163,6 +166,7 @@ function logsFromDetail() {
 function openEditor(row: TestCaseItem) {
   editing.value = row
   editTitle.value = row.title
+  editPriority.value = (row.priority === 'P0' || row.priority === 'P2') ? row.priority : 'P1'
   editContent.value = row.content_md
 }
 
@@ -177,6 +181,7 @@ async function saveEditor() {
     const updated = await updateCase(editing.value.id, {
       title: editTitle.value,
       content_md: editContent.value,
+      priority: editPriority.value,
       expected_revision: editing.value.revision,
     })
     const index = cases.value.findIndex((item) => item.id === updated.id)
@@ -280,6 +285,11 @@ onMounted(load)
           <el-option label="当前" value="active" />
           <el-option label="已归档" value="archived" />
         </el-select>
+        <el-select v-model="priorityFilter" clearable placeholder="优先级" style="width: 120px" @change="load">
+          <el-option label="P0 高风险" value="P0" />
+          <el-option label="P1 主要" value="P1" />
+          <el-option label="P2 补充" value="P2" />
+        </el-select>
         <el-checkbox v-model="includeArchived" @change="load">显示已归档</el-checkbox>
         <el-button
           :disabled="!groupedCases.length"
@@ -354,6 +364,13 @@ onMounted(load)
             </el-tag>
           </template>
         </el-table-column>
+        <el-table-column label="优先级" width="90">
+          <template #default="{ row }">
+            <el-tag :type="row.priority === 'P0' ? 'danger' : row.priority === 'P1' ? 'warning' : 'info'" size="small">
+              {{ row.priority || 'P1' }}
+            </el-tag>
+          </template>
+        </el-table-column>
         <el-table-column label="来源" min-width="150">
           <template #default="{ row }">
             <span v-if="row.source_task_id">
@@ -402,6 +419,11 @@ onMounted(load)
             {{ requirementTitle(detailCase.requirement_id) }}
           </el-descriptions-item>
           <el-descriptions-item label="当前修订">v{{ detailCase.revision }}</el-descriptions-item>
+          <el-descriptions-item label="优先级">
+            <el-tag :type="detailCase.priority === 'P0' ? 'danger' : detailCase.priority === 'P1' ? 'warning' : 'info'" size="small">
+              {{ detailCase.priority || 'P1' }}
+            </el-tag>
+          </el-descriptions-item>
           <el-descriptions-item label="来源">
             <router-link v-if="detailCase.source_task_id" :to="`/tasks/${detailCase.source_task_id}`">
               任务 #{{ detailCase.source_task_id }} · 草稿 v{{ detailCase.source_draft_version || '-' }}
@@ -427,6 +449,13 @@ onMounted(load)
     <el-dialog v-model="editorVisible" title="编辑当前用例" width="760px" destroy-on-close>
       <el-form label-width="72px" @submit.prevent>
         <el-form-item label="标题"><el-input v-model="editTitle" /></el-form-item>
+        <el-form-item label="优先级">
+          <el-radio-group v-model="editPriority">
+            <el-radio value="P0">P0</el-radio>
+            <el-radio value="P1">P1</el-radio>
+            <el-radio value="P2">P2</el-radio>
+          </el-radio-group>
+        </el-form-item>
         <el-form-item label="Markdown"><el-input v-model="editContent" type="textarea" :rows="18" /></el-form-item>
       </el-form>
       <template #footer>

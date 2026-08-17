@@ -20,9 +20,13 @@ from sqlmodel import Session, col, select
 
 from app.models.entities import (
     CaseDraft,
+    DraftTestPointLink,
     GenerationTask,
     TestCase,
     TestCaseOperationLog,
+    TestPoint,
+    TestPointCaseLink,
+    TaskTestPointCheckpoint,
 )
 
 
@@ -53,7 +57,29 @@ CASE_HEADING_RE = re.compile(
 )
 
 
-def split_case_draft(content_md: str) -> list[dict[str, str]]:
+def _section_metadata(section: str, title: str) -> dict[str, Any]:
+    priority_match = re.search(
+        r"(?im)^\s*(?:[-*]\s*)?(?:优先级|priority)\s*[:：|]\s*(P[0-9]+)\b",
+        section,
+    )
+    priority_present = priority_match is not None
+    priority = priority_match.group(1).upper() if priority_match else "P1"
+    if priority not in {"P0", "P1", "P2"}:
+        priority = "P1"
+    point_block = re.search(
+        r"(?im)^\s*(?:[-*]\s*)?(?:关联测试点|测试点|test points?)\s*[:：|]\s*(.+)$",
+        section,
+    )
+    source = point_block.group(1) if point_block else section
+    point_keys = list(dict.fromkeys(re.findall(r"\bTP-[A-Za-z0-9][A-Za-z0-9_.-]*\b", source, re.IGNORECASE)))
+    return {
+        "priority": priority,
+        "priority_present": priority_present and priority in {"P0", "P1", "P2"},
+        "test_point_keys": [item.upper() for item in point_keys],
+    }
+
+
+def split_case_draft(content_md: str) -> list[dict[str, Any]]:
     """Split Markdown into case sections while preserving every character.
 
     A normal finalized draft contains one or more ``## TC-xxx`` headings.  For
@@ -72,7 +98,12 @@ def split_case_draft(content_md: str) -> list[dict[str, str]]:
         # not a lossy parser: the returned body is byte-for-byte equivalent
         # after only outer whitespace normalization.
         body = content_md.strip()
-        return [{"case_key": "TC-001", "title": "TC-001", "content_md": body}]
+        return [{
+            "case_key": "TC-001",
+            "title": "TC-001",
+            "content_md": body,
+            **_section_metadata(body, "TC-001"),
+        }]
 
     seen: set[str] = set()
     sections: list[dict[str, str]] = []
@@ -91,7 +122,12 @@ def split_case_draft(content_md: str) -> list[dict[str, str]]:
             # so no content before the first heading disappears.
             section = f"{preamble}\n\n{section}"
         title = (match.group(2) or "").strip() or key
-        sections.append({"case_key": key, "title": title, "content_md": section})
+        sections.append({
+            "case_key": key,
+            "title": title,
+            "content_md": section,
+            **_section_metadata(section, title),
+        })
 
     consumed = "\n\n".join(item["content_md"] for item in sections)
     if not consumed.strip():
@@ -191,6 +227,49 @@ def import_cases_from_draft(
         {**section, "case_key": normalize_case_key(section["case_key"])}
         for section in split_case_draft(draft.content_md)
     ]
+    current_checkpoint = session.exec(
+        select(TaskTestPointCheckpoint)
+        .where(
+            TaskTestPointCheckpoint.task_id == task.id,
+            TaskTestPointCheckpoint.status == "confirmed",
+        )
+        .order_by(col(TaskTestPointCheckpoint.attempt).desc())
+    ).first()
+
+    def ensure_point_links(case: TestCase, section: dict[str, Any]) -> None:
+        keys = {str(item).upper() for item in section.get("test_point_keys") or []}
+        if not keys or case.id is None or current_checkpoint is None:
+            return
+        points = session.exec(
+            select(TestPoint)
+            .where(TestPoint.checkpoint_id == current_checkpoint.id)
+            .where(TestPoint.stable_key.in_(keys))
+        ).all()
+        for point in points:
+            existing_draft = session.exec(
+                select(DraftTestPointLink).where(
+                    DraftTestPointLink.draft_id == draft.id,
+                    DraftTestPointLink.case_key == section["case_key"],
+                    DraftTestPointLink.test_point_id == point.id,
+                )
+            ).first()
+            if existing_draft is None:
+                session.add(DraftTestPointLink(
+                    draft_id=int(draft.id),
+                    case_key=section["case_key"],
+                    test_point_id=int(point.id),
+                ))
+            existing_case = session.exec(
+                select(TestPointCaseLink).where(
+                    TestPointCaseLink.test_point_id == point.id,
+                    TestPointCaseLink.test_case_id == case.id,
+                )
+            ).first()
+            if existing_case is None:
+                session.add(TestPointCaseLink(
+                    test_point_id=int(point.id),
+                    test_case_id=int(case.id),
+                ))
     # Validate all requirement-scoped collisions before adding any rows so a
     # malformed multi-case draft cannot leave a partially imported set in a
     # caller's open transaction.
@@ -232,6 +311,7 @@ def import_cases_from_draft(
         ).first()
         if existing is not None:
             # Idempotent repeat: do not replace title/body/status/revision.
+            ensure_point_links(existing, section)
             imported.append(existing)
             continue
 
@@ -254,6 +334,7 @@ def import_cases_from_draft(
             source_case_key=key,
             title=section["title"],
             content_md=section["content_md"],
+            priority=section.get("priority") or "P1",
             source_task_id=task.id,
             source_draft_id=draft.id,
             status="active",
@@ -271,6 +352,7 @@ def import_cases_from_draft(
             source_draft_id=draft.id,
             source_case_key=key,
         )
+        ensure_point_links(case, section)
         imported.append(case)
     session.flush()
     return imported

@@ -50,8 +50,51 @@ def _create_model(client: TestClient) -> int:
     return r.json()["id"]
 
 
-def _generate_with_confirmation(client: TestClient, task_id: int, *, query: str = ""):
-    """Run the retrieval gate, then confirm all candidates for legacy tests."""
+def _generate_with_confirmation(
+    client: TestClient,
+    task_id: int,
+    monkeypatch,
+    *,
+    query: str = "",
+):
+    """Run both durable gates so legacy generation assertions remain valid."""
+
+    monkeypatch.setattr(
+        "app.api.tasks._TEST_POINTS_CHAT_FN",
+        lambda **kwargs: json.dumps(
+            {
+                "test_points": [
+                    {
+                        "stable_key": "TP-001",
+                        "title": "验证需求主路径",
+                        "verification_goal": "验证需求描述的主要行为",
+                        "dimension": "positive",
+                        "priority": "P1",
+                        "citation_ids": [],
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+    )
+    monkeypatch.setattr(
+        "app.services.task_pipeline._TEST_POINTS_CHAT_FN",
+        lambda **kwargs: json.dumps(
+            {
+                "test_points": [
+                    {
+                        "stable_key": "TP-001",
+                        "title": "验证需求主路径",
+                        "verification_goal": "验证需求描述的主要行为",
+                        "dimension": "positive",
+                        "priority": "P1",
+                        "citation_ids": [],
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+    )
     response = client.post(f"/api/tasks/{task_id}/generate{query}")
     assert response.status_code == 200
     body = response.json()
@@ -72,7 +115,27 @@ def _generate_with_confirmation(client: TestClient, task_id: int, *, query: str 
         assert response.status_code == 200
     for _ in range(80):
         current = client.get(f"/api/tasks/{task_id}").json()
-        if current["status"] not in {"generating", "retrieving"}:
+        if current["status"] == "awaiting_test_point_confirmation":
+            checkpoint = client.get(f"/api/tasks/{task_id}/test-points")
+            assert checkpoint.status_code == 200
+            payload = checkpoint.json()
+            response = client.post(
+                f"/api/tasks/{task_id}/test-points/confirm",
+                json={
+                    "points": payload["points"],
+                    "expected_version": payload["version"],
+                    "idempotency_key": f"legacy-test-points-{task_id}-{payload['version']}",
+                },
+            )
+            assert response.status_code == 200
+            break
+        if current["status"] not in {"generating", "retrieving", "generating_test_points"}:
+            response = type("Response", (), {"status_code": 200, "json": lambda self: current})()
+            break
+        time.sleep(0.05)
+    for _ in range(80):
+        current = client.get(f"/api/tasks/{task_id}").json()
+        if current["status"] not in {"generating", "retrieving", "generating_test_points"}:
             response = type("Response", (), {"status_code": 200, "json": lambda self: current})()
             break
         time.sleep(0.05)
@@ -126,7 +189,7 @@ def test_generate_creates_draft(tmp_app_data, monkeypatch):
     assert body["status"] == "draft"
     tid = body["id"]
 
-    g = _generate_with_confirmation(client, tid)
+    g = _generate_with_confirmation(client, tid, monkeypatch)
     assert g.status_code == 200
     gen = g.json()
     assert gen["status"] == "generated"
@@ -198,7 +261,7 @@ def test_generate_fails_without_model(tmp_app_data, monkeypatch):
         json={"title": "余额不足", "description": "余额不足应失败"},
     )
     tid = r.json()["id"]
-    g = _generate_with_confirmation(client, tid)
+    g = _generate_with_confirmation(client, tid, monkeypatch)
     assert g.status_code == 200
     body = g.json()
     assert body["status"] == "failed"
@@ -222,6 +285,21 @@ def test_generate_discards_partial_output_when_primary_and_lean_calls_fail(
     calls = {"n": 0}
 
     def fail_after_partial(*args, **kwargs):
+        if not kwargs.get("stream"):
+            return json.dumps(
+                {
+                    "test_points": [
+                        {
+                            "stable_key": "TP-001",
+                            "title": "验证失败重试",
+                            "verification_goal": "验证模型失败时任务仍可恢复",
+                            "dimension": "recovery",
+                            "priority": "P1",
+                            "citation_ids": [],
+                        }
+                    ]
+                }
+            )
         calls["n"] += 1
         on_attempt = kwargs.get("on_attempt")
         on_delta = kwargs.get("on_delta")
@@ -245,7 +323,7 @@ def test_generate_discards_partial_output_when_primary_and_lean_calls_fail(
         },
     ).json()["id"]
 
-    response = _generate_with_confirmation(client, tid, query="?wait=true")
+    response = _generate_with_confirmation(client, tid, monkeypatch, query="?wait=true")
     assert response.status_code == 200
     assert response.json()["status"] == "failed"
     assert calls["n"] == 2
@@ -277,7 +355,7 @@ def test_review_failure_does_not_replace_completed_generation_stream(
         "/api/tasks",
         json={"title": "生成后评审", "description": "验证流终态", "model_id": mid},
     ).json()["id"]
-    generated = _generate_with_confirmation(client, tid)
+    generated = _generate_with_confirmation(client, tid, monkeypatch)
     assert generated.json()["status"] == "generated"
     completed = task_stream.snapshot(tid)
     assert completed is not None
@@ -338,7 +416,7 @@ def test_generate_lean_fallback_on_primary_llm_error(tmp_app_data, monkeypatch):
         },
     ).json()["id"]
 
-    g = _generate_with_confirmation(client, tid)
+    g = _generate_with_confirmation(client, tid, monkeypatch)
     assert g.status_code == 200
     body = g.json()
     assert body["status"] == "generated", body

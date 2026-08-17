@@ -15,6 +15,7 @@ from sqlmodel import Session, col, select
 from app.db import get_engine, get_session
 from app.models.entities import (
     CaseDraft,
+    DraftTestPointLink,
     GenerationTask,
     ModelConfig,
     PromptRevision,
@@ -24,8 +25,13 @@ from app.models.entities import (
     SourceChunk,
     TaskCitation,
     TaskRetrievalCheckpoint,
+    TaskReferenceCase,
+    TaskTestPointCheckpoint,
     TaskEvent,
     TestCase,
+    TestPoint,
+    TestPointCaseLink,
+    TestPointCitation,
     WikiPageRow,
     WikiSpace,
 )
@@ -42,6 +48,15 @@ from app.schemas.tasks import (
     TaskOut,
     RetrievalCheckpointConfirm,
     RetrievalCheckpointOut,
+    CoverageSummaryOut,
+    RequirementOptimizeOut,
+    RequirementOptimizeRequest,
+    TaskReferenceCaseOut,
+    TestPointCheckpointOut,
+    TestPointConfirmRequest,
+    TestPointEditRequest,
+    TestPointInput,
+    TestPointOut,
 )
 from app.services.task_events import append_event
 from app.services.task_jobs import (
@@ -61,6 +76,17 @@ from app.services.task_pipeline import (
     _resolve_model,
     _fail_task,
 )
+from app.services.coverage import build_coverage
+from app.services.requirement_optimizer import optimize_requirement
+from app.services.test_points import (
+    TEST_DIMENSIONS,
+    current_points,
+    latest_checkpoint as latest_test_point_checkpoint,
+    point_citation_ids,
+    task_dimensions,
+    validate_point_inputs,
+    write_points,
+)
 from app.services.task_state import InvalidTransition, transition
 from app.services.task_stream import encode_sse, task_stream
 from app.services.wiki_spaces import resolve_space, resolve_space_id
@@ -70,15 +96,31 @@ router = APIRouter(prefix="/api/tasks", tags=["tasks"])
 # Optional injectable chat hooks for tests: monkeypatch these module attrs.
 _PIPELINE_CHAT_FN = None
 _GENERATE_CHAT_FN = None
+_TEST_POINTS_CHAT_FN = None
 _REVIEW_CHAT_FN = None
 _OPTIMIZE_CHAT_FN = None
+_REQUIREMENT_OPTIMIZE_CHAT_FN = None
 
 # Statuses that mean a long-running job is already in flight
 _BUSY = frozenset(
-    {"retrieving", "generating", "reviewing", "optimizing", "regenerating"}
+    {
+        "retrieving",
+        "generating_test_points",
+        "generating",
+        "reviewing",
+        "optimizing",
+        "regenerating",
+    }
 )
-_STREAM_ACTIVE_STATUSES = frozenset({"retrieving", "generating", "regenerating"})
-_STREAM_TERMINAL_STATUSES = frozenset({"generated", "reviewed", "finalized", "failed", "awaiting_confirmation"})
+_STREAM_ACTIVE_STATUSES = frozenset({"retrieving", "generating_test_points", "generating", "regenerating"})
+_STREAM_TERMINAL_STATUSES = frozenset({
+    "generated",
+    "reviewed",
+    "finalized",
+    "failed",
+    "awaiting_confirmation",
+    "awaiting_test_point_confirmation",
+})
 _STREAM_HEARTBEAT_SEC = 15.0
 _STREAM_POLL_INTERVAL_SEC = 0.2
 
@@ -88,7 +130,7 @@ def _stream_terminal_for_status(status: str) -> str | None:
         return "failed"
     if status in {"generated", "reviewed", "finalized"}:
         return "completed"
-    if status == "awaiting_confirmation":
+    if status in {"awaiting_confirmation", "awaiting_test_point_confirmation"}:
         return "completed"
     return None
 
@@ -119,6 +161,8 @@ def _chat_for(stage: str = "generate"):
         return _OPTIMIZE_CHAT_FN
     if stage == "generate" and _GENERATE_CHAT_FN is not None:
         return _GENERATE_CHAT_FN
+    if stage == "test_points" and _TEST_POINTS_CHAT_FN is not None:
+        return _TEST_POINTS_CHAT_FN
     if _PIPELINE_CHAT_FN is not None:
         return _PIPELINE_CHAT_FN
     return _GENERATE_CHAT_FN
@@ -184,6 +228,14 @@ def _citation_count(session: Session, task_id: int) -> int:
     return len(rows)
 
 
+def _json_string_list(value: str | None) -> list[str]:
+    try:
+        parsed = json.loads(value or "[]")
+    except (TypeError, ValueError):
+        parsed = []
+    return [str(item) for item in parsed] if isinstance(parsed, list) else []
+
+
 def _checkpoint_out(session: Session, checkpoint: TaskRetrievalCheckpoint) -> RetrievalCheckpointOut:
     selected = [int(x) for x in json.loads(checkpoint.selected_citation_ids_json or "[]")]
     candidates = [int(x) for x in json.loads(checkpoint.candidate_citation_ids_json or "[]")]
@@ -244,6 +296,12 @@ def to_task_out(session: Session, task: GenerationTask) -> TaskOut:
         )
         .order_by(col(TestCase.case_key).asc(), col(TestCase.id).asc())
     ).all() if task.finalized_draft_id is not None else []
+    reference_count = len(
+        session.exec(
+            select(TaskReferenceCase).where(TaskReferenceCase.task_id == task.id)
+        ).all()
+    )
+    test_point_count = len(current_points(session, task.id))
     try:
         space = resolve_space(session, task.wiki_space_id)
     except ValueError:
@@ -269,9 +327,36 @@ def to_task_out(session: Session, task: GenerationTask) -> TaskOut:
         finalized_at=task.finalized_at,
         imported_case_ids=[int(row.id) for row in imported_case_rows if row.id is not None],
         imported_case_count=len(imported_case_rows),
+        generation_granularity=getattr(task, "generation_granularity", None) or "standard",
+        test_dimensions=task_dimensions(task),
+        reference_case_count=reference_count,
+        test_point_count=test_point_count,
         created_at=task.created_at,
         updated_at=task.updated_at,
     )
+
+
+@router.post("/requirement-optimize", response_model=RequirementOptimizeOut)
+def optimize_requirement_route(
+    body: RequirementOptimizeRequest,
+    session: Session = Depends(get_session),
+) -> RequirementOptimizeOut:
+    """Suggest editable requirement copy without touching the legacy Prompt optimizer."""
+
+    try:
+        result = optimize_requirement(
+            session,
+            title=body.title,
+            description=body.description,
+            focus_tags=body.focus_tags,
+            model_id=body.model_id,
+            chat_fn=_REQUIREMENT_OPTIMIZE_CHAT_FN,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"Requirement optimization failed: {exc}") from exc
+    return RequirementOptimizeOut(**result)
 
 
 @router.post("", response_model=TaskOut)
@@ -303,10 +388,57 @@ def create_task(
                 detail="Only active generate prompt templates can be selected",
             )
 
+    dimensions = body.dimensions if body.dimensions is not None else body.test_dimensions
+    dimensions = list(dict.fromkeys(str(item).strip().lower() for item in dimensions if str(item).strip()))
+    if not dimensions:
+        dimensions = ["positive", "negative", "boundary"]
+    unknown_dimensions = [item for item in dimensions if item not in TEST_DIMENSIONS]
+    if unknown_dimensions:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown test dimensions: {', '.join(unknown_dimensions)}",
+        )
+    reference_ids = list(dict.fromkeys(int(item) for item in body.reference_case_ids))
+    if len(reference_ids) > 10:
+        raise HTTPException(status_code=422, detail="At most 10 reference cases may be selected")
+    reference_rows: list[TestCase] = []
+    if reference_ids:
+        reference_rows = list(
+            session.exec(select(TestCase).where(TestCase.id.in_(reference_ids))).all()
+        )
+        by_id = {int(row.id): row for row in reference_rows if row.id is not None}
+        missing = [str(item) for item in reference_ids if item not in by_id]
+        if missing:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Reference case not found: {', '.join(missing)}",
+            )
+        inactive = [row.case_key for row in reference_rows if row.status != "active"]
+        if inactive:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Only active cases can be used as references: {', '.join(inactive)}",
+            )
+    reference_text = body.reference_text.strip()
+    if len(reference_text) > 16000:
+        raise HTTPException(status_code=422, detail="Manual reference text is too long")
+    snapshot_chars = sum(len(row.content_md or "") for row in reference_rows) + len(reference_text)
+    if snapshot_chars > 30000:
+        raise HTTPException(status_code=422, detail="Reference case snapshots exceed 30000 characters")
+
     if body.requirement_id is not None:
         requirement = session.get(Requirement, body.requirement_id)
         if requirement is None:
             raise HTTPException(status_code=422, detail="Requirement not found")
+        if body.title is not None and body.title.strip():
+            requirement.title = body.title.strip()
+        if body.description is not None and body.description.strip():
+            requirement.description = body.description.strip()
+        if body.focus_tags is not None:
+            requirement.focus_tags_json = json.dumps(body.focus_tags, ensure_ascii=False)
+        session.add(requirement)
+        session.commit()
+        session.refresh(requirement)
     else:
         if not (body.title or "").strip() or not (body.description or "").strip():
             raise HTTPException(
@@ -328,8 +460,37 @@ def create_task(
         status="draft",
         model_id=body.model_id,
         prompt_template_id=body.prompt_template_id,
+        generation_granularity=body.generation_granularity,
+        test_dimensions_json=json.dumps(dimensions, ensure_ascii=False),
     )
     session.add(task)
+    session.commit()
+    session.refresh(task)
+    for row in reference_rows:
+        content = row.content_md or ""
+        session.add(
+            TaskReferenceCase(
+                task_id=int(task.id),
+                source_case_id=row.id,
+                source_case_key=row.case_key,
+                title_snapshot=row.title or row.case_key,
+                content_md_snapshot=content,
+                content_hash=hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                source="case_library",
+            )
+        )
+    if reference_text:
+        session.add(
+            TaskReferenceCase(
+                task_id=int(task.id),
+                source_case_id=None,
+                source_case_key=None,
+                title_snapshot="手动输入",
+                content_md_snapshot=reference_text,
+                content_hash=hashlib.sha256(reference_text.encode("utf-8")).hexdigest(),
+                source="manual",
+            )
+        )
     session.commit()
     session.refresh(task)
     # SQLite may reuse an integer id after deletion. Clear retained state so a
@@ -528,15 +689,210 @@ def confirm_retrieval_checkpoint(
         checkpoint.resume_claimed_at = datetime.now(timezone.utc).replace(tzinfo=None)
         checkpoint.resume_status = "claimed"
         session.add(checkpoint)
+        task.status = transition(task.status, "generating_test_points")
+        task.error_message = None
+        session.add(task)
+        append_event(
+            session,
+            task.id,
+            "retrieve",
+            "人工确认检索结果，开始生成测试点",
+            detail={"selected_citation_ids": selected},
+        )
+        session.commit()
+        session.refresh(task)
+        _start_live_generate_stream(task, "已确认检索结果，开始生成测试点")
+        background_tasks.add_task(
+            job_generate,
+            task_id,
+            bool(checkpoint.auto_review),
+            checkpoint.id,
+            checkpoint.resume_claim_token,
+            "retrieval",
+        )
+        return to_task_out(session, task)
+
+
+def _test_point_out(session: Session, row: TestPoint) -> TestPointOut:
+    return TestPointOut(
+        id=int(row.id or 0),
+        task_id=int(row.task_id),
+        checkpoint_id=int(row.checkpoint_id),
+        stable_key=row.stable_key,
+        title=row.title,
+        verification_goal=row.verification_goal,
+        dimension=row.dimension,
+        priority=row.priority,
+        sort_order=int(row.sort_order),
+        is_selected=bool(row.is_selected),
+        is_excluded=bool(row.is_excluded),
+        citation_ids=point_citation_ids(session, int(row.id)),
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
+def _test_point_checkpoint_out(
+    session: Session, checkpoint: TaskTestPointCheckpoint
+) -> TestPointCheckpointOut:
+    rows = session.exec(
+        select(TestPoint)
+        .where(TestPoint.checkpoint_id == checkpoint.id)
+        .order_by(col(TestPoint.sort_order).asc(), col(TestPoint.id).asc())
+    ).all()
+    return TestPointCheckpointOut(
+        id=int(checkpoint.id or 0),
+        task_id=int(checkpoint.task_id),
+        retrieval_checkpoint_id=checkpoint.retrieval_checkpoint_id,
+        attempt=int(checkpoint.attempt),
+        version=int(checkpoint.version),
+        status=checkpoint.status,
+        points=[_test_point_out(session, row) for row in rows],
+        idempotency_key=checkpoint.idempotency_key,
+        created_at=checkpoint.created_at,
+        updated_at=checkpoint.updated_at,
+    )
+
+
+def _point_payload_hash(points: list[dict]) -> str:
+    return hashlib.sha256(
+        json.dumps(points, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+@router.get("/{task_id}/test-points", response_model=TestPointCheckpointOut)
+def get_test_points(
+    task_id: int, session: Session = Depends(get_session)
+) -> TestPointCheckpointOut:
+    task = session.get(GenerationTask, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    checkpoint = latest_test_point_checkpoint(session, task_id)
+    if checkpoint is None:
+        raise HTTPException(status_code=404, detail="Test-point checkpoint not found")
+    return _test_point_checkpoint_out(session, checkpoint)
+
+
+@router.put("/{task_id}/test-points", response_model=TestPointCheckpointOut)
+def edit_test_points(
+    task_id: int,
+    body: TestPointEditRequest,
+    session: Session = Depends(get_session),
+) -> TestPointCheckpointOut:
+    with task_locks.hold(task_id):
+        task = session.get(GenerationTask, task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="Task not found")
+        if task.status != "awaiting_test_point_confirmation":
+            raise HTTPException(status_code=409, detail="Test points are not editable in the current task state")
+        checkpoint = latest_test_point_checkpoint(session, task_id)
+        if checkpoint is None:
+            raise HTTPException(status_code=404, detail="Test-point checkpoint not found")
+        if checkpoint.status != "pending":
+            raise HTTPException(status_code=409, detail="Test-point checkpoint is already confirmed")
+        if checkpoint.version != body.expected_version:
+            raise HTTPException(status_code=409, detail="Stale test-point checkpoint version")
+        try:
+            normalized = validate_point_inputs(
+                session,
+                task,
+                [item.model_dump() for item in body.points],
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        write_points(session, task, checkpoint, normalized)
+        checkpoint.version += 1
+        checkpoint.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        session.add(checkpoint)
+        append_event(session, task.id, "test_points", "人工编辑测试点", detail={"count": len(normalized)})
+        session.commit()
+        session.refresh(checkpoint)
+        return _test_point_checkpoint_out(session, checkpoint)
+
+
+@router.post("/{task_id}/test-points/confirm", response_model=TaskOut)
+def confirm_test_points(
+    task_id: int,
+    body: TestPointConfirmRequest,
+    background_tasks: BackgroundTasks,
+    session: Session = Depends(get_session),
+) -> TaskOut:
+    with task_locks.hold(task_id):
+        task = session.get(GenerationTask, task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="Task not found")
+        checkpoint = latest_test_point_checkpoint(session, task_id)
+        if checkpoint is None:
+            raise HTTPException(status_code=404, detail="Test-point checkpoint not found")
+        try:
+            normalized = validate_point_inputs(
+                session,
+                task,
+                [item.model_dump() for item in body.points],
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        payload_hash = _point_payload_hash(normalized)
+        if checkpoint.status == "confirmed":
+            if checkpoint.decision_hash == payload_hash and checkpoint.idempotency_key == body.idempotency_key:
+                return to_task_out(session, task)
+            raise HTTPException(status_code=409, detail="Test-point checkpoint already confirmed")
+        if task.status != "awaiting_test_point_confirmation":
+            raise HTTPException(status_code=409, detail="Task is not waiting for test-point confirmation")
+        if checkpoint.version != body.expected_version:
+            raise HTTPException(status_code=409, detail="Stale test-point checkpoint version")
+        write_points(session, task, checkpoint, normalized)
+        checkpoint.status = "confirmed"
+        checkpoint.decision_hash = payload_hash
+        checkpoint.idempotency_key = body.idempotency_key
+        checkpoint.resume_claim_token = secrets.token_urlsafe(24)
+        checkpoint.resume_claimed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        checkpoint.resume_status = "claimed"
+        session.add(checkpoint)
         task.status = transition(task.status, "generating")
         task.error_message = None
         session.add(task)
-        append_event(session, task.id, "retrieve", "人工确认检索结果，继续生成", detail={"selected_citation_ids": selected})
+        append_event(
+            session,
+            task.id,
+            "test_points",
+            "人工确认测试点，开始生成完整用例",
+            detail={"checkpoint_id": checkpoint.id, "selected_count": sum(1 for item in normalized if item["is_selected"] and not item["is_excluded"])},
+        )
         session.commit()
         session.refresh(task)
-        _start_live_generate_stream(task, "已确认检索结果，开始生成")
-        background_tasks.add_task(job_generate, task_id, bool(checkpoint.auto_review), checkpoint.id, checkpoint.resume_claim_token)
+        _start_live_generate_stream(task, "已确认测试点，开始生成完整用例")
+        background_tasks.add_task(
+            job_generate,
+            task_id,
+            bool(checkpoint.auto_review),
+            checkpoint.id,
+            checkpoint.resume_claim_token,
+            "test_points",
+        )
         return to_task_out(session, task)
+
+
+@router.get("/{task_id}/references", response_model=List[TaskReferenceCaseOut])
+def list_task_references(
+    task_id: int, session: Session = Depends(get_session)
+) -> list[TaskReferenceCaseOut]:
+    task = session.get(GenerationTask, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    rows = session.exec(
+        select(TaskReferenceCase)
+        .where(TaskReferenceCase.task_id == task_id)
+        .order_by(col(TaskReferenceCase.id).asc())
+    ).all()
+    return [TaskReferenceCaseOut.model_validate(row) for row in rows]
+
+
+@router.get("/{task_id}/coverage", response_model=CoverageSummaryOut)
+def task_coverage(task_id: int, session: Session = Depends(get_session)) -> CoverageSummaryOut:
+    if session.get(GenerationTask, task_id) is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return CoverageSummaryOut(**build_coverage(session, task_id))
 
 
 @router.get("/{task_id}", response_model=TaskOut)
@@ -619,10 +975,35 @@ def _delete_task_locked(task_id: int, session: Session) -> dict:
         else None
     )
 
+    reference_rows = session.exec(
+        select(TaskReferenceCase).where(TaskReferenceCase.task_id == task_id)
+    ).all()
+    for row in reference_rows:
+        session.delete(row)
+    point_checkpoints = session.exec(
+        select(TaskTestPointCheckpoint).where(TaskTestPointCheckpoint.task_id == task_id)
+    ).all()
+    point_rows = session.exec(select(TestPoint).where(TestPoint.task_id == task_id)).all()
+    for point in point_rows:
+        for link in session.exec(
+            select(TestPointCitation).where(TestPointCitation.test_point_id == point.id)
+        ).all():
+            session.delete(link)
+        for link in session.exec(
+            select(TestPointCaseLink).where(TestPointCaseLink.test_point_id == point.id)
+        ).all():
+            session.delete(link)
+        for link in session.exec(
+            select(DraftTestPointLink).where(DraftTestPointLink.test_point_id == point.id)
+        ).all():
+            session.delete(link)
+        session.delete(point)
     for model in (TaskCitation, TaskRetrievalCheckpoint, CaseDraft, ReviewResult, PromptRevision, TaskEvent):
         rows = session.exec(select(model).where(model.task_id == task_id)).all()
         for row in rows:
             session.delete(row)
+    for checkpoint in point_checkpoints:
+        session.delete(checkpoint)
 
     session.delete(task)
     session.flush()
@@ -684,7 +1065,7 @@ def _generate_task_locked(
         # Already running — do not double-schedule
         return to_task_out(session, task)
 
-    if task.status == "awaiting_confirmation":
+    if task.status in {"awaiting_confirmation", "awaiting_test_point_confirmation"}:
         return to_task_out(session, task)
 
     try:
@@ -740,7 +1121,7 @@ def _review_task_locked(
     if task.status in _BUSY:
         return to_task_out(session, task)
 
-    if task.status == "awaiting_confirmation":
+    if task.status in {"awaiting_confirmation", "awaiting_test_point_confirmation"}:
         return to_task_out(session, task)
 
     if _force_sync("review", wait):

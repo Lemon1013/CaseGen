@@ -902,18 +902,18 @@ onUnmounted(() => {
 .uploader :deep(.el-upload-dragger) {
   width: 100%;
   border-radius: var(--cg-radius);
-  border: 1.5px dashed rgba(79, 124, 255, 0.35);
+  border: 1.5px dashed rgba(var(--cg-primary-rgb), 0.35);
   background: linear-gradient(
     135deg,
-    rgba(79, 124, 255, 0.06),
-    rgba(139, 92, 246, 0.05)
+    rgba(var(--cg-primary-rgb), 0.06),
+    rgba(var(--cg-primary-2-rgb), 0.05)
   );
   transition: border-color 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
 }
 
 .uploader :deep(.el-upload-dragger:hover) {
   border-color: var(--cg-primary);
-  box-shadow: 0 0 0 3px rgba(79, 124, 255, 0.1);
+  box-shadow: 0 0 0 3px rgba(var(--cg-primary-rgb), 0.1);
 }
 
 .upload-inner {

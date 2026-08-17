@@ -56,7 +56,26 @@ def _create_model(client: TestClient) -> int:
     return r.json()["id"]
 
 
-def _generate_with_confirmation(client: TestClient, task_id: int):
+def _generate_with_confirmation(client: TestClient, task_id: int, monkeypatch):
+    point_payload = json.dumps(
+        {
+            "test_points": [
+                {
+                    "stable_key": "TP-001",
+                    "title": "验证需求主路径",
+                    "verification_goal": "验证需求描述的主要行为",
+                    "dimension": "positive",
+                    "priority": "P1",
+                    "citation_ids": [],
+                }
+            ]
+        },
+        ensure_ascii=False,
+    )
+    monkeypatch.setattr("app.api.tasks._TEST_POINTS_CHAT_FN", lambda **kwargs: point_payload)
+    monkeypatch.setattr(
+        "app.services.task_pipeline._TEST_POINTS_CHAT_FN", lambda **kwargs: point_payload
+    )
     response = client.post(f"/api/tasks/{task_id}/generate")
     assert response.status_code == 200
     if response.json()["status"] == "awaiting_confirmation":
@@ -73,10 +92,42 @@ def _generate_with_confirmation(client: TestClient, task_id: int):
         assert response.status_code == 200
     for _ in range(80):
         current = client.get(f"/api/tasks/{task_id}").json()
-        if current["status"] not in {"retrieving", "generating"}:
+        if current["status"] == "awaiting_test_point_confirmation":
+            point_checkpoint = client.get(f"/api/tasks/{task_id}/test-points").json()
+            response = client.post(
+                f"/api/tasks/{task_id}/test-points/confirm",
+                json={
+                    "points": point_checkpoint["points"],
+                    "expected_version": point_checkpoint["version"],
+                    "idempotency_key": f"review-test-points-{task_id}-{point_checkpoint['version']}",
+                },
+            )
+            assert response.status_code == 200
+            break
+        if current["status"] not in {"retrieving", "generating", "generating_test_points"}:
+            return current
+        time.sleep(0.05)
+    for _ in range(80):
+        current = client.get(f"/api/tasks/{task_id}").json()
+        if current["status"] not in {"retrieving", "generating", "generating_test_points"}:
             return current
         time.sleep(0.05)
     return current
+
+
+def _confirm_test_points(client: TestClient, task_id: int, prefix: str) -> None:
+    checkpoint = client.get(f"/api/tasks/{task_id}/test-points")
+    assert checkpoint.status_code == 200
+    payload = checkpoint.json()
+    response = client.post(
+        f"/api/tasks/{task_id}/test-points/confirm",
+        json={
+            "points": payload["points"],
+            "expected_version": payload["version"],
+            "idempotency_key": f"{prefix}-{task_id}-{payload['version']}",
+        },
+    )
+    assert response.status_code == 200
 
 
 def test_review_optimize_apply_regenerate_finalize(tmp_app_data, monkeypatch):
@@ -86,6 +137,7 @@ def test_review_optimize_apply_regenerate_finalize(tmp_app_data, monkeypatch):
 
     draft_v1 = """# 用例：余额不足下单
 - 优先级：P0
+- 关联测试点：TP-001
 - 类型：异常
 - 关联知识：[1]
 
@@ -156,7 +208,7 @@ def test_review_optimize_apply_regenerate_finalize(tmp_app_data, monkeypatch):
     assert r.status_code == 200
     tid = r.json()["id"]
 
-    generated = _generate_with_confirmation(client, tid)
+    generated = _generate_with_confirmation(client, tid, monkeypatch)
     assert generated["status"] == "generated"
     assert generated["latest_draft_version"] == 1
 
@@ -209,7 +261,10 @@ def test_review_optimize_apply_regenerate_finalize(tmp_app_data, monkeypatch):
         assert regen.status_code == 200
     for _ in range(80):
         regen_body = client.get(f"/api/tasks/{tid}").json()
-        if regen_body["status"] not in {"retrieving", "generating"}:
+        if regen_body["status"] == "awaiting_test_point_confirmation":
+            _confirm_test_points(client, tid, "regen-points")
+            continue
+        if regen_body["status"] not in {"retrieving", "generating", "generating_test_points"}:
             break
         time.sleep(0.05)
     assert regen_body["status"] == "generated"
@@ -244,7 +299,7 @@ def test_finalize_from_generated(tmp_app_data, monkeypatch):
     mid = _create_model(client)
 
     def fake_chat(**kwargs):
-        return "# 用例：x\n- 优先级：P1\n"
+        return "# 用例：x\n- 优先级：P1\n- 关联测试点：TP-001\n"
 
     monkeypatch.setattr("app.api.tasks._GENERATE_CHAT_FN", fake_chat)
     monkeypatch.setattr("app.services.task_pipeline._GENERATE_CHAT_FN", fake_chat)
@@ -253,7 +308,7 @@ def test_finalize_from_generated(tmp_app_data, monkeypatch):
         "/api/tasks",
         json={"title": "t", "description": "d", "model_id": mid},
     ).json()["id"]
-    assert _generate_with_confirmation(client, tid)["status"] == "generated"
+    assert _generate_with_confirmation(client, tid, monkeypatch)["status"] == "generated"
     fin = client.post(f"/api/tasks/{tid}/finalize")
     assert fin.status_code == 200
     assert fin.json()["status"] == "finalized"
