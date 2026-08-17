@@ -15,7 +15,7 @@ CaseGen/                     # 解压后的项目源码
     ├── install.bat          # ① 一键安装（离线 pip，不联网）
     ├── run.bat              # ② 一键启动（单进程：后端 + 前端页面）
     ├── requirements-offline.txt
-    └── backend_wheels/      # 30 个 Windows 版依赖包（Python 3.12 / win_amd64）
+    └── backend_wheels/      # 31 个 Windows 版依赖包（Python 3.11 / win_amd64，含 socksio）
 ```
 
 ## 部署步骤（Win10 目标机器）
@@ -65,8 +65,8 @@ CaseGen/                     # 解压后的项目源码
 
 ## 本机验证记录
 
-- 后端 pytest：`248 passed`（含认证、Wiki spaces、任务流式输出）
+- 后端 pytest：`289 passed`（含认证、Wiki spaces、任务流式输出、测试设计工作台）
 - 前端 `npm run build`：通过
 - 单进程模式（后端托管 dist）：健康检查、首页、SPA 路由、静态资源、API 全部 200
 - Python 3.11.14 实机验证通过（后端 `backend/.venv311` 与 Win10 同步）
-- 版本基线：`a4a1a18`（Wiki 弹性 + Wiki spaces + 账号认证 + 任务流式输出）
+- 版本基线：`104e684`（Wiki 弹性 + Wiki spaces + 账号认证 + 任务流式输出 + 测试设计工作台）
