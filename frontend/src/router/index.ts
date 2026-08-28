@@ -47,6 +47,41 @@ const router = createRouter({
           meta: { title: '用例管理', description: '按需求管理已入库用例，编辑当前内容并导出 Markdown' },
         },
         {
+          path: 'data-pools',
+          name: 'data-pools',
+          component: () => import('../views/DataPoolsView.vue'),
+          meta: { title: '数据池', description: '导入并预览项目级实体数据与抽象测试数据' },
+        },
+        {
+          path: 'platform-adapters',
+          name: 'platform-adapters',
+          redirect: '/platform-management',
+        },
+        {
+          path: 'platform-management',
+          name: 'platform-management',
+          component: () => import('../views/PlatformManagementView.vue'),
+          meta: { title: '平台管理', description: '维护平台、示例类型及其格式样例' },
+        },
+        {
+          path: 'platform-case-generate',
+          name: 'platform-case-generate',
+          component: () => import('../views/PlatformCaseGeneratorView.vue'),
+          meta: { title: '生成平台用例', description: '根据语义用例、示例类型和数据生成平台产物' },
+        },
+        {
+          path: 'platform-cases',
+          name: 'platform-cases',
+          component: () => import('../views/PlatformCasesView.vue'),
+          meta: { title: '平台用例管理', description: '查看、预览和维护生成产物的管理副本' },
+        },
+        {
+          path: 'platform-upload',
+          name: 'platform-upload',
+          component: () => import('../views/PlatformUploadView.vue'),
+          meta: { title: '上传至测试平台', description: '查看并下载生成产物，等待后续连接器推送' },
+        },
+        {
           path: 'documents',
           name: 'documents',
           component: () => import('../views/DocumentsView.vue'),

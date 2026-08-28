@@ -544,6 +544,138 @@ class TestCase(SQLModel, table=True):
     )
 
 
+class DataPool(SQLModel, table=True):
+    """Project-scoped logical test-data collection."""
+
+    __tablename__ = "data_pools"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    wiki_space_id: int = Field(foreign_key="wiki_spaces.id", index=True)
+    name: str
+    description: str = ""
+    attributes_json: str = "{}"
+    status: str = Field(default="active", index=True)
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow, sa_column_kwargs={"onupdate": _utcnow})
+
+    __table_args__ = (Index("ix_data_pools_space_status", "wiki_space_id", "status"),)
+
+
+class DataPoolRevision(SQLModel, table=True):
+    """Immutable import snapshot; values remain business-agnostic JSON."""
+
+    __tablename__ = "data_pool_revisions"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    data_pool_id: int = Field(foreign_key="data_pools.id", index=True)
+    revision: int = 1
+    source_kind: str
+    inferred_schema_json: str = "{}"
+    records_json: str = "[]"
+    raw_text: str = ""
+    content_hash: str = Field(index=True)
+    status: str = Field(default="published", index=True)
+    error_message: Optional[str] = None
+    model_ref: Optional[str] = None
+    prompt_ref: Optional[str] = None
+    created_at: datetime = Field(default_factory=_utcnow)
+
+    __table_args__ = (UniqueConstraint("data_pool_id", "revision", name="uq_data_pool_revision"),)
+
+
+class PlatformProfile(SQLModel, table=True):
+    __tablename__ = "platform_profiles"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    wiki_space_id: int = Field(foreign_key="wiki_spaces.id", index=True)
+    name: str
+    description: str = ""
+    artifact_topology: str = "combined"
+    status: str = Field(default="active", index=True)
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow, sa_column_kwargs={"onupdate": _utcnow})
+
+
+class ExampleVariant(SQLModel, table=True):
+    __tablename__ = "example_variants"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    platform_id: int = Field(foreign_key="platform_profiles.id", index=True)
+    name: str
+    applicability: str = ""
+    status: str = Field(default="active", index=True)
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+class PlatformExample(SQLModel, table=True):
+    __tablename__ = "platform_examples"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    variant_id: int = Field(foreign_key="example_variants.id", index=True)
+    kind: str
+    name: str = ""
+    media_type: str = "text/plain"
+    content: str
+    content_hash: str = Field(index=True)
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+class PlatformRenderRun(SQLModel, table=True):
+    __tablename__ = "platform_render_runs"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    wiki_space_id: int = Field(foreign_key="wiki_spaces.id", index=True)
+    platform_id: int = Field(foreign_key="platform_profiles.id", index=True)
+    variant_id: int = Field(foreign_key="example_variants.id", index=True)
+    status: str = Field(default="running", index=True)
+    generation_mode: str = "example_direct"
+    input_snapshot_json: str = "{}"
+    input_hash: str = ""
+    model_ref: Optional[str] = None
+    prompt_ref: Optional[str] = None
+    warnings_json: str = "[]"
+    error_message: Optional[str] = None
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow, sa_column_kwargs={"onupdate": _utcnow})
+
+
+class PlatformArtifact(SQLModel, table=True):
+    __tablename__ = "platform_artifacts"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    run_id: int = Field(foreign_key="platform_render_runs.id", index=True)
+    kind: str
+    filename: str
+    media_type: str = "text/plain"
+    content: str
+    content_hash: str
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+class ManagedPlatformCase(SQLModel, table=True):
+    """Editable management copy of an immutable generated platform artifact."""
+
+    __tablename__ = "managed_platform_cases"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    wiki_space_id: int = Field(foreign_key="wiki_spaces.id", index=True)
+    platform_id: int = Field(foreign_key="platform_profiles.id", index=True)
+    variant_id: Optional[int] = Field(default=None, foreign_key="example_variants.id", index=True)
+    source_run_id: Optional[int] = Field(default=None, foreign_key="platform_render_runs.id", index=True)
+    source_artifact_id: Optional[int] = Field(default=None, foreign_key="platform_artifacts.id", unique=True, index=True)
+    filename: str
+    name: str = ""
+    kind: str
+    media_type: str = "text/plain"
+    content: str
+    content_hash: str = Field(index=True)
+    status: str = Field(default="active", index=True)
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow, sa_column_kwargs={"onupdate": _utcnow})
+
+    __table_args__ = (Index("ix_managed_platform_cases_space_status", "wiki_space_id", "status"),)
+
+
 class TestPointCaseLink(SQLModel, table=True):
     """Normalized confirmed test point -> imported current case relationship."""
 

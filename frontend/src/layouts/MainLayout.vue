@@ -8,6 +8,8 @@ import {
   Document,
   EditPen,
   FolderOpened,
+  DataAnalysis,
+  Connection,
   List,
   Monitor,
   Reading,
@@ -25,11 +27,20 @@ const auth = useAuthStore()
 const defaultModel = ref<ModelConfig | null>(null)
 
 const wikiPaths = ['/wiki', '/documents', '/wiki/reviews', '/wiki-spaces']
+const platformPaths = ['/platform-management', '/platform-case-generate', '/platform-cases', '/platform-upload', '/platform-adapters']
 
 const useCaseItems = [
   { path: '/', label: '用例生成', icon: Monitor },
   { path: '/tasks', label: '生成任务', icon: List },
   { path: '/cases', label: '用例管理', icon: Collection },
+  { path: '/data-pools', label: '数据池', icon: DataAnalysis },
+]
+
+const platformItems = [
+  { path: '/platform-management', label: '平台管理', icon: Connection },
+  { path: '/platform-case-generate', label: '生成平台用例', icon: Monitor },
+  { path: '/platform-cases', label: '平台用例管理', icon: Collection },
+  { path: '/platform-upload', label: '上传至测试平台', icon: Document },
 ]
 
 const systemItems = [
@@ -45,8 +56,9 @@ const wikiItems = [
 ]
 
 const wikiExpanded = ref(false)
+const platformExpanded = ref(false)
 
-const allMenuItems = computed(() => [...useCaseItems, ...wikiItems, ...systemItems])
+const allMenuItems = computed(() => [...useCaseItems, ...platformItems, ...wikiItems, ...systemItems])
 
 const pageTitle = computed(() => {
   const meta = route.meta || {}
@@ -70,9 +82,14 @@ function isActive(path: string): boolean {
 }
 
 const isWikiActive = computed(() => wikiPaths.some((path) => isActive(path)))
+const isPlatformActive = computed(() => platformPaths.some((path) => isActive(path)))
 
 function toggleWiki() {
   wikiExpanded.value = !wikiExpanded.value
+}
+
+function togglePlatform() {
+  platformExpanded.value = !platformExpanded.value
 }
 
 watch(
@@ -83,6 +100,7 @@ watch(
       return path === wikiPath || path.startsWith(wikiPath + '/')
     })
     if (isWikiRoute) wikiExpanded.value = true
+    if (platformPaths.some((platformPath) => path === platformPath || path.startsWith(platformPath + '/'))) platformExpanded.value = true
   },
   { immediate: true },
 )
@@ -126,6 +144,15 @@ onMounted(loadDefaultModel)
             </el-icon>
             <span>{{ item.label }}</span>
           </router-link>
+        </section>
+
+        <section class="nav-group wiki-group">
+          <button type="button" class="nav-group-toggle" :class="{ active: isPlatformActive }" :aria-expanded="platformExpanded" aria-controls="platform-submenu" @click="togglePlatform">
+            <el-icon class="nav-icon" :size="18"><Connection /></el-icon><span>平台适配</span><el-icon class="nav-chevron" :size="14"><ArrowDown v-if="platformExpanded"/><ArrowRight v-else/></el-icon>
+          </button>
+          <div v-show="platformExpanded" id="platform-submenu" class="nav-submenu">
+            <router-link v-for="item in platformItems" :key="item.path" :to="item.path" class="nav-item nav-subitem" :class="{active:isActive(item.path)}"><el-icon class="nav-icon" :size="17"><component :is="item.icon"/></el-icon><span>{{item.label}}</span></router-link>
+          </div>
         </section>
 
         <section class="nav-group wiki-group">
