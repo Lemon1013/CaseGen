@@ -204,10 +204,6 @@ export function getPlatformCase(id: number, spaceId: number) {
   return api<PlatformCaseDetail>(`/api/platform-cases/${id}?wiki_space_id=${spaceId}`)
 }
 
-export function createPlatformCase(body: PlatformCaseInput & { wiki_space_id: number; platform_id: number }) {
-  return api<PlatformCaseDetail>('/api/platform-cases', { method: 'POST', body: JSON.stringify(body) })
-}
-
 export function updatePlatformCase(id: number, spaceId: number, body: Partial<PlatformCaseInput>) {
   return api<PlatformCaseDetail>(`/api/platform-cases/${id}?wiki_space_id=${spaceId}`, { method: 'PATCH', body: JSON.stringify(body) })
 }

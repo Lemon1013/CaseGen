@@ -47,8 +47,21 @@ class PromptTemplate(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=_utcnow, sa_column_kwargs={"onupdate": _utcnow})
 
 
+class Project(SQLModel, table=True):
+    __tablename__ = "projects"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str
+    slug: str = Field(index=True, unique=True)
+    description: str = ""
+    status: str = Field(default="active", index=True)
+    default_wiki_space_id: Optional[int] = Field(default=None, index=True)
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow, sa_column_kwargs={"onupdate": _utcnow})
+
+
 class WikiSpace(SQLModel, table=True):
-    """Project-scoped Wiki namespace."""
+    """Shared or project-scoped Wiki namespace."""
 
     __tablename__ = "wiki_spaces"
 
@@ -57,11 +70,30 @@ class WikiSpace(SQLModel, table=True):
     slug: str = Field(index=True, unique=True)
     description: str = ""
     status: str = Field(default="active", index=True)
+    scope: str = Field(default="project", index=True)
+    project_id: Optional[int] = Field(default=None, foreign_key="projects.id", index=True)
+    namespace: Optional[str] = Field(default=None, index=True)
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow, sa_column_kwargs={"onupdate": _utcnow})
 
     __table_args__ = (
         Index("ix_wiki_spaces_status_updated", "status", "updated_at"),
+        Index("uq_wiki_spaces_shared_namespace", "namespace", unique=True, sqlite_where=text("scope = 'shared'")),
+    )
+
+
+class ProjectWikiBinding(SQLModel, table=True):
+    __tablename__ = "project_wiki_bindings"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    project_id: int = Field(foreign_key="projects.id", index=True)
+    wiki_space_id: int = Field(foreign_key="wiki_spaces.id", index=True)
+    priority: int = 100
+    enabled: bool = True
+    created_at: datetime = Field(default_factory=_utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("project_id", "wiki_space_id", name="uq_project_wiki_binding"),
     )
 
 
@@ -121,6 +153,8 @@ class WikiPageRow(SQLModel, table=True):
     revision: int = 1
     aliases_json: str = "[]"
     content_hash: Optional[str] = None
+    canonical_topic: Optional[str] = Field(default=None, index=True)
+    assertion_summary: Optional[str] = None
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow, sa_column_kwargs={"onupdate": _utcnow})
 
@@ -258,6 +292,7 @@ class Requirement(SQLModel, table=True):
     __tablename__ = "requirements"
 
     id: Optional[int] = Field(default=None, primary_key=True)
+    project_id: Optional[int] = Field(default=None, foreign_key="projects.id", index=True)
     title: str
     description: str
     focus_tags_json: str = "[]"
@@ -270,6 +305,7 @@ class GenerationTask(SQLModel, table=True):
 
     id: Optional[int] = Field(default=None, primary_key=True)
     requirement_id: int
+    project_id: Optional[int] = Field(default=None, foreign_key="projects.id", index=True)
     wiki_space_id: Optional[int] = Field(default=None, foreign_key="wiki_spaces.id", index=True)
     status: str
     model_id: Optional[int] = None
@@ -289,6 +325,42 @@ class GenerationTask(SQLModel, table=True):
     finalized_at: Optional[datetime] = None
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow, sa_column_kwargs={"onupdate": _utcnow})
+
+
+class TaskKnowledgeDecision(SQLModel, table=True):
+    __tablename__ = "task_knowledge_decisions"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    task_id: int = Field(foreign_key="generation_tasks.id", index=True)
+    checkpoint_id: int = Field(foreign_key="task_retrieval_checkpoints.id", index=True)
+    checkpoint_version: int
+    conflict_key: str = Field(index=True)
+    selected_page_id: int = Field(foreign_key="wiki_pages.id", index=True)
+    selected_revision: int
+    decision_scope: str = "once"
+    decided_by: Optional[str] = None
+    reason: str = ""
+    created_at: datetime = Field(default_factory=_utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("checkpoint_id", "conflict_key", name="uq_checkpoint_knowledge_decision"),
+    )
+
+
+class ProjectKnowledgeDecision(SQLModel, table=True):
+    __tablename__ = "project_knowledge_decisions"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    project_id: int = Field(foreign_key="projects.id", index=True)
+    conflict_key: str = Field(index=True)
+    selected_page_id: int = Field(foreign_key="wiki_pages.id", index=True)
+    selected_revision: int
+    decided_by: Optional[str] = None
+    reason: str = ""
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow, sa_column_kwargs={"onupdate": _utcnow})
+
+    __table_args__ = (UniqueConstraint("project_id", "conflict_key", name="uq_project_knowledge_decision"),)
 
 
 class TaskReferenceCase(SQLModel, table=True):

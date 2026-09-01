@@ -10,10 +10,12 @@ import {
   listWikiPages,
   retrieveWiki,
   type RetrieveHit,
+  type KnowledgeConflict,
   type WikiPage,
 } from '../api/wiki'
 import { listWikiSpaces, type WikiSpace } from '../api/wikiSpaces'
 import { chooseSpace, rememberAndRoute, spaceIdFromQuery } from '../utils/wikiSpace'
+import { useProjectStore } from '../projectStore'
 
 type ListItem = {
   id: number | null
@@ -41,6 +43,7 @@ type ListItem = {
 
 const route = useRoute()
 const router = useRouter()
+const projects = useProjectStore()
 const spaces = ref<WikiSpace[]>([])
 const currentSpace = ref<WikiSpace | null>(null)
 
@@ -49,6 +52,8 @@ const pages = ref<WikiPage[]>([])
 const query = ref('')
 const searching = ref(false)
 const hits = ref<RetrieveHit[] | null>(null)
+const conflicts = ref<KnowledgeConflict[]>([])
+const conflictChoices = ref<Record<string, number>>({})
 const domainFilter = ref('')
 const typeFilter = ref('')
 const statusFilter = ref('')
@@ -277,6 +282,7 @@ async function openWikiPage(id: number | null | undefined, fallbackTitle?: strin
   try {
     const page = await getWikiPage(id, currentSpace.value?.id)
     previewTitle.value = page.title || fallbackTitle || `页面 #${id}`
+    previewMeta.value = [page.canonical_topic && `主题：${page.canonical_topic}`, page.assertion_summary && `结论：${page.assertion_summary}`].filter(Boolean).join(' · ')
     previewContent.value = page.content || '（无内容）'
   } catch (e) {
     ElMessage.error(`加载页面失败：${(e as Error).message}`)
@@ -339,8 +345,9 @@ async function search() {
   }
   searching.value = true
   try {
-    const res = await retrieveWiki(q, 20, currentSpace.value?.id)
+    const res = await retrieveWiki(q, 20, currentSpace.value?.id, projects.state.currentId || undefined)
     hits.value = res.hits.filter((hit) => hit.status !== 'archived')
+    conflicts.value = res.conflict_groups || []
     retrievalMode.value = res.retrieval_mode || ''
     if (!hits.value.length) {
       ElMessage.info('未检索到相关页面')
@@ -359,6 +366,7 @@ async function search() {
 function clearSearch() {
   query.value = ''
   hits.value = null
+  conflicts.value = []
   retrievalMode.value = ''
 }
 
@@ -561,6 +569,15 @@ watch(
         {{ retrievalMode === 'fts5_hybrid' ? 'FTS5 混合检索' : '兼容检索' }}
       </el-tag>
     </div>
+
+    <el-alert v-for="conflict in conflicts" :key="conflict.conflict_key" type="warning" :closable="false" class="conflict-alert" :title="`知识冲突：${conflict.canonical_topic}`">
+      <el-radio-group v-model="conflictChoices[conflict.conflict_key]">
+        <el-radio v-for="candidate in conflict.candidates" :key="candidate.id || candidate.path" :value="candidate.id || 0">
+          {{ candidate.space_scope === 'shared' ? '公共' : '项目' }} · {{ candidate.space_name }}：{{ candidate.assertion_summary }}
+        </el-radio>
+      </el-radio-group>
+      <el-button link type="primary" @click="router.push({ path: '/wiki/reviews', query: { ...route.query, space_id: String(conflict.candidates.find((item) => item.id === conflictChoices[conflict.conflict_key])?.space_id || currentSpace?.id || '') } })">前往更新知识</el-button>
+    </el-alert>
 
     <div class="layout">
       <div class="list-panel panel" v-loading="loading">

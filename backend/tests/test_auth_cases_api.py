@@ -23,6 +23,10 @@ def _setup(client: TestClient) -> None:
         json={"username": "admin", "display_name": "Admin", "password": "password1234"},
     )
     assert response.status_code == 200
+    with Session(get_engine()) as session:
+        from app.models.entities import Project
+        project = session.exec(select(Project)).first()
+        client.params = {"project_id": int(project.id)}
 
 
 def test_setup_login_logout_and_origin_guard(tmp_app_data, monkeypatch):

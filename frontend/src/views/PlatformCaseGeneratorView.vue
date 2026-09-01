@@ -1,13 +1,12 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import { listWikiSpaces, type WikiSpace } from '../api/wikiSpaces'
 import { listDataPools, listPlatforms, listPlatformSemanticCases, renderExampleDirect, type DataPool, type PlatformProfile, type RenderRun, type SemanticCase } from '../api/platformData'
-import { rememberedSpaceId, rememberAndRoute, spaceIdFromQuery } from '../utils/wikiSpace'
+import { useProjectStore } from '../projectStore'
 
-const route=useRoute(),router=useRouter()
-const spaces=ref<WikiSpace[]>([]),spaceId=ref<number>(),platforms=ref<PlatformProfile[]>([]),pools=ref<DataPool[]>([]),cases=ref<SemanticCase[]>([])
+const projects=useProjectStore()
+const spaceId=computed(()=>projects.current.value?.default_wiki_space_id??undefined)
+const platforms=ref<PlatformProfile[]>([]),pools=ref<DataPool[]>([]),cases=ref<SemanticCase[]>([])
 const active=ref(0),inputMode=ref<'library'|'markdown'>('library'),selectedCases=ref<number[]>([]),externalMarkdown=ref(''),fileName=ref('')
 const platformId=ref<number>(),variantId=ref<number>(),selectedRevisions=ref<number[]>([]),keywords=ref<string[]>([])
 const includeDataValues=ref(false),dataSampleLimit=ref(10),rendering=ref(false),result=ref<RenderRun>(),error=ref('')
@@ -24,9 +23,7 @@ const summary=computed(()=>[
   {label:'数据值',value:includeDataValues.value?`发送最多 ${dataSampleLimit.value} 条样例`:'默认不发送'},
 ])
 async function load(){if(!spaceId.value)return;[platforms.value,pools.value,cases.value]=await Promise.all([listPlatforms(spaceId.value),listDataPools(spaceId.value),listPlatformSemanticCases(spaceId.value)])}
-function clearSelections(){active.value=0;selectedCases.value=[];externalMarkdown.value='';fileName.value='';platformId.value=undefined;variantId.value=undefined;selectedRevisions.value=[];keywords.value=[];includeDataValues.value=false;result.value=undefined;error.value=''}
-async function init(){try{spaces.value=(await listWikiSpaces()).filter(s=>s.status==='active');const requested=spaceIdFromQuery(route.query)||rememberedSpaceId();if(requested&&spaces.value.some(s=>s.id===requested)){spaceId.value=requested;await load()}}catch(error){ElMessage.error(`加载平台生成数据失败：${(error as Error).message}`)}}
-async function changeSpace(id:number){clearSelections();await rememberAndRoute(router,id,'/platform-case-generate');await load()}
+async function init(){try{await load()}catch(error){ElMessage.error(`加载平台生成数据失败：${(error as Error).message}`)}}
 function choosePlatform(){variantId.value=currentPlatform.value?.variants[0]?.id}
 async function readMarkdown(event:Event){const input=event.target as HTMLInputElement;const file=input.files?.[0];if(!file)return;if(!file.name.toLowerCase().endsWith('.md')){ElMessage.warning('请选择 .md 文件');input.value='';return}if(file.size>200000){ElMessage.warning('Markdown 文件不能超过 200 KB');return}externalMarkdown.value=await file.text();fileName.value=file.name}
 function next(){if(active.value===0&&!inputReady.value)return ElMessage.warning('请先选择语义用例或提供 Markdown');if(active.value===1&&!platformReady.value)return ElMessage.warning('请选择含示例的平台和示例类型');active.value=Math.min(3,active.value+1)}
@@ -37,8 +34,8 @@ onMounted(init)
 </script>
 
 <template><div class="page">
- <div class="page-header"><div><h1 class="page-title">生成平台用例</h1><p class="page-subtitle">选择语义输入、单个示例类型和数据上下文，生成可下载的平台产物。</p></div><el-select v-model="spaceId" placeholder="请选择知识空间" style="width:220px" @change="changeSpace"><el-option v-for="s in spaces" :key="s.id" :label="s.name" :value="s.id"/></el-select></div>
- <el-empty v-if="!spaceId" description="请选择知识空间，系统不会自动替你切换项目"/>
+ <div class="page-header"><div><h1 class="page-title">生成平台用例</h1><p class="page-subtitle">选择语义输入、单个示例类型和数据上下文，生成可下载的平台产物。</p></div></div>
+ <el-empty v-if="!spaceId" description="当前空间没有默认知识库"/>
  <template v-else><el-card shadow="never"><el-steps :active="active" finish-status="success"><el-step title="01 选取输入"/><el-step title="02 平台与示例类型"/><el-step title="03 数据与关键字"/><el-step title="04 摘要与生成"/></el-steps></el-card>
  <el-card shadow="never" class="stage">
   <section v-show="active===0"><h3>01 选取输入</h3><el-radio-group v-model="inputMode"><el-radio-button value="library">现有语义用例</el-radio-button><el-radio-button value="markdown">本地 Markdown</el-radio-button></el-radio-group><div v-if="inputMode==='library'" class="field"><el-select v-model="selectedCases" multiple filterable placeholder="选择当前空间的语义用例" style="width:100%"><el-option v-for="c in cases" :key="c.id" :label="`${c.case_key} · ${c.title}`" :value="c.id"/></el-select><el-empty v-if="!cases.length" description="当前空间暂无已入库语义用例" :image-size="70"/></div><div v-else class="field"><input id="markdown-file" type="file" accept=".md,text/markdown" class="hidden" @change="readMarkdown"><label for="markdown-file" class="file-button">选择 .md 文件</label><span class="file-name">{{fileName||'未选择文件；内容只在浏览器读取并随生成请求提交'}}</span><el-input v-model="externalMarkdown" type="textarea" :rows="15" placeholder="# 在此预览或编辑 Markdown 用例"/></div></section>

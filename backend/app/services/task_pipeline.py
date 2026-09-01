@@ -17,6 +17,7 @@ from app.models.entities import (
     ModelConfig,
     PromptRevision,
     PromptTemplate,
+    ProjectKnowledgeDecision,
     Requirement,
     ReviewResult,
     TaskCitation,
@@ -681,6 +682,38 @@ def assemble_task_context(
 
 # Descriptive alias for callers that prefer the verb “build”.
 build_task_context = assemble_task_context
+
+
+def checkpoint_conflicts(
+    conflict_groups: Iterable[Mapping[str, Any]] | None,
+    wiki_hits: Iterable[Mapping[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Keep only conflicts whose candidates survived context normalization."""
+
+    available = {
+        (int(hit["id"]), int(hit["revision"]))
+        for hit in wiki_hits or []
+        if hit.get("id") is not None and hit.get("revision") is not None
+    }
+    result: list[dict[str, Any]] = []
+    for raw_group in conflict_groups or []:
+        group = dict(raw_group)
+        candidates = [
+            dict(candidate)
+            for candidate in group.get("candidates") or []
+            if candidate.get("id") is not None
+            and candidate.get("revision") is not None
+            and (int(candidate["id"]), int(candidate["revision"])) in available
+        ]
+        assertions = {
+            str(candidate.get("assertion_summary") or "").strip()
+            for candidate in candidates
+            if str(candidate.get("assertion_summary") or "").strip()
+        }
+        if len(candidates) >= 2 and len(assertions) >= 2:
+            group["candidates"] = candidates
+            result.append(group)
+    return result
 
 
 def _build_messages(
@@ -1444,14 +1477,30 @@ def run_generate(
                 task.wiki_space_id = resolved_space_id
                 session.add(task)
                 session.commit()
-            from app.services.hybrid_retrieve import hybrid_retrieve
-            retrieved = hybrid_retrieve(
+            from app.services.hybrid_retrieve import hybrid_retrieve, project_hybrid_retrieve
+            retrieve_fn = project_hybrid_retrieve if task.project_id is not None else hybrid_retrieve
+            retrieve_scope = ({"project_id": task.project_id, "private_space_id": resolved_space_id} if task.project_id is not None else {"space_id": resolved_space_id})
+            retrieved = retrieve_fn(
                 session, query,
                 wiki_k=config.RETRIEVE_WIKI_TOP_K,
                 source_k=config.RETRIEVE_SOURCE_TOP_K,
                 top_k=config.RETRIEVE_WIKI_TOP_K + config.RETRIEVE_SOURCE_TOP_K,
-                space_id=resolved_space_id,
+                **retrieve_scope,
             )
+            decisions = {
+                row.conflict_key: row
+                for row in session.exec(select(ProjectKnowledgeDecision).where(ProjectKnowledgeDecision.project_id == task.project_id)).all()
+            } if task.project_id is not None else {}
+            unresolved = []
+            for conflict in retrieved.get("conflict_groups") or []:
+                decision = decisions.get(conflict.get("conflict_key"))
+                selected = next((item for item in conflict.get("candidates") or [] if decision and item.get("id") == decision.selected_page_id and item.get("revision") == decision.selected_revision), None)
+                if selected is None:
+                    unresolved.append(conflict)
+                    continue
+                candidate_ids = {item.get("id") for item in conflict.get("candidates") or []}
+                retrieved["wiki_hits"] = [item for item in retrieved.get("wiki_hits") or [] if item.get("id") not in candidate_ids or item.get("id") == selected.get("id")]
+            retrieved["conflict_groups"] = unresolved
             context = assemble_task_context(
                 retrieved.get("wiki_hits") or [], retrieved.get("source_hits") or [],
                 query=query, include_explain=True,
@@ -1496,12 +1545,16 @@ def run_generate(
                 append_event(session, task.id, "retrieve", "警告：未检索到 Wiki 或原文块，将仅基于需求生成")
             # Store the lossless retrieval/context snapshot before asking for a decision.
             attempt = (session.exec(select(func.max(TaskRetrievalCheckpoint.attempt)).where(TaskRetrievalCheckpoint.task_id == task.id)).one() or 0) + 1
-            snapshot = {"context": context}
+            conflicts = checkpoint_conflicts(
+                retrieved.get("conflict_groups") or [],
+                context.get("wiki_hits") or [],
+            )
+            snapshot = {"context": context, "conflict_groups": conflicts, "requires_knowledge_decision": bool(conflicts)}
             snapshot_json = json.dumps(snapshot, ensure_ascii=False, default=str)
             checkpoint = TaskRetrievalCheckpoint(task_id=task.id, attempt=int(attempt), status="pending", auto_review=auto_review, query=query, retrieval_json=snapshot_json, candidate_citation_ids_json=json.dumps([r.id for r in citation_rows]), version=1)
             session.add(checkpoint)
             _set_status(task, "awaiting_confirmation")
-            append_event(session, task.id, "retrieve", "检索完成，等待人工确认")
+            append_event(session, task.id, "retrieve", "发现知识冲突，等待选择" if conflicts else "检索完成，等待人工确认", detail={"requires_knowledge_decision": bool(conflicts), "conflict_count": len(conflicts)})
             session.commit()
             session.refresh(task)
             task_stream.status(stream_task_id, status="awaiting_confirmation", message="检索完成，请确认引用后继续生成")

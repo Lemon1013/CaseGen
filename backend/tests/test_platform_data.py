@@ -253,6 +253,9 @@ def test_artifact_filename_validation_rejects_unsafe_names():
 
 
 def test_archived_space_rejects_platform_configuration_writes(tmp_app_data):
+    from app.db import get_engine
+    from app.models.entities import Project, WikiSpace
+
     client = TestClient(_app(tmp_app_data))
     space = _space(client, "Archive writes")
     platform = client.post("/api/platforms", json={
@@ -266,6 +269,12 @@ def test_archived_space_rejects_platform_configuration_writes(tmp_app_data):
         f'/api/platforms/{platform["id"]}/variants/{variant["id"]}/examples?wiki_space_id={space["id"]}',
         json={"kind": "combined", "content": "{}"},
     ).json()
+    with Session(get_engine()) as session:
+        owner = session.get(Project, space["project_id"])
+        replacement = WikiSpace(name="Archive replacement", slug="archive-replacement", scope="project", project_id=owner.id)
+        session.add(replacement); session.flush()
+        owner.default_wiki_space_id = replacement.id
+        session.add(owner); session.commit()
     assert client.post(f'/api/wiki-spaces/{space["id"]}/archive').status_code == 200
 
     responses = [

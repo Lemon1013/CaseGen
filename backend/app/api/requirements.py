@@ -3,11 +3,11 @@ from __future__ import annotations
 import json
 from typing import List
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlmodel import Session, select
 
 from app.db import get_session
-from app.models.entities import Requirement
+from app.models.entities import Project, Requirement
 from app.schemas.requirements import RequirementCreate, RequirementOut
 
 router = APIRouter(prefix="/api/requirements", tags=["requirements"])
@@ -26,6 +26,7 @@ def _tags_list(row: Requirement) -> list[str]:
 def to_requirement_out(row: Requirement) -> RequirementOut:
     return RequirementOut(
         id=row.id,
+        project_id=row.project_id,
         title=row.title,
         description=row.description,
         focus_tags=_tags_list(row),
@@ -37,9 +38,19 @@ def to_requirement_out(row: Requirement) -> RequirementOut:
 @router.post("", response_model=RequirementOut)
 def create_requirement(
     body: RequirementCreate,
+    request: Request,
     session: Session = Depends(get_session),
 ) -> RequirementOut:
+    from app.services.projects import request_project_id, require_request_project
+    current_project_id = request_project_id(request)
+    target_project_id = body.project_id or current_project_id
+    if target_project_id is not None:
+        require_request_project(request, target_project_id)
+        project = session.get(Project, target_project_id)
+        if project is None or project.status != "active":
+            raise HTTPException(status_code=422, detail="Project not found or inactive")
     row = Requirement(
+        project_id=target_project_id,
         title=body.title,
         description=body.description,
         focus_tags_json=json.dumps(body.focus_tags or [], ensure_ascii=False),
@@ -51,17 +62,23 @@ def create_requirement(
 
 
 @router.get("", response_model=List[RequirementOut])
-def list_requirements(session: Session = Depends(get_session)) -> list[RequirementOut]:
-    rows = session.exec(select(Requirement).order_by(Requirement.id.desc())).all()
+def list_requirements(project_id: int | None = None, session: Session = Depends(get_session)) -> list[RequirementOut]:
+    statement = select(Requirement)
+    if project_id is not None:
+        statement = statement.where(Requirement.project_id == project_id)
+    rows = session.exec(statement.order_by(Requirement.id.desc())).all()
     return [to_requirement_out(r) for r in rows]
 
 
 @router.get("/{requirement_id}", response_model=RequirementOut)
 def get_requirement(
     requirement_id: int,
+    project_id: int | None = None,
     session: Session = Depends(get_session),
 ) -> RequirementOut:
     row = session.get(Requirement, requirement_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Requirement not found")
+    if project_id is not None and row.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Requirement not found in project")
     return to_requirement_out(row)

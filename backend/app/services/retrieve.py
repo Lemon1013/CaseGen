@@ -312,6 +312,8 @@ def load_all_wiki_pages(
                     "source_document_id": row.source_document_id,
                     "source_document_ids": source_document_ids,
                     "space_id": row.space_id if row.space_id is not None else sid,
+                    "canonical_topic": row.canonical_topic,
+                    "assertion_summary": row.assertion_summary,
                 }
             )
         return pages

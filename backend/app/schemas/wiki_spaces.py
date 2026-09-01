@@ -12,6 +12,9 @@ class WikiSpaceCreate(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     slug: Optional[str] = Field(default=None, max_length=64)
     description: str = Field(default="", max_length=2000)
+    scope: str = "project"
+    project_id: Optional[int] = Field(default=None, ge=1)
+    namespace: Optional[str] = Field(default=None, max_length=64)
 
     @field_validator("name", "description")
     @classmethod
@@ -55,6 +58,9 @@ class WikiSpaceOut(BaseModel):
     slug: str
     description: str = ""
     status: str
+    scope: str = "project"
+    project_id: Optional[int] = None
+    namespace: Optional[str] = None
     document_count: int = 0
     page_count: int = 0
     pending_review_count: int = 0

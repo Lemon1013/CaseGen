@@ -56,6 +56,18 @@ from app.services.llm import LLMError, chat_completion
 
 router = APIRouter(tags=["platform-data"])
 
+
+def _project_scope(session: Session, project_id: int | None, wiki_space_id: int) -> None:
+    if project_id is None:
+        return
+    from app.services.projects import validate_project_space
+    try:
+        space = validate_project_space(session, project_id, wiki_space_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if space.scope != "project":
+        raise HTTPException(status_code=422, detail="Writes require a project Wiki space")
+
 # Deterministic test hooks. They also make the exact LLM context inspectable.
 _PLATFORM_CHAT_FN: Callable[..., Any] | None = None
 _DESCRIPTION_CHAT_FN: Callable[..., Any] | None = None
@@ -233,7 +245,8 @@ def _pool_out(session: Session, row: DataPool) -> DataPoolOut:
 
 
 @router.post("/api/data-pools", response_model=DataPoolOut)
-def create_data_pool(body: DataPoolCreate, session: Session = Depends(get_session)) -> DataPoolOut:
+def create_data_pool(body: DataPoolCreate, project_id: int | None = Query(default=None, ge=1), session: Session = Depends(get_session)) -> DataPoolOut:
+    _project_scope(session, project_id, body.wiki_space_id)
     _space(session, body.wiki_space_id)
     schema, records, model_ref, prompt_ref = _parse_import(body, session)
     pool = DataPool(
@@ -254,7 +267,8 @@ def create_data_pool(body: DataPoolCreate, session: Session = Depends(get_sessio
 
 
 @router.get("/api/data-pools", response_model=list[DataPoolOut])
-def list_data_pools(wiki_space_id: int = Query(ge=1), include_archived: bool = False, session: Session = Depends(get_session)) -> list[DataPoolOut]:
+def list_data_pools(wiki_space_id: int = Query(ge=1), project_id: int | None = Query(default=None, ge=1), include_archived: bool = False, session: Session = Depends(get_session)) -> list[DataPoolOut]:
+    _project_scope(session, project_id, wiki_space_id)
     statement = select(DataPool).where(DataPool.wiki_space_id == wiki_space_id)
     if not include_archived:
         statement = statement.where(DataPool.status == "active")
@@ -321,7 +335,8 @@ def _example_referenced(session: Session, variant_id: int, example_id: int) -> b
 
 
 @router.post("/api/platforms", response_model=PlatformOut)
-def create_platform(body: PlatformCreate, session: Session = Depends(get_session)) -> PlatformOut:
+def create_platform(body: PlatformCreate, project_id: int | None = Query(default=None, ge=1), session: Session = Depends(get_session)) -> PlatformOut:
+    _project_scope(session, project_id, body.wiki_space_id)
     _space(session, body.wiki_space_id)
     row = PlatformProfile(**body.model_dump())
     session.add(row)
@@ -331,7 +346,8 @@ def create_platform(body: PlatformCreate, session: Session = Depends(get_session
 
 
 @router.get("/api/platforms", response_model=list[PlatformOut])
-def list_platforms(wiki_space_id: int = Query(ge=1), session: Session = Depends(get_session)) -> list[PlatformOut]:
+def list_platforms(wiki_space_id: int = Query(ge=1), project_id: int | None = Query(default=None, ge=1), session: Session = Depends(get_session)) -> list[PlatformOut]:
+    _project_scope(session, project_id, wiki_space_id)
     rows = session.exec(select(PlatformProfile).where(PlatformProfile.wiki_space_id == wiki_space_id, PlatformProfile.status == "active").order_by(PlatformProfile.id)).all()
     return [_platform_out(session, row) for row in rows]
 
@@ -669,6 +685,7 @@ def _validate_platform_case_values(filename: str, kind: str, media_type: str, co
 @router.get("/api/platform-cases", response_model=PlatformCasePage)
 def list_platform_cases(
     wiki_space_id: int = Query(ge=1),
+    project_id: int | None = Query(default=None, ge=1),
     platform_id: int | None = Query(default=None, ge=1),
     variant_id: int | None = Query(default=None, ge=1),
     media_type: str | None = None,
@@ -678,6 +695,7 @@ def list_platform_cases(
     offset: int = Query(default=0, ge=0),
     session: Session = Depends(get_session),
 ) -> PlatformCasePage:
+    _project_scope(session, project_id, wiki_space_id)
     space = _read_space(session, wiki_space_id)
     if space.status == "active":
         _sync_managed_platform_cases(session, wiki_space_id)
@@ -705,7 +723,8 @@ def list_platform_cases(
 
 
 @router.post("/api/platform-cases", response_model=PlatformCaseDetail)
-def create_platform_case(body: PlatformCaseCreate, session: Session = Depends(get_session)) -> PlatformCaseDetail:
+def create_platform_case(body: PlatformCaseCreate, project_id: int | None = Query(default=None, ge=1), session: Session = Depends(get_session)) -> PlatformCaseDetail:
+    _project_scope(session, project_id, body.wiki_space_id)
     _space(session, body.wiki_space_id)
     _owned_platform(session, body.platform_id, body.wiki_space_id)
     if body.variant_id is not None:
@@ -810,7 +829,8 @@ def list_platform_semantic_cases(
 
 
 @router.post("/api/platform-renders/example-direct", response_model=RenderRunOut)
-def render_example_direct(body: PlatformRenderRequest, session: Session = Depends(get_session)) -> RenderRunOut:
+def render_example_direct(body: PlatformRenderRequest, project_id: int | None = Query(default=None, ge=1), session: Session = Depends(get_session)) -> RenderRunOut:
+    _project_scope(session, project_id, body.wiki_space_id)
     _space(session, body.wiki_space_id)
     platform = session.get(PlatformProfile, body.platform_id)
     variant = session.get(ExampleVariant, body.variant_id)

@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import List
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from sqlmodel import Session, col, or_, select
 
 from app import config
@@ -35,6 +35,14 @@ router = APIRouter(prefix="/api/documents", tags=["documents"])
 
 # Optional injectable chat_fn for tests: set via monkeypatch on this module attr.
 _INGEST_CHAT_FN = None
+
+
+def _require_shared_admin(request: Request, space) -> None:
+    if space.scope != "shared" or not config.AUTH_ENABLED:
+        return
+    user = getattr(request.state, "user", None)
+    if user is None or getattr(user, "role", "") != "admin":
+        raise HTTPException(status_code=403, detail="Shared Wiki spaces require an administrator")
 
 
 def _document_or_404(session: Session, document_id: int) -> Document:
@@ -101,8 +109,10 @@ def _ingest_job_out(session: Session, job: IngestJob) -> IngestJobOut:
 
 @router.post("", response_model=DocumentOut)
 async def upload_document(
+    request: Request,
     file: UploadFile = File(...),
     space_id: int | None = Form(default=None),
+    project_id: int | None = Query(default=None, ge=1),
     session: Session = Depends(get_session),
 ) -> DocumentOut:
     ensure_data_dirs()
@@ -110,6 +120,13 @@ async def upload_document(
         space = resolve_space(session, space_id, for_write=True)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if project_id is not None:
+        from app.services.projects import validate_project_space
+        try:
+            validate_project_space(session, project_id, int(space.id or 0))
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail="Wiki space not found in project") from exc
+    _require_shared_admin(request, space)
 
     filename = file.filename or "upload.bin"
     suffix = Path(filename).suffix.lower()
@@ -193,6 +210,7 @@ def get_document(
 @router.delete("/{document_id}", response_model=DocumentDeleteOut)
 def remove_document(
     document_id: int,
+    request: Request,
     space_id: int | None = Query(default=None),
     session: Session = Depends(get_session),
 ) -> DocumentDeleteOut:
@@ -203,6 +221,7 @@ def remove_document(
         resolve_space_id(session, space_id),
         for_write=True,
     )
+    _require_shared_admin(request, space)
     try:
         result = delete_document(session, doc, space_id=int(space.id or 0))
     except RuntimeError as exc:
@@ -271,6 +290,7 @@ def preview_document(
 @router.post("/{document_id}/ingest", response_model=IngestJobOut)
 def start_ingest(
     document_id: int,
+    request: Request,
     session: Session = Depends(get_session),
     force: bool = Query(False, description="Force a new ingest after a previous terminal job"),
     space_id: int | None = Query(default=None),
@@ -282,6 +302,7 @@ def start_ingest(
     space = _space_for_document(
         session, doc, resolve_space_id(session, space_id), for_write=True
     )
+    _require_shared_admin(request, space)
     active = session.exec(
         select(IngestJob)
         .where(
@@ -362,6 +383,7 @@ def list_document_chunks(
 @router.post("/{document_id}/rechunk", response_model=RechunkOut)
 def rechunk_document(
     document_id: int,
+    request: Request,
     space_id: int | None = Query(default=None),
     session: Session = Depends(get_session),
 ) -> RechunkOut:
@@ -370,6 +392,7 @@ def rechunk_document(
     space = _space_for_document(
         session, doc, resolve_space_id(session, space_id), for_write=True
     )
+    _require_shared_admin(request, space)
     stored = (doc.stored_path or "").replace("\\", "/")
     path = Path(stored)
     if not path.is_absolute():

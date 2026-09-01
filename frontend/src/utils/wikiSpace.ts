@@ -27,5 +27,5 @@ export function chooseSpace(spaces: WikiSpace[], requested: number | null): Wiki
 
 export async function rememberAndRoute(router: Router, id: number, path: string) {
   localStorage.setItem(WIKI_SPACE_STORAGE_KEY, String(id))
-  await router.replace({ path, query: { space_id: String(id) } })
+  await router.replace({ path, query: { ...router.currentRoute.value.query, space_id: String(id) } })
 }

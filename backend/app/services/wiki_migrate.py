@@ -221,8 +221,8 @@ def _ensure_default_space(engine: Engine) -> int:
             conn.execute(
                 text(
                     'INSERT INTO "wiki_spaces" '
-                    '(name, slug, description, status, created_at, updated_at) '
-                    'VALUES (:name, :slug, :description, :status, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)'
+                    '(name, slug, description, status, scope, created_at, updated_at) '
+                    'VALUES (:name, :slug, :description, :status, \'project\', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)'
                 ),
                 {
                     "name": "默认空间",

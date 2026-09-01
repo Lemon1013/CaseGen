@@ -22,6 +22,7 @@ export interface ReviewResult {
 export interface TaskItem {
   id: number
   requirement_id: number
+  project_id?: number | null
   wiki_space_id: number
   wiki_space_name: string
   status: string
@@ -133,7 +134,20 @@ export interface RetrievalCheckpoint {
   idempotency_key: string | null
   created_at: string
   updated_at: string
+  conflict_groups: KnowledgeConflict[]
 }
+
+export interface KnowledgeConflictCandidate {
+  id: number | null
+  title: string
+  space_id?: number | null
+  space_name?: string
+  space_scope?: string
+  revision?: number | null
+  assertion_summary?: string | null
+}
+
+export interface KnowledgeConflict { conflict_key: string; canonical_topic: string; candidates: KnowledgeConflictCandidate[] }
 
 export interface TaskReferenceCase {
   id: number
@@ -316,6 +330,13 @@ export function confirmRetrievalCheckpoint(id: number, body: { selected_citation
   return api<TaskItem>(`/api/tasks/${id}/retrieval-checkpoint/confirm`, {
     method: 'POST',
     body: JSON.stringify(body),
+  })
+}
+
+export function saveKnowledgeDecision(taskId: number, checkpointId: number, checkpointVersion: number, conflictKey: string, selectedPageId: number, decisionScope: 'once' | 'project') {
+  return api(`/api/tasks/${taskId}/knowledge-decisions/${encodeURIComponent(conflictKey)}`, {
+    method: 'PUT',
+    body: JSON.stringify({ checkpoint_id: checkpointId, checkpoint_version: checkpointVersion, conflict_key: conflictKey, selected_page_id: selectedPageId, decision_scope: decisionScope }),
   })
 }
 

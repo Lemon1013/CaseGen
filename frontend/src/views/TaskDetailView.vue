@@ -39,12 +39,14 @@ import {
   editTestPoints,
   confirmTestPoints,
   getTaskCoverage,
+  saveKnowledgeDecision,
   type RetrievalCheckpoint,
   type TestPointCheckpoint,
   type TestPointItem,
   type CoverageSummary,
 } from '../api/tasks'
 import { listModels, type ModelConfig } from '../api/models'
+import { proposeWikiUpdate } from '../api/wiki'
 
 const route = useRoute()
 const router = useRouter()
@@ -60,6 +62,8 @@ const citations = ref<TaskCitation[]>([])
 const checkpoint = ref<RetrievalCheckpoint | null>(null)
 const selectedCitationIds = ref<number[]>([])
 const supplementalText = ref('')
+const knowledgeChoices = ref<Record<string, number>>({})
+const knowledgeScopes = ref<Record<string, boolean>>({})
 const confirmingCheckpoint = ref(false)
 const testPointCheckpoint = ref<TestPointCheckpoint | null>(null)
 const testPoints = ref<TestPointItem[]>([])
@@ -177,6 +181,8 @@ function hydrateRetrievalEditor(fresh: RetrievalCheckpoint) {
     ? [...fresh.selected_citation_ids]
     : fresh.candidate_citations.map((item) => item.id)
   supplementalText.value = fresh.supplemental_text || ''
+  knowledgeChoices.value = {}
+  knowledgeScopes.value = {}
 }
 
 function hydrateTestPointEditor(fresh: TestPointCheckpoint) {
@@ -262,8 +268,16 @@ async function confirmCheckpoint() {
     ElMessage.warning('至少选择一条引用或填写补充上下文')
     return
   }
+  const unresolved = checkpoint.value.conflict_groups.filter((item) => !knowledgeChoices.value[item.conflict_key])
+  if (unresolved.length) {
+    ElMessage.warning('请先为每组知识冲突选择采用项')
+    return
+  }
   confirmingCheckpoint.value = true
   try {
+    for (const conflict of checkpoint.value.conflict_groups) {
+      await saveKnowledgeDecision(task.value.id, checkpoint.value.id, checkpoint.value.version, conflict.conflict_key, knowledgeChoices.value[conflict.conflict_key], knowledgeScopes.value[conflict.conflict_key] ? 'project' : 'once')
+    }
     const updated = await confirmRetrievalCheckpoint(task.value.id, {
       selected_citation_ids: selectedCitationIds.value,
       supplemental_text: supplementalText.value,
@@ -276,6 +290,28 @@ async function confirmCheckpoint() {
     ElMessage.error(`确认失败：${(err as Error).message}`)
   } finally {
     confirmingCheckpoint.value = false
+  }
+}
+
+function chooseKnowledge(conflictKey: string, pageId: number) {
+  if (!checkpoint.value) return
+  const conflict = checkpoint.value.conflict_groups.find((item) => item.conflict_key === conflictKey)
+  const pageIds = new Set((conflict?.candidates || []).map((item) => item.id))
+  const competingCitationIds = new Set(checkpoint.value.candidate_citations.filter((item) => item.wiki_page_id != null && pageIds.has(item.wiki_page_id)).map((item) => item.id))
+  selectedCitationIds.value = selectedCitationIds.value.filter((id) => !competingCitationIds.has(id))
+  const selectedCitation = checkpoint.value.candidate_citations.find((item) => item.wiki_page_id === pageId)
+  if (selectedCitation) selectedCitationIds.value.push(selectedCitation.id)
+}
+
+async function proposeConflictUpdate(pageId: number | null, spaceId: number | null | undefined) {
+  if (!pageId || !spaceId) return
+  try {
+    const { value } = await ElMessageBox.prompt('请输入建议采用的新结论；提交后进入现有审核流程，不会直接覆盖正式知识。', '提交知识修订', { inputValidator: (value) => !!value.trim() || '请输入新结论' })
+    await proposeWikiUpdate(pageId, spaceId, value)
+    ElMessage.success('已创建知识修订审核项')
+    await router.push({ path: '/wiki/reviews', query: { ...route.query, space_id: String(spaceId) } })
+  } catch (error) {
+    if (error !== 'cancel' && error !== 'close') ElMessage.error(`提交修订失败：${(error as Error).message}`)
   }
 }
 
@@ -957,6 +993,15 @@ onUnmounted(() => {
     <el-card v-if="task?.status === 'awaiting_confirmation' && checkpoint" shadow="never" class="block checkpoint-card">
       <template #header>检索结果确认</template>
       <p class="meta">请确认将用于生成的知识引用，可取消不相关条目。</p>
+      <el-alert v-for="conflict in checkpoint.conflict_groups" :key="conflict.conflict_key" type="warning" :closable="false" :title="`知识冲突：${conflict.canonical_topic}`">
+        <el-radio-group v-model="knowledgeChoices[conflict.conflict_key]" @change="(pageId: string | number | boolean | undefined) => chooseKnowledge(conflict.conflict_key, Number(pageId))">
+          <el-radio v-for="candidate in conflict.candidates" :key="candidate.id || candidate.title" :value="candidate.id || 0">
+            {{ candidate.space_scope === 'shared' ? '公共' : '项目' }} · {{ candidate.space_name }}：{{ candidate.assertion_summary }}
+            <el-button link type="primary" @click.stop="proposeConflictUpdate(candidate.id, candidate.space_id)">{{ candidate.space_scope === 'shared' ? '提交公共库更新' : '更新项目库' }}</el-button>
+          </el-radio>
+        </el-radio-group>
+        <el-checkbox v-model="knowledgeScopes[conflict.conflict_key]">记住为当前项目默认选择</el-checkbox>
+      </el-alert>
       <el-checkbox-group v-model="selectedCitationIds" class="checkpoint-list">
         <el-checkbox v-for="item in checkpoint.candidate_citations" :key="item.id" :label="item.id" class="checkpoint-item">
           <span class="checkpoint-title">{{ item.title }}</span>

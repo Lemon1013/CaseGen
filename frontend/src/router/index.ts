@@ -106,6 +106,12 @@ const router = createRouter({
           meta: { title: '知识空间', description: '按项目管理隔离的 Wiki 文档、页面、审核与检索边界' },
         },
         {
+          path: 'spaces',
+          name: 'space-management',
+          component: () => import('../views/SpaceManagementView.vue'),
+          meta: { title: '空间管理', description: '管理全站项目空间及其生命周期' },
+        },
+        {
           path: 'prompts',
           name: 'prompts',
           component: () => import('../views/PromptsView.vue'),

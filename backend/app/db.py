@@ -605,6 +605,86 @@ def _migrate_test_design_schema(engine) -> None:
                 )
 
 
+def _migrate_project_schema(engine, *, backfill: bool = False) -> None:
+    """Add the project boundary without changing legacy default-space semantics."""
+
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS projects (
+                id INTEGER PRIMARY KEY, name VARCHAR NOT NULL, slug VARCHAR NOT NULL,
+                description VARCHAR NOT NULL DEFAULT '', status VARCHAR NOT NULL DEFAULT 'active',
+                default_wiki_space_id INTEGER, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """))
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_projects_slug ON projects(slug)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_projects_status ON projects(status)"))
+
+        additions = {
+            "wiki_spaces": {
+                "scope": "VARCHAR NOT NULL DEFAULT 'project'",
+                "project_id": "INTEGER",
+                "namespace": "VARCHAR",
+            },
+            "wiki_pages": {
+                "canonical_topic": "VARCHAR",
+                "assertion_summary": "TEXT",
+            },
+            "requirements": {"project_id": "INTEGER"},
+            "generation_tasks": {"project_id": "INTEGER"},
+        }
+        for table, columns in additions.items():
+            existing = {
+                str(row[1])
+                for row in conn.execute(text(f'PRAGMA table_info("{table}")')).fetchall()
+            }
+            for name, definition in columns.items():
+                if existing and name not in existing:
+                    conn.execute(text(f'ALTER TABLE "{table}" ADD COLUMN "{name}" {definition}'))
+
+        decision_columns = {str(row[1]) for row in conn.execute(text('PRAGMA table_info("task_knowledge_decisions")')).fetchall()}
+        if decision_columns and ({"checkpoint_id", "checkpoint_version"} - decision_columns):
+            # Pre-checkpoint decisions were not tied to an evidence snapshot
+            # and are unsafe to reuse. Recreate the pre-release table instead
+            # of preserving its incompatible task/conflict unique index.
+            conn.execute(text('DROP TABLE "task_knowledge_decisions"'))
+
+        if not backfill:
+            return
+        spaces = conn.execute(
+            text("SELECT id, name, slug, description, status FROM wiki_spaces WHERE scope = 'project' OR scope IS NULL")
+        ).fetchall()
+        for space in spaces:
+            project_id = conn.execute(
+                text("SELECT id FROM projects WHERE slug = :slug"), {"slug": space.slug}
+            ).scalar()
+            if project_id is None:
+                conn.execute(
+                    text("""INSERT INTO projects
+                        (name, slug, description, status, default_wiki_space_id, created_at, updated_at)
+                        VALUES (:name, :slug, :description, :status, :space_id, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"""),
+                    dict(name=space.name, slug=space.slug, description=space.description or "", status=space.status, space_id=space.id),
+                )
+                project_id = conn.execute(
+                    text("SELECT id FROM projects WHERE slug = :slug"), {"slug": space.slug}
+                ).scalar()
+            conn.execute(
+                text("UPDATE wiki_spaces SET scope = 'project', project_id = :project_id WHERE id = :space_id"),
+                {"project_id": project_id, "space_id": space.id},
+            )
+        default_project = conn.execute(
+            text("SELECT project_id FROM wiki_spaces WHERE slug = 'default'")
+        ).scalar()
+        if default_project is not None:
+            conn.execute(text("UPDATE requirements SET project_id = :pid WHERE project_id IS NULL"), {"pid": default_project})
+            conn.execute(text("""UPDATE generation_tasks SET project_id = COALESCE(
+                (SELECT project_id FROM wiki_spaces WHERE wiki_spaces.id = generation_tasks.wiki_space_id),
+                :pid) WHERE project_id IS NULL"""), {"pid": default_project})
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_wiki_spaces_project_id ON wiki_spaces(project_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_wiki_spaces_scope ON wiki_spaces(scope)"))
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_wiki_spaces_shared_namespace ON wiki_spaces(namespace) WHERE scope = 'shared'"))
+
+
 def init_db() -> None:
     from app.models import entities  # noqa: F401
     from app.services.wiki_migrate import backup_before_wiki_migration, migrate_wiki_schema
@@ -615,10 +695,12 @@ def init_db() -> None:
     # attempts to create the partial unique index on an existing database.
     backup_before_wiki_migration(engine)
     _migrate_model_defaults(engine)
+    _migrate_project_schema(engine)
     # Wiki migration performs its backup before any create/alter/backfill
     # operation.  It also calls create_all so the new Wiki tables are present
     # before the remaining compatibility migration runs.
     migrate_wiki_schema(engine)
+    _migrate_project_schema(engine, backfill=True)
     _migrate_sqlite_columns(engine)
     _migrate_model_defaults(engine)
     _migrate_case_management_schema(engine)

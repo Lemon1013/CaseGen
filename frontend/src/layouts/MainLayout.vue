@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import {
   Collection,
   Cpu,
@@ -8,6 +8,7 @@ import {
   Document,
   EditPen,
   FolderOpened,
+  OfficeBuilding,
   DataAnalysis,
   Connection,
   List,
@@ -21,10 +22,21 @@ import {
 import { listModels, type ModelConfig } from '../api/models'
 import { useAuthStore } from '../authStore'
 import BrandMark from '../components/BrandMark.vue'
+import { useProjectStore } from '../projectStore'
 
 const route = useRoute()
+const router = useRouter()
+const projects = useProjectStore()
 const auth = useAuthStore()
 const defaultModel = ref<ModelConfig | null>(null)
+const projectQuery = computed(() => {
+  const project = projects.current.value
+  if (!project) return {}
+  const requested = Number(Array.isArray(route.query.space_id) ? route.query.space_id[0] : route.query.space_id)
+  const allowed = [...project.private_spaces, ...project.shared_spaces].some((space) => space.id === requested)
+  const spaceId = allowed ? requested : project.default_wiki_space_id
+  return { project_id: String(project.id), ...(spaceId ? { space_id: String(spaceId) } : {}) }
+})
 
 const wikiPaths = ['/wiki', '/documents', '/wiki/reviews', '/wiki-spaces']
 const platformPaths = ['/platform-management', '/platform-case-generate', '/platform-cases', '/platform-upload', '/platform-adapters']
@@ -44,6 +56,7 @@ const platformItems = [
 ]
 
 const systemItems = [
+  { path: '/spaces', label: '空间管理', icon: OfficeBuilding },
   { path: '/prompts', label: '提示词管理', icon: EditPen },
   { path: '/models', label: '模型配置', icon: Cpu },
 ]
@@ -52,7 +65,7 @@ const wikiItems = [
   { path: '/wiki', label: '知识浏览', icon: Reading },
   { path: '/documents', label: '文档摄入', icon: Document },
   { path: '/wiki/reviews', label: '变更审核', icon: CircleCheck },
-  { path: '/wiki-spaces', label: '知识空间', icon: FolderOpened },
+  { path: '/wiki-spaces', label: '知识库管理', icon: FolderOpened },
 ]
 
 const wikiExpanded = ref(false)
@@ -114,7 +127,10 @@ async function loadDefaultModel() {
   }
 }
 
-onMounted(loadDefaultModel)
+onMounted(async () => {
+  await Promise.all([loadDefaultModel(), projects.load(route.query)])
+  if (projects.state.currentId && !route.query.project_id) await projects.select(projects.state.currentId, router)
+})
 </script>
 
 <template>
@@ -135,7 +151,7 @@ onMounted(loadDefaultModel)
           <router-link
             v-for="item in useCaseItems"
             :key="item.path"
-            :to="item.path"
+            :to="{ path: item.path, query: projectQuery }"
             class="nav-item"
             :class="{ active: isActive(item.path) }"
           >
@@ -151,7 +167,7 @@ onMounted(loadDefaultModel)
             <el-icon class="nav-icon" :size="18"><Connection /></el-icon><span>平台适配</span><el-icon class="nav-chevron" :size="14"><ArrowDown v-if="platformExpanded"/><ArrowRight v-else/></el-icon>
           </button>
           <div v-show="platformExpanded" id="platform-submenu" class="nav-submenu">
-            <router-link v-for="item in platformItems" :key="item.path" :to="item.path" class="nav-item nav-subitem" :class="{active:isActive(item.path)}"><el-icon class="nav-icon" :size="17"><component :is="item.icon"/></el-icon><span>{{item.label}}</span></router-link>
+            <router-link v-for="item in platformItems" :key="item.path" :to="{ path: item.path, query: projectQuery }" class="nav-item nav-subitem" :class="{active:isActive(item.path)}"><el-icon class="nav-icon" :size="17"><component :is="item.icon"/></el-icon><span>{{item.label}}</span></router-link>
           </div>
         </section>
 
@@ -175,7 +191,7 @@ onMounted(loadDefaultModel)
             <router-link
               v-for="item in wikiItems"
               :key="item.path"
-              :to="item.path"
+              :to="{ path: item.path, query: projectQuery }"
               class="nav-item nav-subitem"
               :class="{ active: isActive(item.path) }"
             >
@@ -192,7 +208,7 @@ onMounted(loadDefaultModel)
           <router-link
             v-for="item in systemItems"
             :key="item.path"
-            :to="item.path"
+            :to="{ path: item.path, query: projectQuery }"
             class="nav-item"
             :class="{ active: isActive(item.path) }"
           >
@@ -218,6 +234,9 @@ onMounted(loadDefaultModel)
           <p v-if="pageDescription" class="topbar-desc">{{ pageDescription }}</p>
         </div>
         <div class="topbar-right">
+          <el-select v-if="projects.state.projects.length" :model-value="projects.state.currentId" class="project-select" aria-label="当前项目" @change="(id: number) => projects.select(id, router)">
+            <el-option v-for="project in projects.state.projects.filter((item) => item.status === 'active')" :key="project.id" :label="project.name" :value="project.id" />
+          </el-select>
           <div v-if="defaultModel" class="model-chip" title="当前默认模型">
             <span class="model-dot" />
             <span class="model-label">默认模型</span>
@@ -232,7 +251,7 @@ onMounted(loadDefaultModel)
       </header>
 
       <el-main class="main-content">
-        <router-view />
+        <router-view v-if="projects.state.loaded" :key="projects.state.currentId || 'no-project'" />
       </el-main>
     </el-container>
   </el-container>
@@ -497,6 +516,14 @@ onMounted(loadDefaultModel)
   font-size: 12px;
   max-width: 360px;
 }
+
+.topbar-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.project-select { width: 180px; }
 
 .model-dot {
   width: 8px;

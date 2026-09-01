@@ -1,13 +1,12 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { listWikiSpaces, type WikiSpace } from '../api/wikiSpaces'
 import { createExample, createPlatform, createVariant, deleteExample, deletePlatform, deleteVariant, listPlatforms, updateExample, updatePlatform, updateVariant, type ExampleVariant, type PlatformExample, type PlatformProfile } from '../api/platformData'
-import { rememberedSpaceId, rememberAndRoute, spaceIdFromQuery } from '../utils/wikiSpace'
+import { useProjectStore } from '../projectStore'
 
-const route = useRoute(), router = useRouter()
-const spaces = ref<WikiSpace[]>([]), spaceId = ref<number>(), platforms = ref<PlatformProfile[]>([])
+const projects = useProjectStore()
+const spaceId = computed(() => projects.current.value?.default_wiki_space_id ?? undefined)
+const platforms = ref<PlatformProfile[]>([])
 const platformId = ref<number>(), variantId = ref<number>()
 const platformDialog = ref(false), variantDialog = ref(false), exampleDialog = ref(false)
 const editingPlatform = ref<PlatformProfile>(), editingVariant = ref<ExampleVariant>(), editingExample = ref<PlatformExample>()
@@ -25,14 +24,11 @@ async function load() {
 }
 async function init() {
   try {
-    spaces.value = (await listWikiSpaces()).filter((item) => item.status === 'active')
-    const requested = spaceIdFromQuery(route.query) || rememberedSpaceId()
-    if (requested && spaces.value.some((item) => item.id === requested)) { spaceId.value = requested; await load() }
+    await load()
   } catch (error) {
     ElMessage.error(`加载平台管理数据失败：${(error as Error).message}`)
   }
 }
-async function changeSpace(id: number) { platformId.value = undefined; variantId.value = undefined; await rememberAndRoute(router, id, '/platform-management'); await load() }
 function openPlatform(row?: PlatformProfile) { editingPlatform.value = row; Object.assign(platformForm, row ? { name: row.name, description: row.description, artifact_topology: row.artifact_topology } : { name: '', description: '', artifact_topology: 'combined' }); platformDialog.value = true }
 async function savePlatform() { if (!spaceId.value || !platformForm.name.trim()) return; try { if (editingPlatform.value) await updatePlatform(editingPlatform.value.id, spaceId.value, platformForm); else await createPlatform({ wiki_space_id: spaceId.value, ...platformForm }); platformDialog.value=false; await load(); ElMessage.success('平台已保存') } catch(e){ ElMessage.error((e as Error).message) } }
 async function removePlatform(row: PlatformProfile) { if(!spaceId.value)return; try{await ElMessageBox.confirm(`删除平台「${row.name}」及其示例类型？`,'确认删除',{type:'warning'});await deletePlatform(row.id,spaceId.value);await load();ElMessage.success('平台已删除')}catch(e){if(e!=='cancel')ElMessage.error((e as Error).message)} }
@@ -46,8 +42,8 @@ onMounted(init)
 </script>
 
 <template><div class="page">
-  <div class="page-header"><div><h1 class="page-title">平台管理</h1><p class="page-subtitle">先维护平台，再为平台维护可独立选择的示例类型和格式样例。</p></div><el-select v-model="spaceId" placeholder="请选择知识空间" style="width:220px" @change="changeSpace"><el-option v-for="s in spaces" :key="s.id" :label="s.name" :value="s.id"/></el-select></div>
-  <el-empty v-if="!spaceId" description="请选择知识空间后开始配置"/>
+  <div class="page-header"><div><h1 class="page-title">平台管理</h1><p class="page-subtitle">先维护平台，再为平台维护可独立选择的示例类型和格式样例。</p></div></div>
+  <el-empty v-if="!spaceId" description="当前空间没有默认知识库"/>
   <template v-else><el-card shadow="never"><template #header><div class="head"><strong>1. 平台</strong><el-button type="primary" @click="openPlatform()">新建平台</el-button></div></template><el-table :data="platforms" highlight-current-row @current-change="(row:PlatformProfile)=>{platformId=row?.id;variantId=row?.variants[0]?.id}"><el-table-column prop="name" label="平台"/><el-table-column prop="description" label="说明"/><el-table-column prop="artifact_topology" label="产物拓扑" width="140"/><el-table-column label="操作" width="150"><template #default="{row}"><el-button link @click.stop="openPlatform(row)">编辑</el-button><el-button link type="danger" @click.stop="removePlatform(row)">删除</el-button></template></el-table-column></el-table></el-card>
   <el-card shadow="never" class="section"><template #header><div class="head"><strong>2. 示例类型 <span v-if="currentPlatform">· {{currentPlatform.name}}</span></strong><el-button type="primary" :disabled="!platformId" @click="openVariant()">新建示例类型</el-button></div></template><el-empty v-if="!platformId" description="请先在上方选择平台"/><el-table v-else :data="currentPlatform?.variants||[]" highlight-current-row @current-change="(row:ExampleVariant)=>variantId=row?.id"><el-table-column prop="name" label="示例类型"/><el-table-column prop="applicability" label="适用说明"/><el-table-column label="示例数" width="90"><template #default="{row}">{{row.examples.length}}</template></el-table-column><el-table-column label="操作" width="150"><template #default="{row}"><el-button link @click.stop="openVariant(row)">编辑</el-button><el-button link type="danger" @click.stop="removeVariant(row)">删除</el-button></template></el-table-column></el-table>
   <el-divider content-position="left">示例内容 · {{currentVariant?.name||'未选择'}}</el-divider><div class="head"><span class="hint">kind、媒体类型和内容都会作为该示例类型的参考格式。编辑仅影响后续生成，历史产物不会改变；历史已引用的示例不可删除。</span><el-button :disabled="!variantId" @click="openExample()">新增示例</el-button></div><el-table :data="currentVariant?.examples||[]"><el-table-column prop="name" label="名称"/><el-table-column prop="kind" label="Kind" width="110"/><el-table-column prop="media_type" label="媒体类型" width="180"/><el-table-column prop="content" label="内容预览" show-overflow-tooltip/><el-table-column label="操作" width="150"><template #default="{row}"><el-button link @click="openExample(row)">编辑</el-button><el-button link type="danger" @click="removeExample(row)">删除</el-button></template></el-table-column></el-table></el-card></template>
