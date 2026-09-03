@@ -238,12 +238,18 @@ export function shouldPollTaskStatus(status: string | null | undefined): boolean
   return Boolean(status && IN_PROGRESS_STATUSES.has(status))
 }
 
+/** Append ?project_id=… for project-scoped task endpoints. */
+function _projectQuery(projectId?: number | null): string {
+  if (!projectId) return ''
+  return `?project_id=${projectId}`
+}
+
 export function listTasks() {
   return api<TaskItem[]>('/api/tasks')
 }
 
-export function getTask(id: number) {
-  return api<TaskItem>(`/api/tasks/${id}`)
+export function getTask(id: number, projectId?: number | null) {
+  return api<TaskItem>(`/api/tasks/${id}${_projectQuery(projectId)}`)
 }
 
 export function taskStreamUrl(id: number) {
@@ -302,28 +308,28 @@ export function applyPrompt(
   })
 }
 
-export function listDrafts(id: number) {
-  return api<CaseDraft[]>(`/api/tasks/${id}/drafts`)
+export function listDrafts(id: number, projectId?: number | null) {
+  return api<CaseDraft[]>(`/api/tasks/${id}/drafts${_projectQuery(projectId)}`)
 }
 
-export function listEvents(id: number) {
-  return api<TaskEvent[]>(`/api/tasks/${id}/events`)
+export function listEvents(id: number, projectId?: number | null) {
+  return api<TaskEvent[]>(`/api/tasks/${id}/events${_projectQuery(projectId)}`)
 }
 
-export function listReviews(id: number) {
-  return api<ReviewResult[]>(`/api/tasks/${id}/reviews`)
+export function listReviews(id: number, projectId?: number | null) {
+  return api<ReviewResult[]>(`/api/tasks/${id}/reviews${_projectQuery(projectId)}`)
 }
 
-export function listRevisions(id: number) {
-  return api<PromptRevision[]>(`/api/tasks/${id}/revisions`)
+export function listRevisions(id: number, projectId?: number | null) {
+  return api<PromptRevision[]>(`/api/tasks/${id}/revisions${_projectQuery(projectId)}`)
 }
 
-export function listCitations(id: number) {
-  return api<TaskCitation[]>(`/api/tasks/${id}/citations`)
+export function listCitations(id: number, projectId?: number | null) {
+  return api<TaskCitation[]>(`/api/tasks/${id}/citations${_projectQuery(projectId)}`)
 }
 
-export function getRetrievalCheckpoint(id: number) {
-  return api<RetrievalCheckpoint>(`/api/tasks/${id}/retrieval-checkpoint`)
+export function getRetrievalCheckpoint(id: number, projectId?: number | null) {
+  return api<RetrievalCheckpoint>(`/api/tasks/${id}/retrieval-checkpoint${_projectQuery(projectId)}`)
 }
 
 export function confirmRetrievalCheckpoint(id: number, body: { selected_citation_ids: number[]; supplemental_text: string; expected_version: number; idempotency_key: string }) {
@@ -357,8 +363,8 @@ export function optimizeRequirement(body: {
   })
 }
 
-export function getTestPointCheckpoint(id: number) {
-  return api<TestPointCheckpoint>(`/api/tasks/${id}/test-points`)
+export function getTestPointCheckpoint(id: number, projectId?: number | null) {
+  return api<TestPointCheckpoint>(`/api/tasks/${id}/test-points${_projectQuery(projectId)}`)
 }
 
 export function editTestPoints(id: number, body: {
@@ -402,12 +408,12 @@ export function confirmTestPoints(id: number, body: {
   })
 }
 
-export function listTaskReferences(id: number) {
-  return api<TaskReferenceCase[]>(`/api/tasks/${id}/references`)
+export function listTaskReferences(id: number, projectId?: number | null) {
+  return api<TaskReferenceCase[]>(`/api/tasks/${id}/references${_projectQuery(projectId)}`)
 }
 
-export function getTaskCoverage(id: number) {
-  return api<CoverageSummary>(`/api/tasks/${id}/coverage`)
+export function getTaskCoverage(id: number, projectId?: number | null) {
+  return api<CoverageSummary>(`/api/tasks/${id}/coverage${_projectQuery(projectId)}`)
 }
 
 export function statusLabel(status: string): string {
