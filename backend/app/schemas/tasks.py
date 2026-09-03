@@ -2,6 +2,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from app.schemas.wiki import KnowledgeConflict
 
 
 class TaskCreate(BaseModel):
@@ -20,6 +21,7 @@ class TaskCreate(BaseModel):
     # Compatibility clients may omit this; the API explicitly resolves the
     # default space while the new frontend always sends it.
     wiki_space_id: Optional[int] = Field(default=None, ge=1)
+    project_id: Optional[int] = Field(default=None, ge=1)
     generation_granularity: Literal["compact", "standard", "detailed"] = "standard"
     test_dimensions: List[str] = Field(default_factory=lambda: ["positive", "negative", "boundary"])
     # ``dimensions`` is accepted as a short-lived compatibility spelling for
@@ -63,6 +65,7 @@ class TaskOut(BaseModel):
 
     id: int
     requirement_id: int
+    project_id: Optional[int] = None
     wiki_space_id: int
     wiki_space_name: str = ""
     status: str
@@ -86,6 +89,32 @@ class TaskOut(BaseModel):
     test_point_count: int = 0
     created_at: datetime
     updated_at: datetime
+
+
+class KnowledgeDecisionIn(BaseModel):
+    checkpoint_id: int = Field(ge=1)
+    checkpoint_version: int = Field(ge=1)
+    conflict_key: str = Field(min_length=1, max_length=200)
+    selected_page_id: int = Field(ge=1)
+    decision_scope: Literal["once", "project"] = "once"
+    decided_by: Optional[str] = Field(default=None, max_length=120)
+    reason: str = Field(default="", max_length=2000)
+
+
+class KnowledgeDecisionOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    task_id: int
+    checkpoint_id: int
+    checkpoint_version: int
+    conflict_key: str
+    selected_page_id: int
+    selected_revision: int
+    decision_scope: str
+    decided_by: Optional[str] = None
+    reason: str
+    created_at: datetime
 
 
 class TaskCitationOut(BaseModel):
@@ -121,6 +150,7 @@ class RetrievalCheckpointOut(BaseModel):
     idempotency_key: Optional[str] = None
     created_at: datetime
     updated_at: datetime
+    conflict_groups: List[KnowledgeConflict] = Field(default_factory=list)
 
 
 class RetrievalCheckpointConfirm(BaseModel):

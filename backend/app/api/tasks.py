@@ -8,7 +8,7 @@ import time
 from datetime import datetime, timezone
 from typing import AsyncIterator, List, Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from sqlmodel import Session, col, select
 
@@ -19,6 +19,7 @@ from app.models.entities import (
     GenerationTask,
     ModelConfig,
     PromptRevision,
+    ProjectKnowledgeDecision,
     PromptTemplate,
     Requirement,
     ReviewResult,
@@ -28,6 +29,7 @@ from app.models.entities import (
     TaskReferenceCase,
     TaskTestPointCheckpoint,
     TaskEvent,
+    TaskKnowledgeDecision,
     TestCase,
     TestPoint,
     TestPointCaseLink,
@@ -46,6 +48,8 @@ from app.schemas.tasks import (
     TaskEventOut,
     TaskModelUpdate,
     TaskOut,
+    KnowledgeDecisionIn,
+    KnowledgeDecisionOut,
     RetrievalCheckpointConfirm,
     RetrievalCheckpointOut,
     CoverageSummaryOut,
@@ -248,6 +252,10 @@ def _checkpoint_out(session: Session, checkpoint: TaskRetrievalCheckpoint) -> Re
             clause_ids=json.loads(getattr(row, "clause_ids_json", "[]") or "[]"), anchor_clause=getattr(row, "anchor_clause", None),
         ) for row in rows
     }
+    try:
+        snapshot = json.loads(checkpoint.retrieval_json or "{}")
+    except json.JSONDecodeError:
+        snapshot = {}
     return RetrievalCheckpointOut(
         id=checkpoint.id, task_id=checkpoint.task_id, attempt=checkpoint.attempt,
         version=checkpoint.version, status=checkpoint.status, query=checkpoint.query,
@@ -255,6 +263,7 @@ def _checkpoint_out(session: Session, checkpoint: TaskRetrievalCheckpoint) -> Re
         candidate_citations=[available[row.id] for row in rows if row.id in available],
         selected_citation_ids=selected, supplemental_text=checkpoint.supplemental_text or "",
         idempotency_key=checkpoint.idempotency_key, created_at=checkpoint.created_at, updated_at=checkpoint.updated_at,
+        conflict_groups=snapshot.get("conflict_groups") or [],
     )
 
 
@@ -310,6 +319,7 @@ def to_task_out(session: Session, task: GenerationTask) -> TaskOut:
     return TaskOut(
         id=task.id,
         requirement_id=task.requirement_id,
+        project_id=task.project_id,
         wiki_space_id=int(space.id if space and space.id is not None else task.wiki_space_id or 0),
         wiki_space_name=space.name if space else "",
         status=task.status,
@@ -363,6 +373,7 @@ def optimize_requirement_route(
 def create_task(
     body: TaskCreate,
     background_tasks: BackgroundTasks,
+    request: Request,
     session: Session = Depends(get_session),
     wait: bool = Query(
         False,
@@ -371,6 +382,15 @@ def create_task(
 ) -> TaskOut:
     try:
         space = resolve_space(session, body.wiki_space_id, for_write=True)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    project_id = body.project_id or space.project_id
+    if project_id is None or space.scope != "project":
+        raise HTTPException(status_code=422, detail="Tasks require a project and a project Wiki space")
+    try:
+        from app.services.projects import require_request_project, validate_project_space
+        require_request_project(request, project_id)
+        validate_project_space(session, project_id, int(space.id or 0))
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     if body.prompt_template_id is not None:
@@ -430,6 +450,9 @@ def create_task(
         requirement = session.get(Requirement, body.requirement_id)
         if requirement is None:
             raise HTTPException(status_code=422, detail="Requirement not found")
+        if requirement.project_id is not None and requirement.project_id != project_id:
+            raise HTTPException(status_code=422, detail="Requirement belongs to another project")
+        requirement.project_id = project_id
         if body.title is not None and body.title.strip():
             requirement.title = body.title.strip()
         if body.description is not None and body.description.strip():
@@ -446,6 +469,7 @@ def create_task(
                 detail="title and description are required when requirement_id is omitted",
             )
         requirement = Requirement(
+            project_id=project_id,
             title=(body.title or "").strip(),
             description=(body.description or "").strip(),
             focus_tags_json=json.dumps(body.focus_tags or [], ensure_ascii=False),
@@ -456,6 +480,7 @@ def create_task(
 
     task = GenerationTask(
         requirement_id=requirement.id,
+        project_id=project_id,
         wiki_space_id=space.id,
         status="draft",
         model_id=body.model_id,
@@ -519,8 +544,11 @@ def create_task(
 
 
 @router.get("", response_model=List[TaskOut])
-def list_tasks(session: Session = Depends(get_session)) -> list[TaskOut]:
-    rows = session.exec(select(GenerationTask).order_by(col(GenerationTask.id).desc())).all()
+def list_tasks(project_id: int | None = Query(default=None, ge=1), session: Session = Depends(get_session)) -> list[TaskOut]:
+    statement = select(GenerationTask)
+    if project_id is not None:
+        statement = statement.where(GenerationTask.project_id == project_id)
+    rows = session.exec(statement.order_by(col(GenerationTask.id).desc())).all()
     return [to_task_out(session, r) for r in rows]
 
 
@@ -673,6 +701,27 @@ def confirm_retrieval_checkpoint(
             raise HTTPException(status_code=422, detail="Selected citation does not belong to checkpoint")
         if not selected and not body.supplemental_text.strip():
             raise HTTPException(status_code=422, detail="Select a citation or provide supplemental context")
+        try:
+            conflict_groups = json.loads(checkpoint.retrieval_json or "{}").get("conflict_groups") or []
+        except (AttributeError, json.JSONDecodeError):
+            conflict_groups = []
+        decision_rows = session.exec(select(TaskKnowledgeDecision).where(TaskKnowledgeDecision.checkpoint_id == checkpoint.id, TaskKnowledgeDecision.checkpoint_version == checkpoint.version)).all()
+        decisions = {row.conflict_key: row for row in decision_rows}
+        unresolved = [item.get("conflict_key") for item in conflict_groups if item.get("conflict_key") not in decisions]
+        if unresolved:
+            raise HTTPException(status_code=409, detail="Resolve knowledge conflicts before confirming retrieval")
+        # A conflict decision is authoritative: keep its citation and remove
+        # every competing candidate even if the browser submitted stale boxes.
+        citation_rows = session.exec(select(TaskCitation).where(TaskCitation.task_id == task_id, TaskCitation.id.in_(candidate_ids))).all()
+        citation_by_page = {int(row.wiki_page_id): int(row.id) for row in citation_rows if row.wiki_page_id is not None and row.id is not None}
+        for conflict in conflict_groups:
+            decision = decisions[conflict["conflict_key"]]
+            competing = {citation_by_page.get(int(item["id"])) for item in conflict.get("candidates") or [] if item.get("id") is not None}
+            selected_citation = citation_by_page.get(decision.selected_page_id)
+            if selected_citation not in actual_ids:
+                raise HTTPException(status_code=409, detail="Selected conflict citation is no longer available")
+            selected = [item for item in selected if item not in competing]
+            selected.append(int(selected_citation))
         payload_hash = hashlib.sha256(json.dumps({"selected": selected, "supplemental_text": body.supplemental_text}, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
         if checkpoint.status == "confirmed":
             if checkpoint.decision_hash == payload_hash and checkpoint.idempotency_key == body.idempotency_key:
@@ -1370,6 +1419,54 @@ def list_citations(
             )
         )
     return out
+
+
+@router.get("/{task_id}/knowledge-decisions", response_model=List[KnowledgeDecisionOut])
+def list_knowledge_decisions(task_id: int, session: Session = Depends(get_session)):
+    if session.get(GenerationTask, task_id) is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return list(session.exec(select(TaskKnowledgeDecision).where(TaskKnowledgeDecision.task_id == task_id).order_by(TaskKnowledgeDecision.id)).all())
+
+
+@router.put("/{task_id}/knowledge-decisions/{conflict_key}", response_model=KnowledgeDecisionOut)
+def save_knowledge_decision(task_id: int, conflict_key: str, body: KnowledgeDecisionIn, session: Session = Depends(get_session)):
+    task = session.get(GenerationTask, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if body.conflict_key != conflict_key:
+        raise HTTPException(status_code=422, detail="conflict_key does not match path")
+    checkpoint = session.exec(select(TaskRetrievalCheckpoint).where(TaskRetrievalCheckpoint.task_id == task_id).order_by(col(TaskRetrievalCheckpoint.attempt).desc())).first()
+    if checkpoint is None or checkpoint.status != "pending":
+        raise HTTPException(status_code=409, detail="No pending retrieval checkpoint")
+    if checkpoint.id != body.checkpoint_id or checkpoint.version != body.checkpoint_version:
+        raise HTTPException(status_code=409, detail="Stale retrieval checkpoint")
+    try:
+        conflicts = json.loads(checkpoint.retrieval_json or "{}").get("conflict_groups") or []
+    except (AttributeError, json.JSONDecodeError):
+        conflicts = []
+    conflict = next((item for item in conflicts if item.get("conflict_key") == conflict_key), None)
+    candidate = next((item for item in (conflict or {}).get("candidates", []) if item.get("id") == body.selected_page_id), None)
+    page = session.get(WikiPageRow, body.selected_page_id)
+    if conflict is None or candidate is None or page is None or page.revision != candidate.get("revision"):
+        raise HTTPException(status_code=422, detail="Page is not a current candidate for this checkpoint conflict")
+    row = session.exec(select(TaskKnowledgeDecision).where(TaskKnowledgeDecision.checkpoint_id == checkpoint.id, TaskKnowledgeDecision.conflict_key == conflict_key)).first()
+    if row is None:
+        row = TaskKnowledgeDecision(task_id=task_id, checkpoint_id=checkpoint.id, checkpoint_version=checkpoint.version, conflict_key=conflict_key, selected_page_id=page.id, selected_revision=page.revision)
+    row.selected_page_id = int(page.id)
+    row.selected_revision = page.revision
+    row.decision_scope = body.decision_scope
+    row.decided_by = body.decided_by
+    row.reason = body.reason
+    session.add(row)
+    if body.decision_scope == "project" and task.project_id is not None:
+        project_row = session.exec(select(ProjectKnowledgeDecision).where(ProjectKnowledgeDecision.project_id == task.project_id, ProjectKnowledgeDecision.conflict_key == conflict_key)).first()
+        if project_row is None:
+            project_row = ProjectKnowledgeDecision(project_id=task.project_id, conflict_key=conflict_key, selected_page_id=page.id, selected_revision=page.revision)
+        project_row.selected_page_id, project_row.selected_revision = int(page.id), page.revision
+        project_row.decided_by, project_row.reason = body.decided_by, body.reason
+        session.add(project_row)
+    session.commit(); session.refresh(row)
+    return row
 
 
 @router.get("/{task_id}/events", response_model=List[TaskEventOut])

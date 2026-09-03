@@ -154,6 +154,8 @@ class WikiFrontmatter(BaseModel):
     title: str = Field(min_length=1)
     type: WikiPageType
     domain: str | None = None
+    canonical_topic: str | None = None
+    assertion_summary: str | None = None
     aliases: list[str] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
     sources: list[WikiSource] = Field(default_factory=list)
@@ -166,7 +168,7 @@ class WikiFrontmatter(BaseModel):
     def _validate_key(cls, value: str) -> str:
         return validate_page_key(value)
 
-    @field_validator("domain", "status")
+    @field_validator("domain", "status", "canonical_topic", "assertion_summary")
     @classmethod
     def _validate_optional_text(cls, value: str | None) -> str | None:
         if value is None:

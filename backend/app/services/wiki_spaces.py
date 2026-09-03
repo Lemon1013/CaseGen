@@ -14,6 +14,7 @@ from sqlmodel import Session, select
 from app import config
 from app.models.entities import (
     Document,
+    Project,
     WikiPageRow,
     WikiReviewItem,
     WikiSpace,
@@ -64,14 +65,23 @@ def get_default_space(session: Session, *, create: bool = True) -> WikiSpace | N
     ).first()
     if row is not None or not create:
         return row
+    project = session.exec(select(Project).where(Project.slug == DEFAULT_SPACE_SLUG)).first()
+    if project is None:
+        project = Project(name=DEFAULT_SPACE_NAME, slug=DEFAULT_SPACE_SLUG, description="兼容旧数据的默认项目")
+        session.add(project)
+        session.flush()
     row = WikiSpace(
         name=DEFAULT_SPACE_NAME,
         slug=DEFAULT_SPACE_SLUG,
         description="由系统迁移和兼容旧 Wiki 数据使用的默认空间",
         status=ACTIVE_SPACE_STATUS,
+        scope="project",
+        project_id=project.id,
     )
     session.add(row)
     session.flush()
+    project.default_wiki_space_id = row.id
+    session.add(project)
     return row
 
 
@@ -201,6 +211,9 @@ def space_to_dict(session: Session, space: WikiSpace) -> dict[str, Any]:
         "slug": space.slug,
         "description": space.description or "",
         "status": space.status,
+        "scope": space.scope,
+        "project_id": space.project_id,
+        "namespace": space.namespace,
         "created_at": space.created_at,
         "updated_at": space.updated_at,
         **space_statistics(session, space),

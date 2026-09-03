@@ -17,6 +17,8 @@ from app.api.requirements import router as requirements_router
 from app.api.tasks import router as tasks_router
 from app.api.wiki import router as wiki_router
 from app.api.wiki_spaces import router as wiki_spaces_router
+from app.api.platform_data import router as platform_data_router
+from app.api.projects import router as projects_router
 from app import config
 from app.config import ensure_data_dirs
 from app.db import get_engine, init_db
@@ -24,6 +26,7 @@ from app.services.auth import get_user_for_token
 from app.services.prompts_seed import seed_default_prompts
 from app.services.wiki_jobs import recover_ingest_jobs
 from app.services.task_jobs import recover_generation_jobs
+from app.services.projects import is_project_scoped_path, validate_request_project_scope
 
 
 def _mount_frontend_dist(app: FastAPI) -> None:
@@ -99,13 +102,23 @@ def create_app() -> FastAPI:
         # OPTIONS is handled by the CORS middleware and carries no session
         # mutation.  Legacy tests can explicitly disable auth through their
         # fixture; production defaults remain protected.
-        if not config.AUTH_ENABLED or request.method == "OPTIONS":
+        if request.method == "OPTIONS":
             return await call_next(request)
 
         path = request.url.path
         if path.startswith("/api"):
             unsafe = request.method not in {"GET", "HEAD", "OPTIONS", "TRACE"}
-            if unsafe:
+            if config.AUTH_ENABLED and path not in public_paths:
+                with Session(get_engine()) as auth_session:
+                    user = get_user_for_token(
+                        auth_session,
+                        request.cookies.get(config.AUTH_COOKIE_NAME),
+                    )
+                if user is None:
+                    return JSONResponse({"detail": "Not authenticated"}, status_code=401)
+                request.state.user = user
+
+            if config.AUTH_ENABLED and unsafe:
                 origin = request.headers.get("origin")
                 referer = request.headers.get("referer")
                 if origin:
@@ -123,22 +136,35 @@ def create_app() -> FastAPI:
                         {"detail": "Origin or Referer header is required"}, status_code=403
                     )
 
-            if path not in public_paths:
-                with Session(get_engine()) as auth_session:
-                    user = get_user_for_token(
-                        auth_session,
-                        request.cookies.get(config.AUTH_COOKIE_NAME),
-                    )
-                if user is None:
-                    return JSONResponse({"detail": "Not authenticated"}, status_code=401)
-                request.state.user = user
+            project_raw = request.query_params.get("project_id")
+            if config.AUTH_ENABLED and is_project_scoped_path(path) and project_raw is None:
+                return JSONResponse({"detail": "project_id is required"}, status_code=422)
+            if project_raw is not None and not project_raw.isdigit():
+                return JSONResponse({"detail": "project_id must be a positive integer"}, status_code=422)
+            if project_raw and project_raw.isdigit() and is_project_scoped_path(path) and not path.startswith("/api/projects/"):
+                query_spaces = [
+                    int(value)
+                    for key in ("space_id", "wiki_space_id")
+                    for value in request.query_params.getlist(key)
+                    if value.isdigit()
+                ]
+                try:
+                    with Session(get_engine()) as scope_session:
+                        validate_request_project_scope(
+                            scope_session,
+                            int(project_raw),
+                            request.url.path,
+                            query_spaces,
+                        )
+                except ValueError:
+                    return JSONResponse({"detail": "Resource not found in project"}, status_code=404)
 
             # If a browser client sends a double-submit token, validate it.
             # Origin/Referer remains the mandatory CSRF boundary; optional
             # token validation also protects clients that opt into the header.
             csrf_header = request.headers.get("x-csrf-token")
             csrf_cookie = request.cookies.get(config.AUTH_CSRF_COOKIE_NAME)
-            if unsafe and csrf_header is not None and csrf_header != csrf_cookie:
+            if config.AUTH_ENABLED and unsafe and csrf_header is not None and csrf_header != csrf_cookie:
                 return JSONResponse({"detail": "CSRF validation failed"}, status_code=403)
 
         return await call_next(request)
@@ -156,6 +182,8 @@ def create_app() -> FastAPI:
     app.include_router(tasks_router)
     app.include_router(wiki_router)
     app.include_router(wiki_spaces_router)
+    app.include_router(platform_data_router)
+    app.include_router(projects_router)
 
     _mount_frontend_dist(app)
 

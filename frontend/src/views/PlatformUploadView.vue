@@ -1,0 +1,15 @@
+<script setup lang="ts">
+import { computed, onMounted, ref } from 'vue'
+import { ElMessage } from 'element-plus'
+import { listRenderRuns, type RenderRun } from '../api/platformData'
+import { useProjectStore } from '../projectStore'
+
+const projects=useProjectStore(),spaceId=computed(()=>projects.current.value?.default_wiki_space_id??undefined),runs=ref<RenderRun[]>([]),loading=ref(false)
+async function load(){if(!spaceId.value)return;loading.value=true;try{runs.value=await listRenderRuns(spaceId.value)}catch(e){ElMessage.error((e as Error).message)}finally{loading.value=false}}
+async function init(){try{await load()}catch(error){ElMessage.error(`加载生成历史失败：${(error as Error).message}`)}}
+function safeDownloadName(filename:string){const basename=filename.replace(/\\/g,'/').split('/').pop()||'artifact.txt';const cleaned=basename.replace(/[\u0000-\u001f\u007f]/g,'_').slice(0,240);return !cleaned||cleaned==='.'||cleaned==='..'?'artifact.txt':cleaned}
+function download(artifact:RenderRun['artifacts'][number]){const blob=new Blob([artifact.content],{type:artifact.media_type||'text/plain'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=safeDownloadName(artifact.filename);a.click();URL.revokeObjectURL(url)}
+onMounted(init)
+</script>
+<template><div class="page"><div class="page-header"><div><h1 class="page-title">上传至测试平台</h1><p class="page-subtitle">查看平台生成历史并下载生成产物。</p></div></div><el-alert title="当前版本仅提供平台产物下载；配置真实平台连接器和凭据后才能推送。这里不会产生模拟上传成功。" type="info" :closable="false" show-icon/><el-empty v-if="!spaceId" description="当前空间没有默认知识库"/><el-card v-else shadow="never" class="history"><el-table v-loading="loading" :data="runs" row-key="id"><el-table-column type="expand"><template #default="{row}"><div class="expanded"><el-alert v-for="w in row.warnings" :key="w" :title="w" type="warning" :closable="false"/><el-table :data="row.artifacts"><el-table-column prop="kind" label="Kind"/><el-table-column prop="filename" label="文件"/><el-table-column prop="media_type" label="媒体类型"/><el-table-column label="操作" width="100"><template #default="scope"><el-button link type="primary" @click="download(scope.row)">下载</el-button></template></el-table-column></el-table></div></template></el-table-column><el-table-column prop="id" label="Run" width="80"/><el-table-column prop="platform_name" label="平台"/><el-table-column prop="variant_name" label="示例类型"/><el-table-column prop="status" label="状态" width="110"><template #default="{row}"><el-tag :type="row.status==='completed'?'success':row.status==='failed'?'danger':'warning'">{{row.status}}</el-tag></template></el-table-column><el-table-column label="产物" width="90"><template #default="{row}">{{row.artifacts.length}}</template></el-table-column><el-table-column prop="created_at" label="生成时间" width="190"/><el-table-column prop="error_message" label="错误" show-overflow-tooltip/></el-table><el-empty v-if="!loading&&!runs.length" description="当前空间暂无生成历史"/></el-card></div></template>
+<style scoped>.history{margin-top:18px}.expanded{padding:10px 24px}.expanded .el-alert{margin-bottom:10px}</style>

@@ -40,6 +40,7 @@ from app.schemas.wiki import (
     WikiCandidateOut,
     WikiDiffOut,
     WikiReviewDecisionIn,
+    WikiUpdateProposalIn,
     WikiReviewBatchIn,
     WikiReviewBatchOut,
     WikiReviewBatchSkipOut,
@@ -96,6 +97,12 @@ def _require_admin(request: Request) -> None:
     user = getattr(request.state, "user", None)
     if user is None or not bool(getattr(user, "is_active", False)) or getattr(user, "role", "") != "admin":
         raise HTTPException(status_code=403, detail="Administrator access required")
+
+
+def _require_shared_admin(request: Request, session: Session, space_id: int) -> None:
+    space = session.get(WikiSpace, space_id)
+    if space is not None and space.scope == "shared" and config.AUTH_ENABLED:
+        _require_admin(request)
 
 
 def _lexical_path(value: Path) -> Path:
@@ -781,6 +788,8 @@ def _to_page_out(
         source_document_id=row.source_document_id,
         page_key=row.page_key,
         domain=row.domain,
+        canonical_topic=row.canonical_topic,
+        assertion_summary=row.assertion_summary,
         status=row.status,
         revision=row.revision,
         aliases=_aliases_from_row(row),
@@ -1013,7 +1022,7 @@ def _candidate_page(
         values["page_key"] = meta["page_key"]
     else:
         values["page_key"] = page_key
-    for field in ("title", "domain", "status"):
+    for field in ("title", "domain", "status", "canonical_topic", "assertion_summary"):
         if field in meta and meta[field] is not None:
             values[field] = meta[field]
     for field in ("aliases", "tags"):
@@ -1258,13 +1267,16 @@ def get_ingest_job(
 @router.post("/api/ingest-jobs/{job_id}/cancel", response_model=IngestJobOut)
 def cancel_ingest(
     job_id: int,
+    request: Request,
     space_id: Optional[int] = Query(default=None),
     session: Session = Depends(get_session),
 ) -> IngestJobOut:
     existing = session.get(IngestJob, job_id)
     if existing is None:
         raise HTTPException(status_code=404, detail="Ingest job not found")
-    _job_scope(session, existing, resolve_space_id(session, space_id))
+    sid = resolve_space_id(session, space_id)
+    _job_scope(session, existing, sid)
+    _require_shared_admin(request, session, sid)
     job = cancel_ingest_job(session, job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Ingest job not found")
@@ -1274,13 +1286,16 @@ def cancel_ingest(
 @router.post("/api/ingest-jobs/{job_id}/retry-failed-windows", response_model=IngestJobOut)
 def retry_ingest_failed_windows(
     job_id: int,
+    request: Request,
     space_id: Optional[int] = Query(default=None),
     session: Session = Depends(get_session),
 ) -> IngestJobOut:
     existing = session.get(IngestJob, job_id)
     if existing is None:
         raise HTTPException(status_code=404, detail="Ingest job not found")
-    _job_scope(session, existing, resolve_space_id(session, space_id))
+    sid = resolve_space_id(session, space_id)
+    _job_scope(session, existing, sid)
+    _require_shared_admin(request, session, sid)
     try:
         job = retry_failed_windows(session, job_id)
     except ValueError as exc:
@@ -1359,6 +1374,7 @@ def get_wiki_review(
 @router.post("/api/wiki/reviews/{review_id}/approve", response_model=WikiReviewDetailOut)
 def approve_wiki_review(
     review_id: int,
+    request: Request,
     body: WikiReviewDecisionIn | None = None,
     space_id: Optional[int] = Query(default=None),
     session: Session = Depends(get_session),
@@ -1367,12 +1383,14 @@ def approve_wiki_review(
     if item is None:
         raise HTTPException(status_code=404, detail="Wiki review item not found")
     sid = resolve_space_id(session, space_id)
+    _require_shared_admin(request, session, sid)
     return _approve_review_item(session, item, sid, body)
 
 
 @router.post("/api/wiki/reviews/{review_id}/reject", response_model=WikiReviewDetailOut)
 def reject_wiki_review(
     review_id: int,
+    request: Request,
     body: WikiReviewDecisionIn | None = None,
     space_id: Optional[int] = Query(default=None),
     session: Session = Depends(get_session),
@@ -1381,6 +1399,7 @@ def reject_wiki_review(
     if item is None:
         raise HTTPException(status_code=404, detail="Wiki review item not found")
     sid = resolve_space_id(session, space_id)
+    _require_shared_admin(request, session, sid)
     _review_scope(session, item, sid)
     with page_key_lock(f"review.item.{review_id}", sid):
         session.refresh(item)
@@ -1407,6 +1426,7 @@ def reject_wiki_review(
 @router.post("/api/wiki/reviews/{review_id}/acknowledge", response_model=WikiReviewDetailOut)
 def acknowledge_wiki_review(
     review_id: int,
+    request: Request,
     body: WikiReviewDecisionIn | None = None,
     space_id: Optional[int] = Query(default=None),
     session: Session = Depends(get_session),
@@ -1417,13 +1437,16 @@ def acknowledge_wiki_review(
     if item is None:
         raise HTTPException(status_code=404, detail="Wiki review item not found")
     sid = resolve_space_id(session, space_id)
+    _require_shared_admin(request, session, sid)
     return _acknowledge_review_item(session, item, sid, body)
 
 
 @router.post("/api/wiki/reviews/batch-approve", response_model=WikiReviewBatchOut)
 def batch_approve_wiki_reviews(
     body: WikiReviewBatchIn,
+    request: Request,
     space_id: Optional[int] = Query(default=None),
+    project_id: Optional[int] = Query(default=None, ge=1),
     session: Session = Depends(get_session),
 ) -> WikiReviewBatchOut:
     """Approve safe page candidates and acknowledge non-writable reminders.
@@ -1433,6 +1456,7 @@ def batch_approve_wiki_reviews(
     """
 
     sid = resolve_space_id(session, space_id)
+    _require_shared_admin(request, session, sid)
     decision = WikiReviewDecisionIn(
         reviewed_by=body.reviewed_by,
         decision_reason=body.decision_reason or "批量审核通过",
@@ -1447,6 +1471,18 @@ def batch_approve_wiki_reviews(
                 WikiReviewBatchSkipOut(review_id=review_id, reason="审核项不存在")
             )
             continue
+        if project_id is not None:
+            from app.services.projects import validate_project_space
+            item_space_id = item.space_id
+            if item_space_id is None and item.page_id is not None:
+                page = session.get(WikiPageRow, item.page_id)
+                item_space_id = page.space_id if page is not None else None
+            try:
+                if item_space_id is None:
+                    raise ValueError("Review item has no Wiki space")
+                validate_project_space(session, project_id, int(item_space_id))
+            except ValueError as exc:
+                raise HTTPException(status_code=404, detail="Wiki review item not found in project") from exc
         try:
             _review_scope(session, item, sid)
             if item.status != "pending":
@@ -1570,6 +1606,7 @@ def get_wiki_diff(
 def rollback_wiki_page(
     page_id: int,
     body: WikiRollbackIn,
+    request: Request,
     space_id: Optional[int] = Query(default=None),
     session: Session = Depends(get_session),
 ) -> WikiRollbackOut:
@@ -1578,6 +1615,7 @@ def rollback_wiki_page(
         raise HTTPException(status_code=404, detail="Wiki page not found")
     sid = resolve_space_id(session, space_id)
     _page_scope(session, row, sid)
+    _require_shared_admin(request, session, sid)
     target_number = body.revision
     target = session.get(WikiPageRevision, body.revision_id) if body.revision_id else None
     if (target is None or target.page_id != page_id) and body.revision_id is not None:
@@ -1661,9 +1699,25 @@ def get_wiki_index(
     return WikiIndexOut(content=content, path=f"wiki/spaces/{space.slug}/index.md")
 
 
+@router.post("/api/wiki/pages/{page_id}/propose-update", response_model=WikiReviewDetailOut)
+def propose_wiki_update(page_id: int, body: WikiUpdateProposalIn, space_id: Optional[int] = Query(default=None), session: Session = Depends(get_session)):
+    row = session.get(WikiPageRow, page_id)
+    if row is None or not row.page_key:
+        raise HTTPException(status_code=404, detail="Wiki page not found")
+    sid = resolve_space_id(session, space_id)
+    _page_scope(session, row, sid)
+    record = WikiRepository(session, space_id=sid).read(row.page_key)
+    frontmatter = record.frontmatter.model_dump(mode="json")
+    frontmatter["assertion_summary"] = body.assertion_summary.strip()
+    item = WikiReviewItem(page_id=row.id, space_id=sid, kind="conflict", reason=body.reason.strip(), candidate_frontmatter_json=json.dumps(frontmatter, ensure_ascii=False), candidate_content_md=record.page.body, payload_json=json.dumps({"operation": "update", "page_key": row.page_key}, ensure_ascii=False))
+    session.add(item); session.commit(); session.refresh(item)
+    return _review_detail(session, item)
+
+
 @router.post("/api/wiki/retrieve", response_model=RetrieveResponse)
 def retrieve_wiki(
     body: RetrieveRequest,
+    request: Request,
     session: Session = Depends(get_session),
 ) -> RetrieveResponse:
     """Hybrid retrieve: Wiki + source chunks + clause anchors."""
@@ -1671,20 +1725,23 @@ def retrieve_wiki(
     wiki_k = min(RETRIEVE_WIKI_TOP_K, max(1, top_k // 2 + top_k % 2))
     source_k = min(RETRIEVE_SOURCE_TOP_K, max(1, top_k - wiki_k))
 
-    from app.services.hybrid_retrieve import hybrid_retrieve
+    from app.services.hybrid_retrieve import hybrid_retrieve, project_hybrid_retrieve
 
-    result = hybrid_retrieve(
-        session,
-        body.query,
-        top_k=top_k,
-        wiki_k=wiki_k,
-        source_k=source_k,
-        types=body.types,
-        space_id=resolve_space_id(session, body.space_id),
-    )
+    if body.project_id is None:
+        result = hybrid_retrieve(session, body.query, top_k=top_k, wiki_k=wiki_k, source_k=source_k, types=body.types, space_id=resolve_space_id(session, body.space_id))
+    else:
+        from app.services.projects import require_request_project
+        require_request_project(request, body.project_id)
+        try:
+            result = project_hybrid_retrieve(session, body.query, project_id=body.project_id, private_space_id=body.space_id, shared_space_ids=body.shared_space_ids, top_k=top_k, wiki_k=wiki_k, source_k=source_k, types=body.types)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     hits: list[RetrieveHit] = []
     for h in result["hits"]:
+        space = session.get(WikiSpace, h.get("space_id")) if h.get("space_id") else None
+        h.setdefault("space_name", space.name if space else "")
+        h.setdefault("space_scope", space.scope if space else "project")
         hits.append(
             RetrieveHit(
                 id=h.get("id"),
@@ -1712,6 +1769,10 @@ def retrieve_wiki(
                   aliases=list(h.get("aliases") or []),
                   source_document_ids=list(h.get("source_document_ids") or []),
                   space_id=h.get("space_id"),
+                  space_name=h.get("space_name") or "",
+                  space_scope=h.get("space_scope") or "project",
+                  canonical_topic=h.get("canonical_topic"),
+                  assertion_summary=h.get("assertion_summary"),
             )
         )
     return RetrieveResponse(
@@ -1725,4 +1786,5 @@ def retrieve_wiki(
           ],
           retrieval_mode=result.get("retrieval_mode"),
           explain=result.get("explain"),
+          conflict_groups=result.get("conflict_groups") or [],
       )

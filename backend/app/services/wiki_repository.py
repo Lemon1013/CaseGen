@@ -616,6 +616,13 @@ class WikiRepository:
             key = validate_page_key(page_key)
         else:
             raise ValueError("page_key is required when no candidate page is provided")
+        if self.space.scope == "shared":
+            prefix = f"{self.space.namespace}."
+            if operation == "create" and self.space.namespace and not key.startswith(prefix):
+                key = validate_page_key(prefix + key)
+                candidate = candidate.model_copy(update={"frontmatter": candidate.frontmatter.model_copy(update={"page_key": key})}) if candidate is not None else None
+            if not self.space.namespace or not key.startswith(prefix):
+                raise ValueError(f"Shared Wiki page_key must start with {prefix}")
 
         if candidate is not None:
             self._validate_space_links(candidate, job_id)
@@ -708,6 +715,8 @@ class WikiRepository:
                             revision=target_revision,
                             aliases_json=_json(prepared.frontmatter.aliases),
                             content_hash=content_hash(formal_content),
+                            canonical_topic=prepared.frontmatter.canonical_topic,
+                            assertion_summary=prepared.frontmatter.assertion_summary,
                         )
                         self.session.add(row)
                         self.session.flush()
@@ -730,6 +739,8 @@ class WikiRepository:
                         row.revision = target_revision
                         row.aliases_json = _json(prepared.frontmatter.aliases)
                         row.content_hash = content_hash(formal_content)
+                        row.canonical_topic = prepared.frontmatter.canonical_topic
+                        row.assertion_summary = prepared.frontmatter.assertion_summary
                         row.updated_at = _utcnow()
                         self.session.add(row)
                         self.session.flush()

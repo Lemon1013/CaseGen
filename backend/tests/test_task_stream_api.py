@@ -2,13 +2,13 @@ import json
 
 from fastapi.testclient import TestClient
 import pytest
-from sqlmodel import Session
+from sqlmodel import Session, select
 
 import app.api.tasks as tasks_api
 from app import config
 from app.db import get_engine
 from app.main import create_app
-from app.models.entities import GenerationTask
+from app.models.entities import GenerationTask, Project
 from app.services.task_stream import TaskStreamBroker, TaskStreamEvent, TaskStreamPoll
 
 
@@ -262,6 +262,9 @@ def test_task_stream_requires_auth_and_allows_authenticated_cookie(
         },
     )
     assert setup.status_code == 200
+    with Session(get_engine()) as session:
+        project = session.exec(select(Project)).first()
+        client.params = {"project_id": int(project.id)}
     created = client.post(
         "/api/tasks",
         headers={"Origin": "http://testserver"},

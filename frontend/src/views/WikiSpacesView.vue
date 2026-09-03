@@ -11,12 +11,15 @@ import {
   type WikiSpaceStatus,
 } from '../api/wikiSpaces'
 import { previewArchivedWikiPurge, purgeArchivedWiki, type WikiPurgePreview } from '../api/wiki'
+import { bindSharedWiki, unbindSharedWiki } from '../api/projects'
+import { useProjectStore } from '../projectStore'
 
 const spaces = ref<WikiSpace[]>([])
 const loading = ref(false)
 const dialogVisible = ref(false)
 const editing = ref<WikiSpace | null>(null)
-const form = reactive({ name: '', slug: '', description: '' })
+const form = reactive({ name: '', slug: '', description: '', scope: 'project' as 'project' | 'shared', namespace: '' })
+const projects = useProjectStore()
 const statusFilter = ref<'all' | WikiSpaceStatus>('all')
 const statusChangingId = ref<number | null>(null)
 const auth = useAuthStore()
@@ -36,7 +39,7 @@ const visibleSpaces = computed(() =>
 async function load() {
   loading.value = true
   try {
-    spaces.value = await listWikiSpaces()
+    spaces.value = await listWikiSpaces(true)
   } catch (error) {
     ElMessage.error(`加载 Wiki 空间失败：${(error as Error).message}`)
   } finally {
@@ -82,7 +85,7 @@ async function executePurge() {
 
 function openCreate() {
   editing.value = null
-  Object.assign(form, { name: '', slug: '', description: '' })
+  Object.assign(form, { name: '', slug: '', description: '', scope: 'project', namespace: '' })
   dialogVisible.value = true
 }
 
@@ -109,6 +112,9 @@ async function save() {
         name: form.name.trim(),
         slug: form.slug.trim() || undefined,
         description: form.description.trim(),
+        scope: form.scope,
+        project_id: form.scope === 'project' ? projects.state.currentId || undefined : undefined,
+        namespace: form.scope === 'shared' ? form.namespace.trim() : undefined,
       })
       ElMessage.success('空间已创建')
     }
@@ -116,6 +122,23 @@ async function save() {
     await load()
   } catch (error) {
     ElMessage.error(`保存空间失败：${(error as Error).message}`)
+  }
+}
+
+function isBound(space: WikiSpace) {
+  return projects.current.value?.shared_spaces.some((item) => item.id === space.id) || false
+}
+
+async function toggleBinding(space: WikiSpace) {
+  const projectId = projects.state.currentId
+  if (!projectId) return
+  try {
+    if (isBound(space)) await unbindSharedWiki(projectId, space.id)
+    else await bindSharedWiki(projectId, space.id)
+    await projects.load({ project_id: String(projectId) })
+    ElMessage.success(isBound(space) ? '公共库已启用' : '公共库已停用')
+  } catch (error) {
+    ElMessage.error(`更新项目公共库失败：${(error as Error).message}`)
   }
 }
 
@@ -175,6 +198,8 @@ onMounted(load)
           <template #default="{ row }">
             <div class="space-name">{{ row.name }}</div>
             <div class="space-slug">/{{ row.slug }}</div>
+            <el-tag size="small" :type="row.scope === 'shared' ? 'warning' : 'info'">{{ row.scope === 'shared' ? '公共库' : '项目库' }}</el-tag>
+            <span v-if="row.namespace" class="space-slug">{{ row.namespace }}.*</span>
           </template>
         </el-table-column>
         <el-table-column prop="description" label="说明" min-width="260" show-overflow-tooltip />
@@ -198,6 +223,7 @@ onMounted(load)
         <el-table-column label="操作" width="220" fixed="right">
           <template #default="{ row }">
             <el-button v-if="row.status === 'active'" link type="primary" @click="openEdit(row)">编辑</el-button>
+            <el-button v-if="row.scope === 'shared' && projects.state.currentId" link :type="isBound(row) ? 'warning' : 'success'" @click="toggleBinding(row)">{{ isBound(row) ? '停用' : '项目启用' }}</el-button>
             <el-button
               v-if="row.status === 'active' && row.slug !== 'default'"
               link
@@ -228,6 +254,12 @@ onMounted(load)
         </el-form-item>
         <el-form-item v-if="!editing" label="Slug">
           <el-input v-model="form.slug" maxlength="64" placeholder="留空则根据名称生成" />
+        </el-form-item>
+        <el-form-item v-if="!editing" label="类型">
+          <el-radio-group v-model="form.scope"><el-radio value="project">项目私库</el-radio><el-radio value="shared">公共库</el-radio></el-radio-group>
+        </el-form-item>
+        <el-form-item v-if="!editing && form.scope === 'shared'" label="命名空间" required>
+          <el-input v-model="form.namespace" placeholder="例如 security；页面 key 必须以 security. 开头" />
         </el-form-item>
         <el-form-item label="说明">
           <el-input v-model="form.description" type="textarea" :rows="4" maxlength="2000" />

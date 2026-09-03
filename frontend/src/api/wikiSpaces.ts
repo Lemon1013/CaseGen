@@ -6,6 +6,9 @@ export interface WikiSpace {
   slug: string
   description: string
   status: 'active' | 'archived' | string
+  scope: 'shared' | 'project'
+  project_id: number | null
+  namespace: string | null
   document_count: number
   page_count: number
   pending_review_count: number
@@ -18,12 +21,15 @@ export interface WikiSpaceInput {
   name: string
   slug?: string
   description?: string
+  scope?: 'shared' | 'project'
+  project_id?: number
+  namespace?: string
 }
 
 export type WikiSpaceStatus = 'active' | 'archived'
 
-export function listWikiSpaces() {
-  return api<WikiSpace[]>('/api/wiki-spaces')
+export function listWikiSpaces(includeAvailableShared = false) {
+  return api<WikiSpace[]>(`/api/wiki-spaces${includeAvailableShared ? '?include_available_shared=true' : ''}`)
 }
 
 export function getWikiSpace(id: number) {

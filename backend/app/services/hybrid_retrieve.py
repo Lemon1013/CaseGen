@@ -352,3 +352,58 @@ def hybrid_retrieve(
             "one_hop_expansion": True,
         },
     }
+
+
+def project_hybrid_retrieve(
+    session: Session,
+    query: str,
+    *,
+    project_id: int,
+    private_space_id: int | None = None,
+    shared_space_ids: list[int] | None = None,
+    top_k: int | None = None,
+    wiki_k: int | None = None,
+    source_k: int | None = None,
+    types: list[str] | None = None,
+) -> dict[str, Any]:
+    from app.models.entities import WikiSpace
+    from app.services.projects import project_space_ids, validate_project_space
+
+    allowed = project_space_ids(session, project_id)
+    if private_space_id is not None:
+        private = validate_project_space(session, project_id, private_space_id)
+        if private.scope != "project":
+            raise ValueError("private_space_id must identify a project Wiki space")
+        private_ids = [private_space_id]
+    else:
+        private_ids = [sid for sid in allowed if session.get(WikiSpace, sid).scope == "project"]
+    shared_ids = shared_space_ids if shared_space_ids is not None else [sid for sid in allowed if session.get(WikiSpace, sid).scope == "shared"]
+    if any(sid not in allowed or session.get(WikiSpace, sid).scope != "shared" for sid in shared_ids):
+        raise ValueError("Shared Wiki space is not bound to this project")
+    parts = []
+    for sid in [*private_ids, *shared_ids]:
+        part = hybrid_retrieve(session, query, top_k=top_k, wiki_k=wiki_k, source_k=source_k, types=types, space_id=sid)
+        # Compatibility test retrievers and older adapters may omit space_id.
+        for hit in [*(part.get("wiki_hits") or []), *(part.get("source_hits") or []), *(part.get("hits") or [])]:
+            hit.setdefault("space_id", sid)
+        parts.append(part)
+    wiki_hits = [hit for part in parts for hit in part["wiki_hits"]]
+    source_hits = [hit for part in parts for hit in part["source_hits"]]
+    for hit in [*wiki_hits, *source_hits]:
+        space = session.get(WikiSpace, hit.get("space_id"))
+        hit.update(space_name=space.name if space else "", space_scope=space.scope if space else "project")
+    limit = top_k if top_k is not None else config.RETRIEVE_TOP_K
+    hits = sorted(
+        [hit for part in parts for hit in (part.get("hits") or [*(part.get("wiki_hits") or []), *(part.get("source_hits") or [])])],
+        key=lambda hit: float(hit.get("score") or 0),
+        reverse=True,
+    )[:limit]
+    for hit in hits:
+        space = session.get(WikiSpace, hit.get("space_id"))
+        hit.update(space_name=space.name if space else "", space_scope=space.scope if space else "project")
+    topics: dict[str, list[dict[str, Any]]] = {}
+    for hit in wiki_hits:
+        if hit.get("canonical_topic") and hit.get("assertion_summary"):
+            topics.setdefault(str(hit["canonical_topic"]), []).append(hit)
+    conflicts = [{"conflict_key": topic, "canonical_topic": topic, "candidates": candidates} for topic, candidates in topics.items() if len({str(item["assertion_summary"]).strip() for item in candidates}) > 1]
+    return {"query": query, "wiki_hits": wiki_hits, "source_hits": source_hits, "hits": hits, "wiki_hit_count": len(wiki_hits), "source_hit_count": len(source_hits), "clause_ids": list(dict.fromkeys(c for part in parts for c in part.get("clause_ids", []))), "anchored_clause_ids": list(dict.fromkeys(c for part in parts for c in part.get("anchored_clause_ids", []))), "retrieval_mode": "project_multi_space", "explain": {"space_ids": [*private_ids, *shared_ids]}, "conflict_groups": conflicts}

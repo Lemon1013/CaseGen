@@ -36,6 +36,8 @@ class WikiPageOut(BaseModel):
     source_document_id: Optional[int] = None
     page_key: Optional[str] = None
     domain: Optional[str] = None
+    canonical_topic: Optional[str] = None
+    assertion_summary: Optional[str] = None
     status: str = "published"
     revision: int = 1
     aliases: List[str] = Field(default_factory=list)
@@ -53,6 +55,8 @@ class WikiIndexOut(BaseModel):
 class RetrieveRequest(BaseModel):
     query: str
     space_id: Optional[int] = Field(default=None, ge=1)
+    project_id: Optional[int] = Field(default=None, ge=1)
+    shared_space_ids: Optional[List[int]] = None
     top_k: Optional[int] = None
     types: Optional[List[str]] = None
 
@@ -82,6 +86,16 @@ class RetrieveHit(BaseModel):
     aliases: List[str] = Field(default_factory=list)
     source_document_ids: List[int] = Field(default_factory=list)
     space_id: Optional[int] = None
+    space_name: str = ""
+    space_scope: str = "project"
+    canonical_topic: Optional[str] = None
+    assertion_summary: Optional[str] = None
+
+
+class KnowledgeConflict(BaseModel):
+    conflict_key: str
+    canonical_topic: str
+    candidates: List[RetrieveHit]
 
 
 class RetrieveResponse(BaseModel):
@@ -93,6 +107,7 @@ class RetrieveResponse(BaseModel):
     anchored_clause_ids: List[str] = Field(default_factory=list)
     retrieval_mode: Optional[str] = None
     explain: Optional[dict] = None
+    conflict_groups: List[KnowledgeConflict] = Field(default_factory=list)
 
 
 class WikiSourceEvidenceOut(BaseModel):
@@ -179,6 +194,11 @@ class WikiReviewDecisionIn(BaseModel):
     reviewed_by: Optional[str] = None
     reason: Optional[str] = None
     decision_reason: Optional[str] = None
+
+
+class WikiUpdateProposalIn(BaseModel):
+    assertion_summary: str = Field(min_length=1, max_length=2000)
+    reason: str = Field(default="知识冲突修订", max_length=2000)
 
 
 class WikiReviewBatchIn(BaseModel):

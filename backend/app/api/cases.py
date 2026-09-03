@@ -77,6 +77,14 @@ def _get_case(session: Session, case_id: int) -> TestCase:
     return row
 
 
+def _check_project(session: Session, row: TestCase, project_id: int | None) -> None:
+    if project_id is None:
+        return
+    requirement = session.get(Requirement, row.requirement_id)
+    if requirement is None or requirement.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Test case not found in project")
+
+
 def _check_revision(row: TestCase, expected_revision: int | None, expected_updated_at: datetime | None) -> None:
     if expected_revision is not None and int(row.revision) != int(expected_revision):
         raise HTTPException(
@@ -173,6 +181,7 @@ def _export_response(content: str, filename: str = "casegen-cases.md") -> Respon
 
 @router.get("", response_model=List[TestCaseOut])
 def list_cases(
+    project_id: int | None = Query(default=None, ge=1),
     requirement_id: int | None = Query(default=None, ge=1),
     include_archived: bool = Query(default=False),
     keyword: str | None = Query(default=None, max_length=200),
@@ -183,6 +192,8 @@ def list_cases(
     statement = select(TestCase)
     if requirement_id is not None:
         statement = statement.where(TestCase.requirement_id == requirement_id)
+    if project_id is not None:
+        statement = statement.where(TestCase.requirement_id.in_(select(Requirement.id).where(Requirement.project_id == project_id)))
     if status not in {None, "", "active", "archived"}:
         raise HTTPException(status_code=422, detail="status must be active or archived")
     if status:
@@ -264,13 +275,20 @@ def export_case(case_id: int, request: Request, session: Session = Depends(get_s
 def create_case(
     body: TestCaseCreate,
     request: Request,
+    project_id: int | None = Query(default=None, ge=1),
     session: Session = Depends(get_session),
 ) -> TestCaseOut:
     content = body.content_md if body.content_md is not None else body.content
     if not content or not content.strip():
         raise HTTPException(status_code=422, detail="content_md is required")
-    if session.get(Requirement, body.requirement_id) is None:
+    requirement = session.get(Requirement, body.requirement_id)
+    if requirement is None:
         raise HTTPException(status_code=404, detail="Requirement not found")
+    if requirement.project_id is not None:
+        from app.services.projects import require_request_project
+        require_request_project(request, requirement.project_id)
+    if project_id is not None and requirement.project_id != project_id:
+        raise HTTPException(status_code=422, detail="Requirement belongs to another project")
     try:
         case_key = normalize_case_key(body.case_key)
     except CaseDraftParseError as exc:
@@ -312,8 +330,9 @@ def create_case(
 
 
 @router.get("/{case_id}", response_model=TestCaseOut)
-def get_case(case_id: int, session: Session = Depends(get_session)) -> TestCaseOut:
-    return _case_out(session, _get_case(session, case_id))
+def get_case(case_id: int, project_id: int | None = Query(default=None, ge=1), session: Session = Depends(get_session)) -> TestCaseOut:
+    row = _get_case(session, case_id); _check_project(session, row, project_id)
+    return _case_out(session, row)
 
 
 @router.patch("/{case_id}", response_model=TestCaseOut)
@@ -321,9 +340,11 @@ def update_case(
     case_id: int,
     body: TestCaseUpdate,
     request: Request,
+    project_id: int | None = Query(default=None, ge=1),
     session: Session = Depends(get_session),
 ) -> TestCaseOut:
     row = _get_case(session, case_id)
+    _check_project(session, row, project_id)
     expected_revision = body.expected_revision if body.expected_revision is not None else body.revision
     _check_revision(row, expected_revision, body.expected_updated_at)
     content = body.content_md if body.content_md is not None else body.content

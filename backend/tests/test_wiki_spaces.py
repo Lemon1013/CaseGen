@@ -8,6 +8,7 @@ from app.main import create_app
 from app.models.entities import (
     Document,
     IngestJob,
+    Project,
     SourceChunk,
     WikiPageRow,
     WikiReviewItem,
@@ -83,6 +84,15 @@ def test_space_crud_document_and_task_selection(tmp_app_data):
     assert task.status_code == 200
     assert task.json()["wiki_space_id"] == project["id"]
     assert task.json()["wiki_space_name"] == "项目甲"
+
+    # There is no public atomic default-switch API yet. Simulate a completed
+    # switch so this legacy CRUD test can exercise archiving a non-default Wiki.
+    with Session(get_engine()) as session:
+        owner = session.get(Project, project["project_id"])
+        replacement = WikiSpace(name="项目甲默认库", slug="project-a-default", scope="project", project_id=owner.id)
+        session.add(replacement); session.flush()
+        owner.default_wiki_space_id = replacement.id
+        session.add(owner); session.commit()
 
     archived = client.post(f"/api/wiki-spaces/{project['id']}/archive")
     assert archived.status_code == 200

@@ -15,13 +15,15 @@ PROMPT_TYPES = (
     "requirement_optimize",
     "wiki_analyze",
     "wiki_write",
+    "platform_example_render",
+    "data_description_parse",
 )
 
 DEFAULT_PROMPTS_DIR = Path(__file__).resolve().parents[1] / "default_prompts"
 
 # Bump this only when the bundled prompt contract changes. Recognized v1 hashes
 # let existing installations upgrade without replacing a user-created prompt.
-BUNDLED_PROMPT_VERSION = 6
+BUNDLED_PROMPT_VERSION = 8
 _LEGACY_DEFAULT_HASHES: dict[str, frozenset[str]] = {
     "generate": frozenset(
         {
@@ -65,6 +67,13 @@ _LEGACY_DEFAULT_HASHES: dict[str, frozenset[str]] = {
             "b94d9bb0b10ebbb755e20161149ab5e258bfb9d7a77645358c488b135ea8c437",
         }
     ),
+    "platform_example_render": frozenset(
+        {
+            "d3dcd2304d18ddfb1e36b23b5d846727b790e5cad07db7c3f93627fefdc5e60b",
+            "6b60bc2f8ffe530b48ead870b71c83372d2fc66e215dd4979ebf467f7d0194c3",
+        }
+    ),
+    "data_description_parse": frozenset(),
 }
 
 

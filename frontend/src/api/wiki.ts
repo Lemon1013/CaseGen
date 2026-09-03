@@ -57,6 +57,8 @@ export interface WikiPage {
   page_type: string
   page_key?: string | null
   domain?: string | null
+  canonical_topic?: string | null
+  assertion_summary?: string | null
   status?: string | null
   revision?: number | null
   aliases?: string[]
@@ -99,7 +101,13 @@ export interface RetrieveHit {
   aliases?: string[]
   source_document_ids?: number[]
   space_id?: number | null
+  space_name?: string
+  space_scope?: 'shared' | 'project'
+  canonical_topic?: string | null
+  assertion_summary?: string | null
 }
+
+export interface KnowledgeConflict { conflict_key: string; canonical_topic: string; candidates: RetrieveHit[] }
 
 export interface RetrieveResponse {
   query: string
@@ -110,6 +118,7 @@ export interface RetrieveResponse {
   anchored_clause_ids?: string[]
   retrieval_mode?: string | null
   explain?: Record<string, unknown> | null
+  conflict_groups?: KnowledgeConflict[]
 }
 
 export type WikiReviewStatus = 'pending' | 'approved' | 'rejected' | 'acknowledged'
@@ -248,11 +257,15 @@ export function getWikiIndex(spaceId?: number) {
   return api<WikiIndex>(`/api/wiki/index${query}`)
 }
 
-export function retrieveWiki(query: string, top_k?: number, spaceId?: number) {
+export function retrieveWiki(query: string, top_k?: number, spaceId?: number, projectId?: number) {
   return api<RetrieveResponse>('/api/wiki/retrieve', {
     method: 'POST',
-    body: JSON.stringify({ query, top_k, space_id: spaceId }),
+    body: JSON.stringify({ query, top_k, space_id: spaceId, project_id: projectId }),
   })
+}
+
+export function proposeWikiUpdate(pageId: number, spaceId: number, assertionSummary: string) {
+  return api(`/api/wiki/pages/${pageId}/propose-update?space_id=${spaceId}`, { method: 'POST', body: JSON.stringify({ assertion_summary: assertionSummary, reason: '用户从知识冲突选择中提交修订' }) })
 }
 
 export interface WikiReviewQuery {
