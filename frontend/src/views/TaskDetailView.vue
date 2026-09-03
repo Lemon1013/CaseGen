@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { useProjectStore } from '../projectStore'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import MarkdownView from '../components/MarkdownView.vue'
 import TaskTimeline from '../components/TaskTimeline.vue'
@@ -108,6 +109,18 @@ const POST_GENERATION_CONFIRM_DELAY_MS = 400
 const POST_GENERATION_CONFIRM_ATTEMPTS = 10
 
 const taskId = computed(() => Number(route.params.id))
+
+// Project-scoped APIs require the current project id. Prefer the URL query,
+// then fall back to the active project store / last used project.
+const projects = useProjectStore()
+const projectId = computed(() => {
+  const fromQuery = Number(route.query.project_id)
+  if (Number.isInteger(fromQuery) && fromQuery > 0) return fromQuery
+  const fromStore = projects.state.currentId
+  if (fromStore) return fromStore
+  const stored = Number(localStorage.getItem('casegen:last-project-id'))
+  return Number.isInteger(stored) && stored > 0 ? stored : null
+})
 
 const isBusy = computed(() =>
   shouldPollTaskStatus(task.value?.status),
@@ -222,21 +235,21 @@ async function loadAll() {
   loading.value = true
   try {
     const [t, d, e, rev, revs, c, modelRows] = await Promise.all([
-      getTask(id),
-      listDrafts(id),
-      listEvents(id),
-      listReviews(id),
-      listRevisions(id),
-      listCitations(id),
+      getTask(id, projectId.value),
+      listDrafts(id, projectId.value),
+      listEvents(id, projectId.value),
+      listReviews(id, projectId.value),
+      listRevisions(id, projectId.value),
+      listCitations(id, projectId.value),
       listModels().catch(() => [] as ModelConfig[]),
     ])
     const retrievalFresh = t.status === 'awaiting_confirmation'
-      ? await getRetrievalCheckpoint(id)
+      ? await getRetrievalCheckpoint(id, projectId.value)
       : null
     const testPointFresh = t.status === 'awaiting_test_point_confirmation'
-      ? await getTestPointCheckpoint(id).catch(() => null)
+      ? await getTestPointCheckpoint(id, projectId.value).catch(() => null)
       : null
-    const coverageFresh = await getTaskCoverage(id).catch(() => null)
+    const coverageFresh = await getTaskCoverage(id, projectId.value).catch(() => null)
     if (!canApplyDataRequest(id, requestSequence)) return
     markDataRequestApplied(requestSequence)
     task.value = t
@@ -323,20 +336,20 @@ async function refreshLight(force = false): Promise<boolean> {
   refreshInFlightSequence = requestSequence
   try {
     const [t, d, e, rev, revs, c] = await Promise.all([
-      getTask(id),
-      listDrafts(id),
-      listEvents(id),
-      listReviews(id),
-      listRevisions(id),
-      listCitations(id),
+      getTask(id, projectId.value),
+      listDrafts(id, projectId.value),
+      listEvents(id, projectId.value),
+      listReviews(id, projectId.value),
+      listRevisions(id, projectId.value),
+      listCitations(id, projectId.value),
     ])
     const retrievalFresh = t.status === 'awaiting_confirmation'
-      ? await getRetrievalCheckpoint(id)
+      ? await getRetrievalCheckpoint(id, projectId.value)
       : null
     const testPointFresh = t.status === 'awaiting_test_point_confirmation'
-      ? await getTestPointCheckpoint(id).catch(() => null)
+      ? await getTestPointCheckpoint(id, projectId.value).catch(() => null)
       : null
-    const coverageFresh = await getTaskCoverage(id).catch(() => null)
+    const coverageFresh = await getTaskCoverage(id, projectId.value).catch(() => null)
     if (!canApplyDataRequest(id, requestSequence)) return false
     markDataRequestApplied(requestSequence)
     task.value = t

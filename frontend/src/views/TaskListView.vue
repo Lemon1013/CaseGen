@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, Refresh } from '@element-plus/icons-vue'
 import { formatDateTime as formatTime } from '../utils/datetime'
@@ -16,6 +16,7 @@ import {
 import { listModels, type ModelConfig } from '../api/models'
 
 const router = useRouter()
+const route = useRoute()
 const loading = ref(false)
 const deletingId = ref<number | null>(null)
 const retryingId = ref<number | null>(null)
@@ -69,7 +70,8 @@ async function retryWithModel(row: TaskItem) {
 }
 
 function openDetail(row: TaskItem) {
-  router.push(`/tasks/${row.id}`)
+  // Keep the current project context so project-scoped APIs resolve.
+  router.push({ path: `/tasks/${row.id}`, query: { ...route.query } })
 }
 
 async function handleDelete(row: TaskItem) {
