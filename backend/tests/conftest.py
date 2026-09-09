@@ -14,7 +14,18 @@ if str(BACKEND_ROOT) not in sys.path:
 # database before per-test fixtures run.  Point both application data and
 # Python's temp directory at an ignored workspace path before collection so a
 # test run can never migrate or seed the developer's real data/ directory.
-_PYTEST_SESSION_ROOT = BACKEND_ROOT / ".pytest_cache" / f"casegen-{os.getpid()}"
+def _resolve_session_root() -> Path:
+    cache_dir = BACKEND_ROOT / ".pytest_cache"
+    try:
+        probe = cache_dir / f"probe-{os.getpid()}"
+        probe.mkdir(parents=True, exist_ok=True)
+        probe.rmdir()
+        return cache_dir / f"casegen-{os.getpid()}"
+    except Exception:
+        return Path(tempfile.gettempdir()) / "casegen_pytest_cache" / f"casegen-{os.getpid()}"
+
+
+_PYTEST_SESSION_ROOT = _resolve_session_root()
 
 
 def pytest_sessionstart(session):

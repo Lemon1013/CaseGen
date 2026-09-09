@@ -81,6 +81,7 @@ from app.services.task_pipeline import (
     _fail_task,
 )
 from app.services.coverage import build_coverage
+from app.services.case_management import aggregate_draft_cases_by_points
 from app.services.requirement_optimizer import optimize_requirement
 from app.services.test_points import (
     TEST_DIMENSIONS,
@@ -1177,7 +1178,7 @@ def _review_task_locked(
         task = run_review(session, task_id, chat_fn=_chat_for("review"))
         return to_task_out(session, task)
 
-    if task.status not in ("generated", "failed"):
+    if task.status not in ("generated", "failed", "reviewed"):
         task = run_review(session, task_id, chat_fn=_chat_for("review"))
         return to_task_out(session, task)
 
@@ -1342,7 +1343,7 @@ def _finalize_task_locked(
 
 
 @router.get("/{task_id}/drafts", response_model=List[CaseDraftOut])
-def list_drafts(task_id: int, session: Session = Depends(get_session)) -> list[CaseDraft]:
+def list_drafts(task_id: int, session: Session = Depends(get_session)) -> list[CaseDraftOut]:
     task = session.get(GenerationTask, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
@@ -1351,7 +1352,21 @@ def list_drafts(task_id: int, session: Session = Depends(get_session)) -> list[C
         .where(CaseDraft.task_id == task_id)
         .order_by(col(CaseDraft.version).desc())
     ).all()
-    return list(rows)
+    results: list[CaseDraftOut] = []
+    for d in rows:
+        points_with_cases = aggregate_draft_cases_by_points(session, task_id, d)
+        results.append(
+            CaseDraftOut(
+                id=int(d.id),
+                task_id=int(d.task_id),
+                version=int(d.version),
+                content_md=str(d.content_md),
+                prompt_version_ref=d.prompt_version_ref,
+                created_at=d.created_at,
+                points_with_cases=points_with_cases,
+            )
+        )
+    return results
 
 
 @router.get("/{task_id}/citations", response_model=List[TaskCitationOut])
@@ -1395,6 +1410,8 @@ def list_citations(
                 int(page.space_id) if page is not None and page.space_id is not None else default_space_id
             )
             target_available = page is not None and page_space_id == task_space_id
+        elif citation_type == "external":
+            target_available = True
         legacy = not target_available
         out.append(
             TaskCitationOut(

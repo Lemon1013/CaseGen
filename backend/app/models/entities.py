@@ -4,6 +4,8 @@ from typing import Optional
 from sqlalchemy import Column, ForeignKey, Index, Integer, UniqueConstraint, text
 from sqlmodel import Field, SQLModel
 
+from app.models.external_wiki import ProjectExternalWiki
+
 
 def _utcnow() -> datetime:
     # Naive UTC so SQLite round-trips stay comparable without tzinfo.
@@ -18,6 +20,7 @@ class ModelConfig(SQLModel, table=True):
     base_url: str
     api_key: str
     model_name: str
+    protocol: str = Field(default="chat_completions")
     is_default: bool = False
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow, sa_column_kwargs={"onupdate": _utcnow})

@@ -99,12 +99,17 @@ def _migrate_sqlite_columns(engine) -> None:
 
 
 def _migrate_model_defaults(engine) -> None:
-    """Normalize legacy duplicate defaults and install the DB constraint."""
+    """Normalize legacy duplicate defaults, add protocol column, and install the DB constraint."""
     with engine.begin() as conn:
         columns = conn.execute(text('PRAGMA table_info("models")')).fetchall()
         names = {str(row[1]) for row in columns}
         if not columns or "is_default" not in names:
             return
+
+        if "protocol" not in names:
+            conn.execute(
+                text('ALTER TABLE "models" ADD COLUMN protocol VARCHAR DEFAULT \'chat_completions\'')
+            )
 
         defaults = conn.execute(
             text(
@@ -685,6 +690,30 @@ def _migrate_project_schema(engine, *, backfill: bool = False) -> None:
         conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_wiki_spaces_shared_namespace ON wiki_spaces(namespace) WHERE scope = 'shared'"))
 
 
+def _migrate_external_wiki_schema(engine) -> None:
+    """Create project_external_wikis table and index if not present."""
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS project_external_wikis (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL UNIQUE,
+                name VARCHAR NOT NULL DEFAULT '外部LLM知识库',
+                base_url VARCHAR NOT NULL DEFAULT 'http://127.0.0.1:8091',
+                external_project_id VARCHAR NOT NULL DEFAULT '',
+                external_project_name VARCHAR NOT NULL DEFAULT '',
+                top_k INTEGER NOT NULL DEFAULT 6,
+                timeout_sec FLOAT NOT NULL DEFAULT 3.0,
+                weight FLOAT NOT NULL DEFAULT 1.0,
+                use_synonyms BOOLEAN NOT NULL DEFAULT 1,
+                enabled BOOLEAN NOT NULL DEFAULT 1,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(project_id) REFERENCES projects(id)
+            )
+        """))
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_project_external_wikis_project_id ON project_external_wikis(project_id)"))
+
+
 def init_db() -> None:
     from app.models import entities  # noqa: F401
     from app.services.wiki_migrate import backup_before_wiki_migration, migrate_wiki_schema
@@ -705,6 +734,7 @@ def init_db() -> None:
     _migrate_model_defaults(engine)
     _migrate_case_management_schema(engine)
     _migrate_test_design_schema(engine)
+    _migrate_external_wiki_schema(engine)
 
 
 def get_session():

@@ -31,3 +31,9 @@ def test_disallow_skip_draft_to_finalized():
 def test_disallow_complete_generation_bypass_from_retrieval_gate():
     assert can_transition("retrieving", "generating") is False
     assert can_transition("awaiting_confirmation", "generating") is False
+
+
+def test_allow_re_review_from_reviewed():
+    assert can_transition("reviewed", "reviewing") is True
+    assert transition("reviewed", "reviewing") == "reviewing"
+

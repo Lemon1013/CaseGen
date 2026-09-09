@@ -28,6 +28,7 @@ from app.models.entities import (
     TestPointCaseLink,
     TaskTestPointCheckpoint,
 )
+from app.services.test_points import current_points, point_citation_ids
 
 
 def utcnow() -> datetime:
@@ -387,3 +388,189 @@ def stable_cases(cases: Iterable[TestCase]) -> list[TestCase]:
             int(row.id or 0),
         ),
     )
+
+
+def parse_case_detail(section: dict[str, Any]) -> dict[str, Any]:
+    """Extract structured details from a single case markdown section."""
+    raw_md = section.get("content_md", "")
+    case_key = section.get("case_key", "")
+    title = section.get("title", case_key)
+    priority = section.get("priority", "P1")
+
+    # 1. 提取类型 (type)
+    type_match = re.search(
+        r"(?im)^\s*(?:[-*]\s*)?(?:类型|用例类型|type)\s*[:：|]\s*(.+)$",
+        raw_md,
+    )
+    case_type = type_match.group(1).strip() if type_match else ""
+
+    # 2. 提取验证目标 (verification_goal)
+    goal_match = re.search(
+        r"(?im)^\s*(?:[-*]\s*)?(?:验证目标|测试目标|目标|goal)\s*[:：|]\s*(.+)$",
+        raw_md,
+    )
+    verification_goal = goal_match.group(1).strip() if goal_match else ""
+
+    # 3. 提取前置条件 (preconditions)
+    pre_match = re.search(
+        r"(?im)^###?\s*前置条件[^\n]*\n([\s\S]*?)(?=^###?|\Z)",
+        raw_md,
+    )
+    preconditions = pre_match.group(1).strip() if pre_match else ""
+    if not preconditions:
+        pre_inline = re.search(r"(?im)^\s*(?:[-*]\s*)?前置条件\s*[:：|]\s*(.+)$", raw_md)
+        if pre_inline:
+            preconditions = pre_inline.group(1).strip()
+
+    # 4. 提取测试数据 (test_data)
+    data_match = re.search(
+        r"(?im)^###?\s*测试数据[^\n]*\n([\s\S]*?)(?=^###?|\Z)",
+        raw_md,
+    )
+    test_data = data_match.group(1).strip() if data_match else ""
+
+    # 5. 提取步骤与预期 (steps)
+    steps_block_match = re.search(
+        r"(?im)^###?\s*(?:测试步骤|步骤与预期|步骤)[^\n]*\n([\s\S]*?)(?=^###?\s*(?:预期结果|待定事项|待定项|备注)|\Z)",
+        raw_md,
+    )
+    expected_block_match = re.search(
+        r"(?im)^###?\s*(?:预期结果|预期断言|断言)[^\n]*\n([\s\S]*?)(?=^###?|\Z)",
+        raw_md,
+    )
+
+    steps: list[dict[str, Any]] = []
+    if steps_block_match:
+        steps_text = steps_block_match.group(1).strip()
+        raw_items = re.split(r"(?m)^(?=\s*\d+[.、)])", steps_text)
+        step_idx = 1
+        for item in raw_items:
+            item_str = item.strip()
+            if not item_str:
+                continue
+            cleaned = re.sub(r"^\s*\d+[.、)]\s*", "", item_str).strip()
+            sub_exp_match = re.search(r"(?im)(?:[-*]\s*)?(?:预期结果|预期|断言)\s*[:：]\s*([\s\S]*)$", cleaned)
+            if sub_exp_match:
+                act = cleaned[: sub_exp_match.start()].strip()
+                exp = sub_exp_match.group(1).strip()
+            else:
+                act = cleaned
+                exp = ""
+            steps.append({
+                "step_no": step_idx,
+                "action": act,
+                "expected": exp,
+            })
+            step_idx += 1
+
+    if expected_block_match and steps:
+        exp_text = expected_block_match.group(1).strip()
+        raw_exps = re.split(r"(?m)^(?=\s*\d+[.、)])", exp_text)
+        exp_list = [re.sub(r"^\s*\d+[.、)]\s*", "", e.strip()).strip() for e in raw_exps if e.strip()]
+        for i, st in enumerate(steps):
+            if not st["expected"] and i < len(exp_list):
+                st["expected"] = exp_list[i]
+
+    # 6. 提取待定事项 (pending_items)
+    pending_match = re.search(
+        r"(?im)^###?\s*(?:待定事项|待定项|待定|pending)[^\n]*\n([\s\S]*?)(?=^###?|\Z)",
+        raw_md,
+    )
+    pending_items: list[str] = []
+    if pending_match:
+        p_text = pending_match.group(1).strip()
+        lines = [re.sub(r"^\s*[-*]\s*", "", ln).strip() for ln in p_text.splitlines() if ln.strip()]
+        pending_items = [ln for ln in lines if ln]
+
+    return {
+        "case_key": case_key,
+        "title": title,
+        "priority": priority,
+        "type": case_type,
+        "verification_goal": verification_goal,
+        "preconditions": preconditions,
+        "test_data": test_data,
+        "steps": steps,
+        "pending_items": pending_items,
+        "raw_md": raw_md,
+    }
+
+
+def aggregate_draft_cases_by_points(
+    session: Session,
+    task_id: int,
+    draft: CaseDraft,
+) -> list[dict[str, Any]]:
+    """Group draft cases by test points, honoring links or falling back to regex."""
+    try:
+        sections = split_case_draft(draft.content_md)
+    except Exception:
+        sections = []
+
+    case_details = [parse_case_detail(sec) for sec in sections]
+    case_detail_by_key = {c["case_key"]: c for c in case_details}
+
+    points = current_points(session, task_id)
+    point_citation_map: dict[int, list[int]] = {}
+    for pt in points:
+        if pt.id is not None:
+            point_citation_map[pt.id] = point_citation_ids(session, pt.id)
+
+    links = session.exec(
+        select(DraftTestPointLink).where(DraftTestPointLink.draft_id == draft.id)
+    ).all()
+
+    point_cases_map: dict[int, list[str]] = {pt.id: [] for pt in points if pt.id is not None}
+    linked_case_keys: set[str] = set()
+
+    for link in links:
+        if link.test_point_id in point_cases_map:
+            if link.case_key not in point_cases_map[link.test_point_id]:
+                point_cases_map[link.test_point_id].append(link.case_key)
+            linked_case_keys.add(link.case_key)
+
+    point_by_stable_key = {pt.stable_key.upper(): pt for pt in points}
+    for sec in sections:
+        ck = sec["case_key"]
+        if ck in linked_case_keys:
+            continue
+        keys = sec.get("test_point_keys") or []
+        for k in keys:
+            norm_k = k.upper()
+            if norm_k in point_by_stable_key:
+                pt_id = point_by_stable_key[norm_k].id
+                if pt_id is not None:
+                    if ck not in point_cases_map.setdefault(pt_id, []):
+                        point_cases_map[pt_id].append(ck)
+                    linked_case_keys.add(ck)
+
+    groups: list[dict[str, Any]] = []
+    for pt in points:
+        c_keys = point_cases_map.get(pt.id or 0, [])
+        cases = [case_detail_by_key[k] for k in c_keys if k in case_detail_by_key]
+        groups.append({
+            "test_point_id": pt.id,
+            "stable_key": pt.stable_key,
+            "title": pt.title,
+            "verification_goal": pt.verification_goal,
+            "dimension": pt.dimension,
+            "priority": pt.priority,
+            "citation_ids": point_citation_map.get(pt.id or 0, []),
+            "cases": cases,
+        })
+
+    unlinked_keys = [c["case_key"] for c in case_details if c["case_key"] not in linked_case_keys]
+    if unlinked_keys:
+        unlinked_cases = [case_detail_by_key[k] for k in unlinked_keys if k in case_detail_by_key]
+        groups.append({
+            "test_point_id": None,
+            "stable_key": "OTHER",
+            "title": "其他衍生用例",
+            "verification_goal": "未直接关联特定测试点的用例",
+            "dimension": "other",
+            "priority": "P1",
+            "citation_ids": [],
+            "cases": unlinked_cases,
+        })
+
+    return groups

@@ -22,6 +22,7 @@ const form = reactive({
   base_url: '',
   api_key: '',
   model_name: '',
+  protocol: 'chat_completions' as 'chat_completions' | 'responses',
   is_default: false,
 })
 
@@ -30,6 +31,7 @@ function resetForm() {
   form.base_url = ''
   form.api_key = ''
   form.model_name = ''
+  form.protocol = 'chat_completions'
   form.is_default = false
   editingId.value = null
 }
@@ -56,6 +58,7 @@ function openEdit(row: ModelConfig) {
   form.base_url = row.base_url
   form.api_key = ''
   form.model_name = row.model_name
+  form.protocol = row.protocol || 'chat_completions'
   form.is_default = row.is_default
   dialogVisible.value = true
 }
@@ -77,6 +80,7 @@ async function submit() {
         name: form.name.trim(),
         base_url: form.base_url.trim(),
         model_name: form.model_name.trim(),
+        protocol: form.protocol,
         is_default: form.is_default,
       }
       if (form.api_key.trim()) {
@@ -90,6 +94,7 @@ async function submit() {
         base_url: form.base_url.trim(),
         api_key: form.api_key.trim(),
         model_name: form.model_name.trim(),
+        protocol: form.protocol,
         is_default: form.is_default,
       })
       ElMessage.success('已创建模型')
@@ -150,6 +155,12 @@ onMounted(load)
       <el-table-column prop="model_name" label="模型名" min-width="140" />
       <el-table-column prop="base_url" label="Base URL" min-width="200" show-overflow-tooltip />
       <el-table-column prop="api_key" label="API Key" width="120" />
+      <el-table-column label="协议" width="135">
+        <template #default="{ row }">
+          <el-tag v-if="row.protocol === 'responses'" type="warning" size="small">Responses</el-tag>
+          <el-tag v-else type="info" size="small">Chat Completions</el-tag>
+        </template>
+      </el-table-column>
       <el-table-column label="默认" width="90">
         <template #default="{ row }">
           <el-tag v-if="row.is_default" type="success" size="small" effect="dark">默认</el-tag>
@@ -181,6 +192,12 @@ onMounted(load)
       <el-form label-width="100px">
         <el-form-item label="名称" required>
           <el-input v-model="form.name" placeholder="如：DeepSeek / GPT" />
+        </el-form-item>
+        <el-form-item label="接口协议" required>
+          <el-radio-group v-model="form.protocol">
+            <el-radio value="chat_completions">Chat Completions (/v1/chat/completions)</el-radio>
+            <el-radio value="responses">Responses API (/v1/responses)</el-radio>
+          </el-radio-group>
         </el-form-item>
         <el-form-item label="Base URL" required>
           <el-input v-model="form.base_url" placeholder="https://api.example.com/v1" />

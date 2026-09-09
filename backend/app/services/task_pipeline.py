@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import hashlib
 from collections.abc import Iterable, Mapping
@@ -12,6 +13,7 @@ from sqlmodel import Session, col, func, select
 from app import config
 from app.models.entities import (
     CaseDraft,
+    DraftTestPointLink,
     TaskReferenceCase,
     GenerationTask,
     ModelConfig,
@@ -29,7 +31,12 @@ from app.services.llm import LLMError, chat_completion
 from app.services.retrieve import load_all_wiki_pages, rank_pages
 from app.services.source_chunks_store import load_all_source_chunks, rank_source_chunks
 from app.services.review_parse import parse_review_payload
-from app.services.case_management import import_cases_from_draft, split_case_draft, utcnow
+from app.services.case_management import (
+    CASE_HEADING_RE,
+    import_cases_from_draft,
+    split_case_draft,
+    utcnow,
+)
 from app.services.task_events import append_event
 from app.services.task_state import InvalidTransition, transition
 from app.services.task_stream import task_stream
@@ -37,6 +44,7 @@ from app.services.wiki_spaces import resolve_space_id
 from app.services.test_points import (
     citation_label_map_from_context,
     create_checkpoint as create_test_point_checkpoint,
+    current_points,
     extract_json_payload,
     normalize_model_points,
     point_citation_ids,
@@ -228,12 +236,27 @@ def _context_content(hit: Mapping[str, Any], kind: str) -> str:
         return _strip_yaml_frontmatter(
             str(hit.get("content") or hit.get("content_excerpt") or hit.get("snippet") or "")
         )
+    if kind == "external":
+        return str(
+            hit.get("evidence_snippet")
+            or hit.get("evidenceSnippet")
+            or hit.get("content_excerpt")
+            or hit.get("content")
+            or hit.get("snippet")
+            or hit.get("text")
+            or ""
+        )
     return str(hit.get("text") or hit.get("content") or hit.get("content_excerpt") or "")
 
 
 def _context_hit_key(hit: Mapping[str, Any], kind: str) -> tuple[Any, ...]:
     if kind == "wiki":
         for field in ("page_key", "id", "path"):
+            value = hit.get(field)
+            if value is not None and str(value):
+                return (kind, field, str(value))
+    elif kind == "external":
+        for field in ("chunk_id", "id", "path", "document_path", "heading_path", "title"):
             value = hit.get(field)
             if value is not None and str(value):
                 return (kind, field, str(value))
@@ -303,6 +326,12 @@ def _normalise_context_hits(
                 item["anchor_source"] = None
                 item["strong_anchor"] = False
             item["_context_group"] = _context_source_group(item)
+        elif kind == "external":
+            item["anchor_clause"] = None
+            item["strong_anchor"] = False
+            item["_context_group"] = str(
+                item.get("document_path") or item.get("path") or "external:unknown"
+            )
         else:
             item["anchor_clause"] = None
             item["strong_anchor"] = False
@@ -326,6 +355,7 @@ def _normalise_context_hits(
         for field in (
             "page_key", "path", "title", "page_start", "page_end", "start_char",
             "end_char", "section", "parent_index", "document_id", "source_document_id",
+            "heading_path", "headingPath", "evidence_snippet", "evidenceSnippet",
         ):
             if previous.get(field) in (None, "") and item.get(field) not in (None, ""):
                 previous[field] = item[field]
@@ -383,6 +413,9 @@ def _context_header(citation: Mapping[str, Any]) -> str:
         parts.append(f"page_key={citation['page_key']}")
     if citation.get("source_chunk_id") is not None:
         parts.append(f"source_chunk_id={citation['source_chunk_id']}")
+    heading = citation.get("heading_path") or citation.get("headingPath")
+    if heading:
+        parts.append(f"heading={heading}")
     start, end = citation.get("start_char"), citation.get("end_char")
     if start is not None or end is not None:
         parts.append(f"chars={start if start is not None else '?'}-{end if end is not None else '?'}")
@@ -487,11 +520,15 @@ def _build_context_index(citations: list[dict[str, Any]], budget: int) -> str:
     per_line = max(80, budget // len(citations))
     for citation in citations:
         kind = citation.get("citation_type") or ""
-        identity = (
-            f"page_key={citation.get('page_key')}"
-            if kind == "wiki"
-            else f"source_chunk_id={citation.get('source_chunk_id')}"
-        )
+        if kind == "wiki":
+            identity = f"page_key={citation.get('page_key')}"
+        elif kind == "source":
+            identity = f"source_chunk_id={citation.get('source_chunk_id')}"
+        elif kind == "external":
+            heading = citation.get("heading_path") or citation.get("headingPath") or ""
+            identity = f"external heading={heading}" if heading else "external"
+        else:
+            identity = ""
         anchor = f" anchor={citation['anchor_clause']}" if citation.get("anchor_clause") else ""
         lines.append(
             f"[{citation.get('label')}] {kind} {citation.get('title') or ''} | {identity}"
@@ -504,24 +541,46 @@ def assemble_task_context(
     wiki_hits: Iterable[Mapping[str, Any]] | None,
     source_hits: Iterable[Mapping[str, Any]] | None,
     *,
+    external_hits: Iterable[Mapping[str, Any]] | None = None,
     query: str = "",
     max_chars: int | None = None,
     wiki_ratio: float = _WIKI_CONTEXT_RATIO,
     source_ratio: float = _SOURCE_CONTEXT_RATIO,
     index_ratio: float = _INDEX_CONTEXT_RATIO,
+    external_ratio: float = 0.20,
     max_wiki_item_chars: int = _DEFAULT_WIKI_ITEM_CHARS,
     max_source_item_chars: int = _DEFAULT_SOURCE_ITEM_CHARS,
+    max_external_item_chars: int = _DEFAULT_SOURCE_ITEM_CHARS,
     max_source_document_chars: int | None = None,
     include_explain: bool = False,
 ) -> dict[str, Any]:
-    """Assemble fair Wiki/source context plus traceable citations.
+    """Assemble fair Wiki/source/external context plus traceable citations.
 
     The return value is intentionally a plain mapping so callers can pass
-    ``wiki_context`` and ``source_context`` into the existing generation
-    message builder without changing its API.  Strong clause anchors are
-    derived only from clause ids explicitly present in ``query``.
+    ``wiki_context``, ``source_context``, and ``external_context`` into the
+    existing generation message builder without changing its API.
     """
-    ratios = [float(wiki_ratio), float(source_ratio), float(index_ratio)]
+    raw_wiki = list(wiki_hits or [])
+    raw_source = list(source_hits or [])
+    raw_external = list(external_hits or [])
+
+    explicit_clause_ids = _context_explicit_clauses(query)
+    wiki, raw_wiki_count = _normalise_context_hits(
+        raw_wiki, kind="wiki", explicit_clause_ids=explicit_clause_ids
+    )
+    source, raw_source_count = _normalise_context_hits(
+        raw_source, kind="source", explicit_clause_ids=explicit_clause_ids
+    )
+    external, raw_external_count = _normalise_context_hits(
+        raw_external, kind="external", explicit_clause_ids=explicit_clause_ids
+    ) if raw_external else ([], 0)
+
+    has_external = bool(external)
+    if has_external:
+        ratios = [float(wiki_ratio), float(source_ratio), float(external_ratio), float(index_ratio)]
+    else:
+        ratios = [float(wiki_ratio), float(source_ratio), float(index_ratio)]
+
     if any(r < 0 for r in ratios) or sum(ratios) <= 0:
         raise ValueError("context ratios must be non-negative and not all zero")
     total = int(max_chars) if max_chars is not None else max(
@@ -535,15 +594,14 @@ def assemble_task_context(
     for index in range(total - sum(budgets)):
         budgets[index % len(budgets)] += 1
 
-    explicit_clause_ids = _context_explicit_clauses(query)
-    raw_wiki = list(wiki_hits or [])
-    raw_source = list(source_hits or [])
-    wiki, raw_wiki_count = _normalise_context_hits(
-        raw_wiki, kind="wiki", explicit_clause_ids=explicit_clause_ids
-    )
-    source, raw_source_count = _normalise_context_hits(
-        raw_source, kind="source", explicit_clause_ids=explicit_clause_ids
-    )
+    wiki_budget = budgets[0]
+    source_budget = budgets[1]
+    if has_external:
+        external_budget = budgets[2]
+        index_budget = budgets[3]
+    else:
+        external_budget = 0
+        index_budget = budgets[2]
 
     citations: list[dict[str, Any]] = []
     for index, hit in enumerate(wiki, start=1):
@@ -575,6 +633,7 @@ def assemble_task_context(
             }
         )
     wiki_citations = citations[:]
+    source_start_index = len(citations)
     for index, hit in enumerate(source, start=1):
         text = hit.get("_context_content") or ""
         snippet, _, _ = _context_excerpt(text, query, 320, fallback=str(hit.get("snippet") or ""))
@@ -604,40 +663,92 @@ def assemble_task_context(
                 "_context_group": hit.get("_context_group"),
             }
         )
-    source_citations = citations[len(wiki_citations) :]
+    source_citations = citations[source_start_index:]
+
+    external_start_index = len(citations)
+    for index, hit in enumerate(external, start=1):
+        text = hit.get("_context_content") or ""
+        snippet, _, _ = _context_excerpt(text, query, 320, fallback=str(hit.get("snippet") or ""))
+        citations.append(
+            {
+                "citation_type": "external",
+                "citation_id": f"E{index}",
+                "label": f"E{index}",
+                "wiki_page_id": None,
+                "page_key": None,
+                "source_chunk_id": None,
+                "title": hit.get("title") or f"外部知识{index}",
+                "path": hit.get("path") or hit.get("document_path") or "",
+                "heading_path": hit.get("heading_path") or hit.get("headingPath") or "",
+                "evidence_snippet": hit.get("evidence_snippet") or hit.get("evidenceSnippet") or "",
+                "score": float(hit.get("score") or 0),
+                "snippet": snippet,
+                "content_excerpt": text[:2000],
+                "start_char": hit.get("start_char"),
+                "end_char": hit.get("end_char"),
+                "page_start": hit.get("page_start"),
+                "page_end": hit.get("page_end"),
+                "section": hit.get("section") or "",
+                "clause_ids": hit.get("clause_ids") or [],
+                "anchor_clause": None,
+                "document_id": None,
+                "task_citation_id": hit.get("task_citation_id"),
+                "_context_group": hit.get("_context_group") or "external",
+            }
+        )
+    external_citations = citations[external_start_index:]
 
     wiki_context = _fair_render_context_group(
         wiki_citations,
         wiki,
-        budget=budgets[0],
+        budget=wiki_budget,
         item_cap=max(0, int(max_wiki_item_chars)),
         group_cap=max(0, int(max_wiki_item_chars)),
         query=query,
     )
     source_group_cap = max_source_document_chars
     if source_group_cap is None:
-        source_group_cap = max(0, min(budgets[1], max(int(max_source_item_chars), budgets[1] // 2)))
+        source_group_cap = max(0, min(source_budget, max(int(max_source_item_chars), source_budget // 2)))
     source_context = _fair_render_context_group(
         source_citations,
         source,
-        budget=budgets[1],
+        budget=source_budget,
         item_cap=max(0, int(max_source_item_chars)),
         group_cap=source_group_cap,
         query=query,
     )
-    index_context = _build_context_index(citations, budgets[2])
+    external_context = _fair_render_context_group(
+        external_citations,
+        external,
+        budget=external_budget,
+        item_cap=max(0, int(max_external_item_chars)),
+        group_cap=max(0, int(max_external_item_chars)),
+        query=query,
+    ) if has_external else ""
+
+    index_context = _build_context_index(citations, index_budget)
+
+    text_blocks = [
+        "# Wiki 结构化知识\n" + (wiki_context or "（无匹配 Wiki 页面）"),
+    ]
+    if has_external:
+        text_blocks.append(
+            "# 外部知识参考 (External Knowledge [E#])\n" + (external_context or "（无匹配外部知识）")
+        )
+    text_blocks.extend([
+        "# 原文证据\n" + (source_context or "（无匹配原文块）"),
+        "# 关联索引\n" + (index_context or "（无命中索引）"),
+    ])
     result: dict[str, Any] = {
-        "text": (
-            "# Wiki 结构化知识\n" + (wiki_context or "（无匹配 Wiki 页面）") + "\n\n"
-            "# 原文证据\n" + (source_context or "（无匹配原文块）") + "\n\n"
-            "# 关联索引\n" + (index_context or "（无命中索引）")
-        ),
+        "text": "\n\n".join(text_blocks),
         "wiki_context": wiki_context,
         "source_context": source_context,
+        "external_context": external_context,
         "index_context": index_context,
         "citations": citations,
         "wiki_hits": [{k: v for k, v in hit.items() if not k.startswith("_")} for hit in wiki],
         "source_hits": [{k: v for k, v in hit.items() if not k.startswith("_")} for hit in source],
+        "external_hits": [{k: v for k, v in hit.items() if not k.startswith("_")} for hit in external],
         "explicit_clause_ids": explicit_clause_ids,
         "explicit_anchor_clause_ids": list(
             dict.fromkeys(
@@ -648,13 +759,15 @@ def assemble_task_context(
         ),
         "budgets": {
             "total_chars": total,
-            "wiki_chars": budgets[0],
-            "source_chars": budgets[1],
-            "index_chars": budgets[2],
+            "wiki_chars": wiki_budget,
+            "source_chars": source_budget,
+            "external_chars": external_budget,
+            "index_chars": index_budget,
             "ratios": {
                 "wiki": ratios[0] / ratio_sum,
                 "source": ratios[1] / ratio_sum,
-                "index": ratios[2] / ratio_sum,
+                "external": (ratios[2] / ratio_sum) if has_external else 0.0,
+                "index": (ratios[3] if has_external else ratios[2]) / ratio_sum,
             },
         },
     }
@@ -663,10 +776,12 @@ def assemble_task_context(
             "deduped": {
                 "wiki": raw_wiki_count - len(wiki),
                 "source": raw_source_count - len(source),
+                "external": raw_external_count - len(external),
             },
             "counts": {
                 "wiki": len(wiki),
                 "source": len(source),
+                "external": len(external),
                 "included": sum(1 for citation in citations if citation.get("included")),
             },
             "explicit_clause_ids": explicit_clause_ids,
@@ -674,6 +789,7 @@ def assemble_task_context(
             "item_caps": {
                 "wiki": int(max_wiki_item_chars),
                 "source": int(max_source_item_chars),
+                "external": int(max_external_item_chars),
                 "source_document": int(source_group_cap),
             },
         }
@@ -724,6 +840,7 @@ def _build_messages(
     index_context: str = "",
     test_points_text: str = "",
     reference_cases_text: str = "",
+    external_context: str = "",
 ) -> list[dict[str, str]]:
     tags = _focus_tags(requirement)
     user_parts = [
@@ -736,6 +853,10 @@ def _build_messages(
     user_parts.append("")
     user_parts.append("# Wiki 结构化知识（摘要/规则卡片）")
     user_parts.append(wiki_context if wiki_context.strip() else "（无匹配 Wiki 页面）")
+    if external_context.strip():
+        user_parts.append("")
+        user_parts.append("# 外部知识参考 (External Knowledge [E#])")
+        user_parts.append(external_context)
     user_parts.append("")
     user_parts.append("# 原文摘录（Source Chunks，请优先引用可核对的原句）")
     user_parts.append(
@@ -756,10 +877,10 @@ def _build_messages(
         )
     user_parts.append("")
     user_parts.append(
-        "请根据需求、Wiki 与【原文摘录】生成测试用例 Markdown。\n"
+        "请根据需求、Wiki、外部知识与【原文摘录】生成测试用例 Markdown。\n"
         "硬性要求：\n"
-        "1) 规则断言必须能在原文 [S#] 中找到依据，优先引用条款号（如 3.5.2）；\n"
-        "2) 每条用例「关联知识」同时写 Wiki 编号 [n] 与原文 [S#]（若有）；\n"
+        "1) 规则断言必须能在原文 [S#]、外部知识 [E#] 或 Wiki [n] 中找到依据，优先引用条款号（如 3.5.2）；\n"
+        "2) 每条用例「关联知识」可同时引用 Wiki [#]、原文证据 [S#] 及外部知识 [E#]（若有）；\n"
         "3) 需要定位时保留 page_key、source_chunk_id、字符范围、页码和条款号；\n"
         "4) 覆盖正常 / 边界 / 异常；不得编造上下文未出现的规则；\n"
         "5) 每条用例必须写出关联测试点稳定 key（如 TP-001）和优先级 P0/P1/P2；\n"
@@ -784,6 +905,213 @@ def _append_supplemental_context(messages: list[dict[str, str]], supplemental_te
         messages[-1]["content"] += (
             "\n\n# 用户补充上下文（仅作为人工确认后的附加输入）\n" + text
         )
+
+
+def _citations_for_point(session: Session, task_id: int, point: TestPoint) -> str:
+    """Collect evidence text specifically bound to a given test point."""
+    if point.id is None:
+        return ""
+    c_ids = point_citation_ids(session, int(point.id))
+    if not c_ids:
+        return ""
+    rows = session.exec(
+        select(TaskCitation)
+        .where(TaskCitation.task_id == task_id)
+        .where(TaskCitation.id.in_(c_ids))
+    ).all()
+    if not rows:
+        return ""
+    parts: list[str] = []
+    for r in rows:
+        title = r.title or "引用"
+        body = (r.snippet or r.content_excerpt or "").strip()
+        parts.append(f"[{r.citation_type}] {title} ({r.path})\n{body}")
+    return "\n\n".join(parts)
+
+
+def _build_point_generate_messages(
+    system_prompt: str,
+    requirement: Requirement,
+    point: TestPoint,
+    point_index: int,
+    total_points: int,
+    granularity: str = "standard",
+    citations_text: str = "",
+    reference_cases_text: str = "",
+) -> list[dict[str, str]]:
+    """Build focused prompt messages for a single test point in the point-by-point pipeline."""
+    tags = _focus_tags(requirement)
+    user_parts = [
+        f"# 目标测试点 [{point_index}/{total_points}]",
+        f"- 稳定Key：{point.stable_key}",
+        f"- 标题：{point.title}",
+        f"- 验证目标：{point.verification_goal}",
+        f"- 维度：{point.dimension}",
+        f"- 优先级：{point.priority}",
+        "",
+        "# 需求背景 [REQ]",
+        f"标题：{requirement.title}",
+        f"描述：{requirement.description}",
+        f"生成粒度：{granularity}",
+    ]
+    if tags:
+        user_parts.append(f"关注标签：{', '.join(tags)}")
+
+    if citations_text.strip():
+        user_parts.append("")
+        user_parts.append("# 绑定的业务规则与引用证据")
+        user_parts.append(citations_text.strip())
+
+    granularity_rules = {
+        "compact": "生成粒度为【精简/compact】：本测试点仅需生成 1 条核心测试用例（聚焦核心主流程或最关键阻断）。",
+        "standard": "生成粒度为【标准/standard】：本测试点请生成 2~3 条测试用例（覆盖正向主流程、关键边界值或典型异常场景）。",
+        "detailed": "生成粒度为【详细/detailed】：本测试点请生成 3~5 条充分详尽的测试用例（全面覆盖正向路径、边界值、异常分支、逆向流程及状态冲突等）。",
+    }
+    granularity_instruction = granularity_rules.get(
+        granularity,
+        "生成粒度为【标准/standard】：本测试点请生成 2~3 条测试用例（覆盖正向主流程与关键异常场景）。",
+    )
+
+    pt_num_part = re.sub(r"^TP-?", "", point.stable_key, flags=re.IGNORECASE) or f"{point_index:03d}"
+    user_parts.append("")
+    user_parts.append("# 硬性输出规范（必须严格遵守）")
+    user_parts.append(
+        f"【用例数量规范】：{granularity_instruction}\n"
+        f"请仅针对上述测试点【{point.stable_key} · {point.title}】生成对应的测试用例 Markdown。\n"
+        f"【全局唯一编号要求】：为避免不同测试点之间产生重复编号冲突，本测试点下的用例必须统一采用 `## TC-{pt_num_part}-01`、`## TC-{pt_num_part}-02` ... 编号格式（如 `## TC-{pt_num_part}-01 用例标题`）。严禁所有测试点都从 TC-001 重新编号！\n"
+        "【证据引证红线】：严格只能引用本提示词上方【绑定的业务规则与引用证据】中明确列出的引文编号（如 `[S#]`、`[n]`、`[E#]`、`[REQ]`），严禁虚构任何不存在的编号（如 `[S30]` 等），正文中严禁保留未实例化的占位符 `[S#]`；引用法规细则时必须精准定位至最具体的最小执行条款（如第 8.7 款，严禁以第 8.1 款等章节总则替代）。\n"
+        "【断言客观性与严禁占位符】：测试步骤与预期必须给出可客观核验的系统状态（订单回报、撮合排队、行情字段等）。预期结果中【严禁输出任何 `<...>` 尖括号模板占位符】（如 `<恢复交易后的处理方式>` 等）；若证据未提供具体报文代码或状态枚举，请用确定性语言客观描述业务状态，并将未明确的字段统一沉淀到“### 待确认项”中。\n"
+        "【授权性规则分层设计】：若引用的规则包含“本所可以”、“有权采取”等授权性规则，必须按“监控识别预警 ➔ 待组织/人工处置指令 ➔ 接收正式决定 ➔ 系统网关执行”分步设计，不得断言为系统必然全自动执行。\n"
+        "【一例一目标】：单条用例只验证一个主要处置动作，避免把“取消交易”与“暂缓交收”用“或”合并验证。\n"
+        "每条用例必须严格包含以下元数据（顶格无额外缩进）：\n"
+        f"- 关联测试点：{point.stable_key}\n"
+        f"- 优先级：{point.priority}\n"
+        f"- 类型：{point.dimension}\n"
+        f"- 验证目标：{point.verification_goal}\n"
+        "用例主体必须包含规范的各小节：\n"
+        "### 前置条件\n"
+        "### 测试数据（若有）\n"
+        "### 测试步骤\n"
+        "1. 操作说明\n"
+        "   预期结果：断言说明（必须可客观核验，严禁输出 `<...>` 占位符）\n"
+        "2. ...\n"
+        "### 待确认项\n"
+        "- 影响执行但证据未明确的事项；没有写“无”\n\n"
+        "只能输出测试用例 Markdown，不得包含任何问候、开场白或解释文字。"
+    )
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": "\n".join(user_parts)},
+    ]
+    if reference_cases_text.strip():
+        messages.append({"role": "user", "content": reference_cases_text})
+    return messages
+
+
+def _normalize_point_chunk_case_keys(
+    chunk_md: str,
+    point: TestPoint,
+    seen_case_keys: set[str],
+) -> str:
+    """Ensure all case keys in a single test point chunk are unique across the draft."""
+    matches = list(CASE_HEADING_RE.finditer(chunk_md))
+    if not matches:
+        return chunk_md
+
+    has_collision = False
+    chunk_seen: set[str] = set()
+    for m in matches:
+        k = m.group(1).strip().upper()
+        if k in seen_case_keys or k in chunk_seen:
+            has_collision = True
+            break
+        chunk_seen.add(k)
+
+    if not has_collision:
+        for m in matches:
+            seen_case_keys.add(m.group(1).strip().upper())
+        return chunk_md
+
+    pt_num = re.sub(r"^TP-?", "", point.stable_key, flags=re.IGNORECASE) or point.stable_key
+    new_parts: list[str] = []
+    last_idx = 0
+    case_no = 1
+    for m in matches:
+        new_parts.append(chunk_md[last_idx : m.start()])
+        old_key = m.group(1).strip()
+        new_key = f"TC-{pt_num}-{case_no:02d}"
+        while new_key.upper() in seen_case_keys:
+            case_no += 1
+            new_key = f"TC-{pt_num}-{case_no:02d}"
+        seen_case_keys.add(new_key.upper())
+
+        header_line = chunk_md[m.start() : m.end()]
+        new_header = re.sub(r"^##\s+" + re.escape(old_key), f"## {new_key}", header_line, count=1)
+        new_parts.append(new_header)
+        case_no += 1
+        last_idx = m.end()
+
+    new_parts.append(chunk_md[last_idx:])
+    return "".join(new_parts)
+
+
+def _link_draft_to_test_points(
+    session: Session,
+    draft: CaseDraft,
+    confirmed_points: list[TestPoint],
+) -> None:
+    """Associate generated case sections with confirmed test points into draft_test_point_links."""
+    if draft.id is None or not confirmed_points:
+        return
+    try:
+        sections = split_case_draft(draft.content_md)
+    except Exception:
+        sections = []
+    if not sections:
+        return
+
+    point_by_key = {p.stable_key.upper(): p for p in confirmed_points}
+    for idx, sec in enumerate(sections):
+        case_key = sec.get("case_key")
+        if not case_key:
+            continue
+        keys = sec.get("test_point_keys") or []
+        matched_point_ids: set[int] = set()
+        for k in keys:
+            norm_k = str(k).strip().upper()
+            if norm_k in point_by_key and point_by_key[norm_k].id is not None:
+                matched_point_ids.add(int(point_by_key[norm_k].id))
+
+        if not matched_point_ids:
+            key_match = re.match(r"^TC-([A-Za-z0-9]+)-\d+$", case_key, re.IGNORECASE)
+            if key_match:
+                cand = f"TP-{key_match.group(1)}".upper()
+                if cand in point_by_key and point_by_key[cand].id is not None:
+                    matched_point_ids.add(int(point_by_key[cand].id))
+
+        if not matched_point_ids and len(sections) == len(confirmed_points):
+            pt = confirmed_points[idx]
+            if pt.id is not None:
+                matched_point_ids.add(int(pt.id))
+
+        for pt_id in matched_point_ids:
+            existing = session.exec(
+                select(DraftTestPointLink).where(
+                    DraftTestPointLink.draft_id == draft.id,
+                    DraftTestPointLink.case_key == case_key,
+                    DraftTestPointLink.test_point_id == pt_id,
+                )
+            ).first()
+            if existing is None:
+                session.add(
+                    DraftTestPointLink(
+                        draft_id=int(draft.id),
+                        case_key=case_key,
+                        test_point_id=int(pt_id),
+                    )
+                )
+    session.commit()
 
 
 def _resolve_chat_fn(
@@ -839,6 +1167,7 @@ def _call_chat(
         base_url=model.base_url,
         api_key=model.api_key,
         model=model.model_name,
+        protocol=getattr(model, "protocol", "chat_completions") or "chat_completions",
         messages=messages,
         stream=stream,
         on_attempt=on_attempt,
@@ -1160,7 +1489,17 @@ def run_generate_test_points(
             item for item in all_context.get("source_hits", [])
             if str(item.get("task_citation_id")) in selected_citations
         ]
-        context = assemble_task_context(wiki_hits, source_hits, query=retrieval.query, include_explain=True)
+        external_hits = [
+            item for item in all_context.get("external_hits", [])
+            if str(item.get("task_citation_id")) in selected_citations
+        ]
+        context = assemble_task_context(
+            wiki_hits,
+            source_hits,
+            external_hits=external_hits,
+            query=retrieval.query,
+            include_explain=True,
+        )
         prompt = _resolve_prompt_by_type(session, "test_points")
         model = _resolve_model(session, task)
         citation_label_map = citation_label_map_from_context(context.get("citations") or [])
@@ -1174,11 +1513,19 @@ def run_generate_test_points(
                 f"model_citation_label={label} task_citation_id={citation_id} "
                 f"title={citation.get('title') or ''} path={citation.get('path') or ''}"
             )
+        granularity = getattr(task, "generation_granularity", "standard") or "standard"
+        point_count_guidance = {
+            "compact": "【精简粒度/compact】：请聚焦核心主干能力，提取 3~5 个最关键的测试点即可，避免过度细分。",
+            "standard": "【标准粒度/standard】：兼顾覆盖率与效率，提取 5~8 个测试点（覆盖核心路径与主要边界分支）。",
+            "detailed": "【详细粒度/detailed】：要求深层穷尽测试，提取 8~12 个及以上测试点（细分到各子模块、边界条件、逆向与异常场景）。",
+        }.get(granularity, "提取 5~8 个测试点")
+
         user_parts = [
             "# 需求 [REQ]",
             f"标题：{requirement.title}",
             f"描述：{requirement.description}",
-            f"生成粒度：{task.generation_granularity}",
+            f"生成粒度：{granularity}",
+            f"测试点数量要求：{point_count_guidance}",
             "测试维度：" + ", ".join(task_dimensions(task)),
             "",
             "# 已确认证据",
@@ -1188,6 +1535,9 @@ def run_generate_test_points(
             "每个 citation_ids 元素必须填写上表的 model_citation_label；"
             "不得填写数据库 task_citation_id，未知 label 将被丢弃。\n"
             + ("\n".join(citation_directory) or "（无）"),
+            "",
+            "# 测试点数量硬性约束",
+            f"必须严格按照当前任务设定的生成粒度【{granularity}】输出测试点数量：{point_count_guidance}。",
         ]
         reference_text = _reference_cases_text(session, task.id)
         if reference_text:
@@ -1203,11 +1553,14 @@ def run_generate_test_points(
         if reference_text:
             messages.append({"role": "user", "content": reference_text})
         task_stream.status(stream_task_id, status="generating_test_points", message="正在生成结构化测试点")
+        is_responses = (getattr(model, "protocol", None) or "chat").lower() == "responses"
         content = _call_chat(
             chat_fn,
             model=model,
             messages=messages,
             stage_fn=_TEST_POINTS_CHAT_FN,
+            stream=is_responses,
+            on_delta=(lambda delta: task_stream.delta(stream_task_id, delta)) if is_responses else None,
         )
         points: list[dict[str, Any]] | None = None
         unknown_citations = 0
@@ -1343,6 +1696,7 @@ def run_generate(
     task_id: int,
     chat_fn: Optional[ChatFn] = None,
     auto_review: bool = False,
+    point_by_point: Optional[bool] = None,
 ) -> GenerationTask:
     task = session.get(GenerationTask, task_id)
     if task is None:
@@ -1467,7 +1821,10 @@ def run_generate(
                 raise ValueError("Selected citation is missing from retrieval checkpoint")
             wiki_hits = [h for h in all_context.get("wiki_hits", []) if str(h.get("task_citation_id")) in selected_citations]
             source_hits = [h for h in all_context.get("source_hits", []) if str(h.get("task_citation_id")) in selected_citations]
-            context = assemble_task_context(wiki_hits, source_hits, query=query, include_explain=True)
+            external_hits = [h for h in all_context.get("external_hits", []) if str(h.get("task_citation_id")) in selected_citations]
+            context = assemble_task_context(
+                wiki_hits, source_hits, external_hits=external_hits, query=query, include_explain=True
+            )
             supplemental_text = checkpoint.supplemental_text or ""
         else:
             task_stream.status(stream_task_id, status="retrieving", message="正在检索 Wiki 与原文证据")
@@ -1502,11 +1859,15 @@ def run_generate(
                 retrieved["wiki_hits"] = [item for item in retrieved.get("wiki_hits") or [] if item.get("id") not in candidate_ids or item.get("id") == selected.get("id")]
             retrieved["conflict_groups"] = unresolved
             context = assemble_task_context(
-                retrieved.get("wiki_hits") or [], retrieved.get("source_hits") or [],
-                query=query, include_explain=True,
+                retrieved.get("wiki_hits") or [],
+                retrieved.get("source_hits") or [],
+                external_hits=retrieved.get("external_hits") or [],
+                query=query,
+                include_explain=True,
             )
             wiki_hits = list(context["wiki_hits"])
             source_hits = list(context["source_hits"])
+            external_hits = list(context.get("external_hits") or [])
             _clear_citations(session, task.id)
             citation_rows = []
             for citation in context["citations"]:
@@ -1527,10 +1888,11 @@ def run_generate(
             for citation, row in zip(context["citations"], citation_rows):
                 citation["task_citation_id"] = row.id
             # ``assemble_task_context`` preserves the normalized hit order:
-            # Wiki hits first, followed by source hits. Assign IDs by that
+            # Wiki hits first, followed by source hits, then external hits. Assign IDs by that
             # deterministic order, never by title/snippet (duplicates are
             # valid and must remain independently selectable).
             wiki_count = len(wiki_hits)
+            source_count = len(source_hits)
             for index, hit in enumerate(wiki_hits):
                 if index < len(context["citations"]):
                     hit["task_citation_id"] = context["citations"][index].get("task_citation_id")
@@ -1538,11 +1900,22 @@ def run_generate(
                 citation_index = wiki_count + index
                 if citation_index < len(context["citations"]):
                     hit["task_citation_id"] = context["citations"][citation_index].get("task_citation_id")
+            for index, hit in enumerate(external_hits):
+                citation_index = wiki_count + source_count + index
+                if citation_index < len(context["citations"]):
+                    hit["task_citation_id"] = context["citations"][citation_index].get("task_citation_id")
             hit_count = len(context["citations"])
             explicit_anchors = context["explicit_anchor_clause_ids"]
-            append_event(session, task.id, "retrieve", f"检索完成：Wiki {len(wiki_hits)} + 原文 {len(source_hits)}", detail={"query": query, "hit_count": hit_count, "context_budgets": context["budgets"], "context_explain": context.get("explain")})
+            append_event(
+                session,
+                task.id,
+                "retrieve",
+                f"检索完成：Wiki {len(wiki_hits)} + 原文 {len(source_hits)}"
+                + (f" + 外部 {len(external_hits)}" if external_hits else ""),
+                detail={"query": query, "hit_count": hit_count, "context_budgets": context["budgets"], "context_explain": context.get("explain")},
+            )
             if hit_count == 0:
-                append_event(session, task.id, "retrieve", "警告：未检索到 Wiki 或原文块，将仅基于需求生成")
+                append_event(session, task.id, "retrieve", "警告：未检索到 Wiki、外部知识或原文块，将仅基于需求生成")
             # Store the lossless retrieval/context snapshot before asking for a decision.
             attempt = (session.exec(select(func.max(TaskRetrievalCheckpoint.attempt)).where(TaskRetrievalCheckpoint.task_id == task.id)).one() or 0) + 1
             conflicts = checkpoint_conflicts(
@@ -1572,27 +1945,30 @@ def run_generate(
             raise ValueError("Cannot generate complete cases before test points are confirmed")
         test_points_text = _test_points_text(session, task.id)
         reference_cases_text = _reference_cases_text(session, task.id)
-        task_stream.status(
-            stream_task_id,
-            status="generating",
-            message="正在生成测试用例",
-        )
 
         system_prompt, prompt_ref = _resolve_generate_prompt(session, task)
         model = _resolve_model(session, task)
-        wiki_context = context["wiki_context"]
-        source_context = context["source_context"]
-        index_context = context["index_context"]
-        messages = _build_messages(
-            system_prompt,
-            requirement,
-            wiki_context,
-            source_context,
-            index_context,
-            test_points_text,
-            reference_cases_text,
-        )
-        _append_supplemental_context(messages, supplemental_text)
+
+        confirmed_points = [
+            p for p in current_points(session, task.id)
+            if p.is_selected and not p.is_excluded
+        ]
+
+        active_chat = chat_fn if chat_fn is not None else _GENERATE_CHAT_FN
+        in_test_env = "PYTEST_CURRENT_TEST" in os.environ
+        if point_by_point is True:
+            is_point_by_point = bool(confirmed_points)
+        elif point_by_point is False:
+            is_point_by_point = False
+        elif not confirmed_points:
+            is_point_by_point = False
+        elif in_test_env:
+            is_point_by_point = bool(
+                getattr(active_chat, "point_by_point", False)
+                or getattr(chat_fn, "point_by_point", False)
+            )
+        else:
+            is_point_by_point = True
 
         def publish_attempt(attempt: int, reset: bool) -> None:
             if reset:
@@ -1621,84 +1997,151 @@ def run_generate(
             )
 
         used_lean_fallback = False
-        try:
-            content = _call_chat(
-                chat_fn,
-                model=model,
-                messages=messages,
-                stage_fn=_GENERATE_CHAT_FN,
-                stream=True,
-                on_attempt=publish_attempt,
-                on_delta=publish_delta,
-                on_retry=publish_retry,
-            )
-        except LLMError as primary_exc:
-            # Gateway instability on long finance prompts: retry with the same
-            # fair allocation contract and a smaller total budget.
-            lean_cap = min(4500, max(2000, config.MAX_WIKI_CONTEXT_CHARS // 2))
-            lean_total = min(
-                context["budgets"]["total_chars"],
-                lean_cap + min(2500, config.MAX_SOURCE_CONTEXT_CHARS // 2 or 2500) + 500,
-            )
-            lean_context = assemble_task_context(
-                wiki_hits,
-                source_hits,
-                query=query,
-                max_chars=lean_total,
-                include_explain=True,
-            )
-            lean_wiki = lean_context["wiki_context"]
-            lean_source = lean_context["source_context"]
-            lean_system_prompt = (
-                system_prompt.rstrip()
-                + "\n\n# 精简重试补充\n"
-                + _LEAN_GENERATE_SYSTEM
-            )
-            lean_messages = _build_messages(
-                lean_system_prompt,
-                requirement,
-                lean_wiki,
-                lean_source,
-                lean_context["index_context"],
-                test_points_text,
-                reference_cases_text,
-            )
-            _append_supplemental_context(lean_messages, supplemental_text)
-            append_event(
-                session,
-                task.id,
-                "generate",
-                f"主生成失败，精简上下文重试: {primary_exc}",
-                detail={
-                    "lean_wiki_chars": len(lean_wiki),
-                    "lean_source_chars": len(lean_source),
-                    "lean_index_chars": len(lean_context["index_context"]),
-                    "lean_budgets": lean_context["budgets"],
-                    "primary_error": str(primary_exc)[:300],
-                },
-            )
-            session.commit()
-            task_stream.reset(
+        if is_point_by_point:
+            total_points = len(confirmed_points)
+            point_chunks: list[str] = []
+            seen_case_keys: set[str] = set()
+            granularity = getattr(task, "generation_granularity", "standard") or "standard"
+            for idx, pt in enumerate(confirmed_points, start=1):
+                progress_msg = f"正在生成测试用例 [{idx}/{total_points}]: {pt.stable_key} · {pt.title}"
+                task_stream.status(
+                    stream_task_id,
+                    status="generating",
+                    message=progress_msg,
+                )
+                pt_citations = _citations_for_point(session, task.id, pt)
+                pt_messages = _build_point_generate_messages(
+                    system_prompt,
+                    requirement,
+                    pt,
+                    idx,
+                    total_points,
+                    granularity=granularity,
+                    citations_text=pt_citations,
+                    reference_cases_text=reference_cases_text,
+                )
+                _append_supplemental_context(pt_messages, supplemental_text)
+                chunk = _call_chat(
+                    chat_fn,
+                    model=model,
+                    messages=pt_messages,
+                    stage_fn=_GENERATE_CHAT_FN,
+                    stream=True,
+                    on_attempt=publish_attempt,
+                    on_delta=publish_delta,
+                    on_retry=publish_retry,
+                )
+                if chunk and str(chunk).strip():
+                    normalized_chunk = _normalize_point_chunk_case_keys(
+                        str(chunk).strip(), pt, seen_case_keys
+                    )
+                    point_chunks.append(normalized_chunk)
+                    if idx < total_points:
+                        task_stream.delta(stream_task_id, "\n\n")
+
+            content = "\n\n".join(point_chunks)
+        else:
+            task_stream.status(
                 stream_task_id,
                 status="generating",
-                message="主生成失败，已清空未完成输出并切换精简上下文",
+                message="正在生成测试用例",
             )
-            task_stream.notice(
-                stream_task_id,
-                message="正在使用精简上下文重新生成",
+            wiki_context = context["wiki_context"]
+            source_context = context["source_context"]
+            index_context = context["index_context"]
+            messages = _build_messages(
+                system_prompt,
+                requirement,
+                wiki_context,
+                source_context,
+                index_context,
+                test_points_text,
+                reference_cases_text,
+                external_context=context.get("external_context") or "",
             )
-            content = _call_chat(
-                chat_fn,
-                model=model,
-                messages=lean_messages,
-                stage_fn=_GENERATE_CHAT_FN,
-                stream=True,
-                on_attempt=publish_attempt,
-                on_delta=publish_delta,
-                on_retry=publish_retry,
-            )
-            used_lean_fallback = True
-            prompt_ref = f"{prompt_ref}|lean_fallback"
+            _append_supplemental_context(messages, supplemental_text)
+
+            try:
+                content = _call_chat(
+                    chat_fn,
+                    model=model,
+                    messages=messages,
+                    stage_fn=_GENERATE_CHAT_FN,
+                    stream=True,
+                    on_attempt=publish_attempt,
+                    on_delta=publish_delta,
+                    on_retry=publish_retry,
+                )
+            except LLMError as primary_exc:
+                # Gateway instability on long finance prompts: retry with the same
+                # fair allocation contract and a smaller total budget.
+                lean_cap = min(4500, max(2000, config.MAX_WIKI_CONTEXT_CHARS // 2))
+                lean_total = min(
+                    context["budgets"]["total_chars"],
+                    lean_cap + min(2500, config.MAX_SOURCE_CONTEXT_CHARS // 2 or 2500) + 500,
+                )
+                lean_context = assemble_task_context(
+                    wiki_hits,
+                    source_hits,
+                    external_hits=external_hits,
+                    query=query,
+                    max_chars=lean_total,
+                    include_explain=True,
+                )
+                lean_wiki = lean_context["wiki_context"]
+                lean_source = lean_context["source_context"]
+                lean_external = lean_context.get("external_context") or ""
+                lean_system_prompt = (
+                    system_prompt.rstrip()
+                    + "\n\n# 精简重试补充\n"
+                    + _LEAN_GENERATE_SYSTEM
+                )
+                lean_messages = _build_messages(
+                    lean_system_prompt,
+                    requirement,
+                    lean_wiki,
+                    lean_source,
+                    lean_context["index_context"],
+                    test_points_text,
+                    reference_cases_text,
+                    external_context=lean_external,
+                )
+                _append_supplemental_context(lean_messages, supplemental_text)
+                append_event(
+                    session,
+                    task.id,
+                    "generate",
+                    f"主生成失败，精简上下文重试: {primary_exc}",
+                    detail={
+                        "lean_wiki_chars": len(lean_wiki),
+                        "lean_source_chars": len(lean_source),
+                        "lean_index_chars": len(lean_context["index_context"]),
+                        "lean_budgets": lean_context["budgets"],
+                        "primary_error": str(primary_exc)[:300],
+                    },
+                )
+                session.commit()
+                task_stream.reset(
+                    stream_task_id,
+                    status="generating",
+                    message="主生成失败，已清空未完成输出并切换精简上下文",
+                )
+                task_stream.notice(
+                    stream_task_id,
+                    message="正在使用精简上下文重新生成",
+                )
+                content = _call_chat(
+                    chat_fn,
+                    model=model,
+                    messages=lean_messages,
+                    stage_fn=_GENERATE_CHAT_FN,
+                    stream=True,
+                    on_attempt=publish_attempt,
+                    on_delta=publish_delta,
+                    on_retry=publish_retry,
+                )
+                used_lean_fallback = True
+                prompt_ref = f"{prompt_ref}|lean_fallback"
 
         if not content or not str(content).strip():
             raise LLMError("Empty LLM content")
@@ -1711,6 +2154,9 @@ def run_generate(
             prompt_version_ref=prompt_ref,
         )
         session.add(draft)
+        session.flush()
+
+        _link_draft_to_test_points(session, draft, confirmed_points)
 
         _set_status(task, "generated")
         task.error_message = None
@@ -1769,7 +2215,7 @@ def run_review(
         return _fail_task(session, task, f"Requirement id={task.requirement_id} not found")
 
     try:
-        if task.status in ("generated", "failed"):
+        if task.status in ("generated", "failed", "reviewed"):
             _set_status(task, "reviewing")
             session.add(task)
             append_event(session, task.id, "review", "开始评审用例")

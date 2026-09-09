@@ -49,7 +49,8 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
     if (csrf && !headers.has('X-CSRF-Token')) headers.set('X-CSRF-Token', csrf)
   }
   if (typeof window !== 'undefined') {
-    const projectId = new URLSearchParams(window.location.search).get('project_id')
+    const searchProjectId = new URLSearchParams(window.location.search).get('project_id')
+    const projectId = searchProjectId || window.localStorage?.getItem('casegen:last-project-id')
     if (projectId && path.startsWith('/api/')) {
       const url = new URL(path, window.location.origin)
       if (!url.searchParams.has('project_id')) url.searchParams.set('project_id', projectId)
@@ -85,6 +86,15 @@ export async function apiBlob(path: string, init?: RequestInit): Promise<Blob> {
   if (isUnsafe(init?.method)) {
     const csrf = readCookie('casegen_csrf')
     if (csrf && !headers.has('X-CSRF-Token')) headers.set('X-CSRF-Token', csrf)
+  }
+  if (typeof window !== 'undefined') {
+    const searchProjectId = new URLSearchParams(window.location.search).get('project_id')
+    const projectId = searchProjectId || window.localStorage?.getItem('casegen:last-project-id')
+    if (projectId && path.startsWith('/api/')) {
+      const url = new URL(path, window.location.origin)
+      if (!url.searchParams.has('project_id')) url.searchParams.set('project_id', projectId)
+      path = `${url.pathname}${url.search}`
+    }
   }
   const res = await fetch(path, { ...init, headers, credentials: 'include' })
   if (!res.ok) {

@@ -902,18 +902,15 @@ onUnmounted(() => {
 .uploader :deep(.el-upload-dragger) {
   width: 100%;
   border-radius: var(--cg-radius);
-  border: 1.5px dashed rgba(var(--cg-primary-rgb), 0.35);
-  background: linear-gradient(
-    135deg,
-    rgba(var(--cg-primary-rgb), 0.06),
-    rgba(var(--cg-primary-2-rgb), 0.05)
-  );
+  border: 1.5px dashed var(--cg-border-strong);
+  background: #f8fafc;
   transition: border-color 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
 }
 
 .uploader :deep(.el-upload-dragger:hover) {
-  border-color: var(--cg-primary);
-  box-shadow: 0 0 0 3px rgba(var(--cg-primary-rgb), 0.1);
+  border-color: #10b981;
+  background: #ecfdf5;
+  box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.15);
 }
 
 .upload-inner {
@@ -921,7 +918,7 @@ onUnmounted(() => {
 }
 
 .upload-icon {
-  color: var(--cg-primary);
+  color: #10b981;
   margin-bottom: 8px;
 }
 

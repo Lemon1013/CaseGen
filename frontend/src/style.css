@@ -18,18 +18,23 @@ body,
 }
 
 a {
-  color: var(--cg-primary);
+  color: var(--cg-text);
   text-decoration: none;
+  transition: color 0.15s ease;
 }
 
 a:hover {
-  color: var(--cg-primary-2);
+  color: #059669;
 }
 
 h1,
 h2,
 h3 {
   color: var(--cg-text);
+}
+
+.font-mono {
+  font-family: var(--cg-font-mono);
 }
 
 /* Scrollbar polish */
@@ -39,10 +44,10 @@ h3 {
 }
 
 *::-webkit-scrollbar-thumb {
-  background: rgba(100, 116, 139, 0.35);
+  background: #cbd5e1;
   border-radius: 999px;
 }
 
 *::-webkit-scrollbar-thumb:hover {
-  background: rgba(100, 116, 139, 0.55);
+  background: #94a3b8;
 }

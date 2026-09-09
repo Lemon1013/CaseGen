@@ -8,16 +8,18 @@ import {
   Document,
   EditPen,
   FolderOpened,
-  OfficeBuilding,
   DataAnalysis,
   Connection,
   List,
-  Monitor,
   Reading,
   ArrowDown,
   ArrowRight,
   UserFilled,
   SwitchButton,
+  Tickets,
+  SetUp,
+  Upload,
+  Grid,
 } from '@element-plus/icons-vue'
 import { listModels, type ModelConfig } from '../api/models'
 import { useAuthStore } from '../authStore'
@@ -42,7 +44,7 @@ const wikiPaths = ['/wiki', '/documents', '/wiki/reviews', '/wiki-spaces']
 const platformPaths = ['/platform-management', '/platform-case-generate', '/platform-cases', '/platform-upload', '/platform-adapters']
 
 const useCaseItems = [
-  { path: '/', label: '用例生成', icon: Monitor },
+  { path: '/', label: '用例生成', icon: Tickets },
   { path: '/tasks', label: '生成任务', icon: List },
   { path: '/cases', label: '用例管理', icon: Collection },
   { path: '/data-pools', label: '数据池', icon: DataAnalysis },
@@ -50,13 +52,13 @@ const useCaseItems = [
 
 const platformItems = [
   { path: '/platform-management', label: '平台管理', icon: Connection },
-  { path: '/platform-case-generate', label: '生成平台用例', icon: Monitor },
+  { path: '/platform-case-generate', label: '生成平台用例', icon: SetUp },
   { path: '/platform-cases', label: '平台用例管理', icon: Collection },
-  { path: '/platform-upload', label: '上传至测试平台', icon: Document },
+  { path: '/platform-upload', label: '上传至测试平台', icon: Upload },
 ]
 
 const systemItems = [
-  { path: '/spaces', label: '空间管理', icon: OfficeBuilding },
+  { path: '/spaces', label: '空间管理', icon: Grid },
   { path: '/prompts', label: '提示词管理', icon: EditPen },
   { path: '/models', label: '模型配置', icon: Cpu },
 ]
@@ -127,6 +129,15 @@ async function loadDefaultModel() {
   }
 }
 
+watch(
+  () => route.query.project_id,
+  async (newId) => {
+    if (projects.state.loaded && projects.state.currentId && !newId) {
+      await projects.select(projects.state.currentId, router)
+    }
+  },
+)
+
 onMounted(async () => {
   await Promise.all([loadDefaultModel(), projects.load(route.query)])
   if (projects.state.currentId && !route.query.project_id) await projects.select(projects.state.currentId, router)
@@ -136,12 +147,11 @@ onMounted(async () => {
 <template>
   <el-container class="main-layout">
     <el-aside width="228px" class="sidebar">
-      <div class="sidebar-accent" />
       <div class="logo">
         <BrandMark class="logo-mark" :size="36" title="CaseGen 用例叠层" />
         <div class="logo-text">
           <div class="logo-title">CaseGen</div>
-          <div class="logo-sub">AI 测试用例平台</div>
+          <div class="logo-sub">SPEC ENGINE // 规范工程平台</div>
         </div>
       </div>
 
@@ -251,7 +261,7 @@ onMounted(async () => {
       </header>
 
       <el-main class="main-content">
-        <router-view v-if="projects.state.loaded" :key="projects.state.currentId || 'no-project'" />
+        <router-view v-if="projects.state.loaded && (!projects.state.currentId || route.query.project_id)" :key="projects.state.currentId || 'no-project'" />
       </el-main>
     </el-container>
   </el-container>
@@ -269,22 +279,12 @@ onMounted(async () => {
   width: 228px !important;
   height: 100vh;
   z-index: 30;
-  background: linear-gradient(180deg, var(--cg-sidebar-elevated) 0%, var(--cg-sidebar) 40%, var(--cg-sidebar) 100%);
+  background: #09090b;
   color: var(--cg-text-on-dark);
   display: flex;
   flex-direction: column;
-  border-right: 1px solid rgba(255, 255, 255, 0.06);
+  border-right: 1px solid #18181b;
   overflow: hidden;
-}
-
-.sidebar-accent {
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  height: 2px;
-  background: var(--cg-gradient-brand);
-  box-shadow: 0 0 18px var(--cg-brand-glow);
 }
 
 .logo {
@@ -292,12 +292,11 @@ onMounted(async () => {
   align-items: center;
   gap: 12px;
   padding: 22px 18px 18px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  border-bottom: 1px solid #18181b;
 }
 
 .logo-mark {
   flex: 0 0 auto;
-  filter: drop-shadow(0 8px 16px var(--cg-brand-shadow));
 }
 
 .logo-title {
@@ -309,8 +308,10 @@ onMounted(async () => {
 
 .logo-sub {
   margin-top: 2px;
-  font-size: 11px;
-  color: var(--cg-text-on-dark-muted);
+  font-size: 10.5px;
+  font-family: var(--cg-font-mono);
+  letter-spacing: 0.03em;
+  color: #71717a;
 }
 
 .nav {
@@ -335,7 +336,7 @@ onMounted(async () => {
 
 .nav-group-title {
   padding: 0 12px 3px;
-  color: rgba(255, 255, 255, 0.44);
+  color: #71717a;
   font-size: 11px;
   font-weight: 700;
   letter-spacing: 0.08em;
@@ -345,13 +346,13 @@ onMounted(async () => {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 11px 12px;
-  border-radius: 10px;
-  color: var(--cg-text-on-dark-muted);
+  padding: 10px 12px;
+  border-radius: 6px;
+  color: #a1a1aa;
   text-decoration: none;
   font-size: 14px;
   font-weight: 500;
-  transition: background 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
+  transition: background 0.15s ease, color 0.15s ease;
   position: relative;
 }
 
@@ -360,40 +361,39 @@ onMounted(async () => {
   align-items: center;
   gap: 10px;
   width: 100%;
-  padding: 11px 12px;
+  padding: 10px 12px;
   border: 0;
-  border-radius: 10px;
+  border-radius: 6px;
   background: transparent;
-  color: var(--cg-text-on-dark-muted);
+  color: #a1a1aa;
   font: inherit;
   font-size: 14px;
   font-weight: 600;
   text-align: left;
   cursor: pointer;
-  transition: background 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
+  transition: background 0.15s ease, color 0.15s ease;
   position: relative;
 }
 
 .nav-group-toggle:hover {
-  background: rgba(255, 255, 255, 0.05);
-  color: var(--cg-text-on-dark);
+  background: rgba(255, 255, 255, 0.06);
+  color: #ffffff;
 }
 
 .nav-group-toggle.active {
-  color: #fff;
-  background: var(--cg-sidebar-active);
-  box-shadow: inset 0 0 0 1px var(--cg-sidebar-active-border);
+  color: #ffffff;
+  background: rgba(255, 255, 255, 0.08);
 }
 
 .nav-group-toggle.active::before {
   content: "";
   position: absolute;
   left: 0;
-  top: 10px;
-  bottom: 10px;
-  width: 3px;
-  border-radius: 0 3px 3px 0;
-  background: var(--cg-gradient-brand);
+  top: 8px;
+  bottom: 8px;
+  width: 2px;
+  border-radius: 0 2px 2px 0;
+  background: #10b981;
 }
 
 .nav-chevron {
@@ -407,7 +407,7 @@ onMounted(async () => {
   gap: 4px;
   margin: 1px 0 0 18px;
   padding-left: 8px;
-  border-left: 1px solid rgba(255, 255, 255, 0.1);
+  border-left: 1px solid #18181b;
 }
 
 .nav-subitem {
@@ -416,25 +416,24 @@ onMounted(async () => {
 }
 
 .nav-item:hover {
-  background: rgba(255, 255, 255, 0.05);
-  color: var(--cg-text-on-dark);
+  background: rgba(255, 255, 255, 0.06);
+  color: #ffffff;
 }
 
 .nav-item.active {
-  color: #fff;
-  background: var(--cg-sidebar-active);
-  box-shadow: inset 0 0 0 1px var(--cg-sidebar-active-border);
+  color: #ffffff;
+  background: rgba(255, 255, 255, 0.08);
 }
 
 .nav-item.active::before {
   content: "";
   position: absolute;
   left: 0;
-  top: 10px;
-  bottom: 10px;
-  width: 3px;
-  border-radius: 0 3px 3px 0;
-  background: var(--cg-gradient-brand);
+  top: 8px;
+  bottom: 8px;
+  width: 2px;
+  border-radius: 0 2px 2px 0;
+  background: #10b981;
 }
 
 .nav-icon {
@@ -443,13 +442,13 @@ onMounted(async () => {
 
 .nav-item:focus-visible,
 .nav-group-toggle:focus-visible {
-  outline: 2px solid var(--cg-primary);
+  outline: 2px solid #10b981;
   outline-offset: 2px;
 }
 
 .sidebar-footer {
   padding: 16px 18px 20px;
-  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  border-top: 1px solid #18181b;
 }
 
 .footer-label {
@@ -508,12 +507,13 @@ onMounted(async () => {
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  padding: 7px 12px;
+  padding: 6px 12px;
   border-radius: 999px;
-  background: #fff;
-  border: 1px solid var(--cg-border);
-  box-shadow: var(--cg-shadow);
+  background: #ffffff;
+  border: 1px solid #e4e4e7;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
   font-size: 12px;
+  font-family: var(--cg-font-mono);
   max-width: 360px;
 }
 
@@ -529,9 +529,22 @@ onMounted(async () => {
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: var(--cg-accent);
-  box-shadow: 0 0 0 3px rgba(18, 184, 134, 0.18);
+  background: #10b981;
+  box-shadow: 0 0 0 2px rgba(16, 185, 129, 0.2);
+  animation: pulse-emerald 2s infinite ease-in-out;
   flex-shrink: 0;
+}
+
+@keyframes pulse-emerald {
+  0%, 100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+  50% {
+    transform: scale(1.15);
+    opacity: 0.8;
+    box-shadow: 0 0 0 4px rgba(16, 185, 129, 0.15);
+  }
 }
 
 .model-label {

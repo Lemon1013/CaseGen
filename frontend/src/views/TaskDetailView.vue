@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useProjectStore } from '../projectStore'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { Aim, CopyDocument, Document, Link, Loading, Warning } from '@element-plus/icons-vue'
 import MarkdownView from '../components/MarkdownView.vue'
 import TaskTimeline from '../components/TaskTimeline.vue'
 import CitationList from '../components/CitationList.vue'
@@ -72,6 +73,81 @@ const confirmingTestPoints = ref(false)
 const coverage = ref<CoverageSummary | null>(null)
 const models = ref<ModelConfig[]>([])
 const activeDraftTab = ref('')
+const draftViewMode = ref<'structured' | 'markdown'>('structured')
+const activePointNames = ref<string[]>([])
+
+const liveProgressInfo = computed(() => {
+  const match = /\[(\d+)\/(\d+)\]/.exec(liveStageMessage.value || '')
+  if (match) {
+    const current = parseInt(match[1], 10)
+    const total = parseInt(match[2], 10)
+    const percent = total > 0 ? Math.min(100, Math.round((current / total) * 100)) : 0
+    return { current, total, percent, active: true }
+  }
+  return { current: 0, total: 0, percent: 0, active: false }
+})
+
+watch(
+  () => drafts.value,
+  (newDrafts) => {
+    if (newDrafts.length > 0) {
+      const active = newDrafts.find((d) => String(d.id) === activeDraftTab.value) || newDrafts[0]
+      if (active?.points_with_cases) {
+        activePointNames.value = active.points_with_cases.map((g) => g.stable_key)
+      }
+    }
+  },
+  { immediate: true, deep: true }
+)
+
+watch(
+  () => activeDraftTab.value,
+  (tab) => {
+    const active = drafts.value.find((d) => String(d.id) === tab)
+    if (active?.points_with_cases) {
+      activePointNames.value = active.points_with_cases.map((g) => g.stable_key)
+    }
+  }
+)
+
+async function copyCaseMarkdown(rawMd: string) {
+  try {
+    await navigator.clipboard.writeText(rawMd)
+    ElMessage.success('用例 Markdown 已成功复制到剪贴板')
+  } catch {
+    const ta = document.createElement('textarea')
+    ta.value = rawMd
+    ta.style.position = 'fixed'
+    ta.style.opacity = '0'
+    document.body.appendChild(ta)
+    ta.select()
+    document.execCommand('copy')
+    document.body.removeChild(ta)
+    ElMessage.success('用例 Markdown 已成功复制到剪贴板')
+  }
+}
+
+function dimensionTagType(dim?: string): 'primary' | 'success' | 'warning' | 'danger' | 'info' {
+  const d = (dim || '').toLowerCase()
+  if (d.includes('positive') || d.includes('正向') || d.includes('主流程')) return 'primary'
+  if (d.includes('boundary') || d.includes('边界')) return 'warning'
+  if (d.includes('negative') || d.includes('异常') || d.includes('容错')) return 'danger'
+  if (d.includes('permission') || d.includes('auth') || d.includes('权限')) return 'info'
+  return 'info'
+}
+
+function priorityTagType(priority?: string): 'danger' | 'warning' | 'primary' | 'info' {
+  const p = (priority || '').toUpperCase()
+  if (p === 'P0') return 'danger'
+  if (p === 'P1') return 'warning'
+  if (p === 'P2') return 'info'
+  return 'info'
+}
+
+function getCitationTitle(id: number): string {
+  const c = citations.value.find((item) => item.id === id)
+  return c?.title || `引用 #${id}`
+}
 
 const applyDialogVisible = ref(false)
 const applyMode = ref<ApplyPromptMode>('task_temp')
@@ -949,14 +1025,103 @@ watch(taskId, () => {
   void loadAll()
 })
 
-onMounted(async () => {
-  await loadAll()
+const draftScrollStyle = ref<Record<string, string>>({})
+let rightColumnObserver: ResizeObserver | null = null
+let syncRafId: number | null = null
+let isMounted = false
+
+function scheduleSyncDraftDepth() {
+  if (typeof window === 'undefined' || !isMounted) return
+  if (syncRafId !== null) {
+    cancelAnimationFrame(syncRafId)
+  }
+  syncRafId = requestAnimationFrame(() => {
+    syncRafId = null
+    if (!isMounted) return
+    syncDraftDepth()
+  })
+}
+
+function syncDraftDepth() {
+  if (typeof window === 'undefined') return
+  if (window.innerWidth < 992) {
+    draftScrollStyle.value = { maxHeight: '540px' }
+    return
+  }
+  const leftCol = document.querySelector('.left-main-col') as HTMLElement | null
+  const rightCol = document.querySelector('.right-main-col') as HTMLElement | null
+  const draftCard = document.querySelector('.draft-container-card') as HTMLElement | null
+  const lastRightCard = document.querySelector('.right-main-col > .block:last-child') as HTMLElement | null
+  const draftScroll = draftCard?.querySelector('.draft-scroll') as HTMLElement | null
+
+  const isSideBySide = Boolean(
+    leftCol &&
+    rightCol &&
+    rightCol.getBoundingClientRect().top < (draftCard?.getBoundingClientRect().bottom ?? 0)
+  )
+  if (!isSideBySide) {
+    draftScrollStyle.value = { maxHeight: '540px' }
+    return
+  }
+
+  if (draftCard && (lastRightCard || rightCol)) {
+    const targetBottom = lastRightCard
+      ? lastRightCard.getBoundingClientRect().bottom
+      : (rightCol ? rightCol.getBoundingClientRect().bottom : 0)
+
+    // el-card 内边距 (20px) + 边框 (1px) = 21px
+    const cardBottomOffset = 21
+    const scrollTop = draftScroll
+      ? draftScroll.getBoundingClientRect().top
+      : (draftCard.getBoundingClientRect().top + 156)
+
+    const availableH = Math.round(targetBottom - scrollTop - cardBottomOffset)
+
+    if (availableH >= 380) {
+      draftScrollStyle.value = {
+        maxHeight: `${availableH}px`,
+        height: `${availableH}px`,
+      }
+      return
+    }
+  }
+  draftScrollStyle.value = { maxHeight: '720px' }
+}
+
+watch([draftViewMode, () => activeDraftTab.value], () => {
+  nextTick(scheduleSyncDraftDepth)
+})
+
+onMounted(() => {
+  isMounted = true
+  window.addEventListener('resize', scheduleSyncDraftDepth)
+
+  const rightCol = document.querySelector('.right-main-col')
+  if (rightCol && typeof ResizeObserver !== 'undefined') {
+    rightColumnObserver = new ResizeObserver(() => {
+      scheduleSyncDraftDepth()
+    })
+    rightColumnObserver.observe(rightCol)
+  }
+
+  void loadAll().then(() => {
+    if (!isMounted) return
+    nextTick(scheduleSyncDraftDepth)
+  })
 })
 
 onUnmounted(() => {
+  isMounted = false
+  if (syncRafId !== null) {
+    cancelAnimationFrame(syncRafId)
+    syncRafId = null
+  }
   stopPolling()
   cancelPostGenerationConfirmation()
   clearLiveStreamConnection({ clearPreview: true })
+  rightColumnObserver?.disconnect()
+  rightColumnObserver = null
+  window.removeEventListener('resize', scheduleSyncDraftDepth)
 })
 </script>
 
@@ -968,7 +1133,7 @@ onUnmounted(() => {
           <el-button link type="primary" @click="router.push('/tasks')">← 返回列表</el-button>
         </div>
         <h1 class="page-title">
-          任务 #{{ task?.id ?? taskId }}
+          <span class="task-spec-id">TASK // #{{ task?.id ?? taskId }}</span>
           <el-tag
             v-if="task"
             :type="statusTagType(task.status)"
@@ -1017,8 +1182,37 @@ onUnmounted(() => {
       </el-alert>
       <el-checkbox-group v-model="selectedCitationIds" class="checkpoint-list">
         <el-checkbox v-for="item in checkpoint.candidate_citations" :key="item.id" :label="item.id" class="checkpoint-item">
-          <span class="checkpoint-title">{{ item.title }}</span>
-          <span class="checkpoint-meta">{{ item.citation_type }} · score {{ item.score.toFixed(3) }} · {{ item.path }}</span>
+          <span class="checkpoint-title">
+            <el-tag
+              v-if="item.citation_type === 'external'"
+              size="small"
+              type="warning"
+              effect="plain"
+              style="margin-right: 6px"
+            >
+              外部知识
+            </el-tag>
+            <el-tag
+              v-else-if="item.citation_type === 'source'"
+              size="small"
+              type="success"
+              effect="plain"
+              style="margin-right: 6px"
+            >
+              原文
+            </el-tag>
+            <el-tag
+              v-else
+              size="small"
+              type="primary"
+              effect="plain"
+              style="margin-right: 6px"
+            >
+              Wiki
+            </el-tag>
+            {{ item.title }}
+          </span>
+          <span class="checkpoint-meta">{{ item.citation_type === 'external' ? '外部知识' : item.citation_type }} · score {{ item.score.toFixed(3) }} · {{ item.path }}</span>
           <span class="checkpoint-snippet">{{ item.snippet || item.content_excerpt }}</span>
         </el-checkbox>
       </el-checkbox-group>
@@ -1102,7 +1296,7 @@ onUnmounted(() => {
     </div>
 
     <el-row :gutter="16" class="main-grid">
-      <el-col :xs="24" :lg="14">
+      <el-col :xs="24" :md="14" :lg="14" class="left-main-col">
         <el-card shadow="never" class="block">
           <template #header>
             <div class="card-head">
@@ -1130,20 +1324,50 @@ onUnmounted(() => {
         <el-card v-if="showLivePreview" shadow="never" class="block live-preview-card">
           <template #header>
             <div class="card-head">
-              <span>实时生成预览（未完成）</span>
-              <el-tag type="warning" size="small" effect="plain">实时输出</el-tag>
+              <div class="head-left">
+                <span class="preview-title">实时生成预览</span>
+                <el-tag type="warning" size="small" effect="plain" class="live-tag">
+                  <el-icon class="is-loading"><Loading /></el-icon> 实时生成中
+                </el-tag>
+              </div>
+              <span v-if="liveProgressInfo.active" class="progress-pill">
+                {{ liveProgressInfo.current }} / {{ liveProgressInfo.total }} 测试点
+              </span>
             </div>
           </template>
+          <div v-if="liveProgressInfo.active" class="live-progress-container">
+            <el-progress
+              :percentage="liveProgressInfo.percent"
+              :stroke-width="10"
+              status="success"
+              :striped="true"
+              :striped-flow="true"
+              class="live-progress-bar"
+            />
+          </div>
           <div v-if="liveStageMessage" class="live-preview-status">
             {{ liveStageStatus ? `${statusLabel(liveStageStatus)} · ` : '' }}{{ liveStageMessage }}
           </div>
-          <MarkdownView v-if="livePreviewText" :content="livePreviewText" />
-          <el-empty v-else description="正在等待模型输出…" :image-size="56" />
+          <div class="live-preview-content">
+            <MarkdownView v-if="livePreviewText" :content="livePreviewText" />
+            <el-empty v-else description="正在等待模型输出…" :image-size="56" />
+          </div>
         </el-card>
 
-        <el-card shadow="never" class="block">
-          <template #header>草稿</template>
-          <el-tabs v-if="drafts.length" v-model="activeDraftTab">
+        <el-card shadow="never" class="block draft-container-card">
+          <template #header>
+            <div class="card-head draft-card-header">
+              <div class="header-title-row">
+                <span class="main-title">用例草稿</span>
+                <span v-if="drafts.length" class="draft-count-tag">共 {{ drafts.length }} 个版本</span>
+              </div>
+              <el-radio-group v-model="draftViewMode" size="small" class="view-mode-toggle">
+                <el-radio-button value="structured"><el-icon style="margin-right: 4px; vertical-align: -1px"><Aim /></el-icon>结构化测试点矩阵</el-radio-button>
+                <el-radio-button value="markdown"><el-icon style="margin-right: 4px; vertical-align: -1px"><Document /></el-icon>Markdown 全文</el-radio-button>
+              </el-radio-group>
+            </div>
+          </template>
+          <el-tabs v-if="drafts.length" v-model="activeDraftTab" class="draft-tabs">
             <el-tab-pane
               v-for="d in drafts"
               :key="d.id"
@@ -1151,8 +1375,8 @@ onUnmounted(() => {
               :name="String(d.id)"
             >
               <div class="draft-meta">
-                {{ formatTime(d.created_at) }}
-                <span v-if="d.prompt_version_ref"> · {{ d.prompt_version_ref }}</span>
+                <span class="meta-time">{{ formatTime(d.created_at) }}</span>
+                <span v-if="d.prompt_version_ref" class="meta-prompt"> · {{ d.prompt_version_ref }}</span>
                 <el-tag
                   v-if="task?.finalized_draft_id === d.id"
                   type="success"
@@ -1163,7 +1387,175 @@ onUnmounted(() => {
                   已定稿并导入
                 </el-tag>
               </div>
-              <div class="draft-scroll">
+
+              <!-- 视图 1：测试点关联视图 -->
+              <div v-if="draftViewMode === 'structured'" class="draft-scroll structured-draft-view" :style="draftScrollStyle">
+                <template v-if="d.points_with_cases && d.points_with_cases.length">
+                  <el-collapse v-model="activePointNames" class="point-collapse-tree">
+                    <el-collapse-item
+                      v-for="group in d.points_with_cases"
+                      :key="group.stable_key"
+                      :name="group.stable_key"
+                      class="point-collapse-item"
+                    >
+                      <template #title>
+                        <div class="point-header-bar">
+                          <div class="point-header-left">
+                            <el-tag
+                              size="small"
+                              :type="dimensionTagType(group.dimension)"
+                              effect="light"
+                              class="dimension-tag"
+                            >
+                              {{ group.dimension || '默认' }}
+                            </el-tag>
+                            <el-tag
+                              size="small"
+                              :type="priorityTagType(group.priority)"
+                              effect="dark"
+                              class="priority-pill"
+                            >
+                              {{ group.priority || 'P1' }}
+                            </el-tag>
+                            <span class="point-stable-key">{{ group.stable_key }}</span>
+                            <span class="point-title-text">{{ group.title }}</span>
+                          </div>
+                          <div class="point-header-right">
+                            <el-tag
+                              size="small"
+                              :type="group.cases.length ? 'primary' : 'info'"
+                              effect="plain"
+                              round
+                              class="case-count-pill"
+                            >
+                              {{ group.cases.length }} 条用例
+                            </el-tag>
+                          </div>
+                        </div>
+                      </template>
+
+                      <!-- 测试点展开主体 -->
+                      <div class="point-body-content">
+                        <!-- 验证目标条 -->
+                        <div class="point-goal-callout">
+                          <el-icon class="goal-icon"><Aim /></el-icon>
+                          <div class="goal-text">
+                            <span class="goal-label">AIM // 验证目标：</span>
+                            {{ group.verification_goal || '针对该测试点开展验证' }}
+                          </div>
+                        </div>
+
+                        <!-- 绑定引用 Chips -->
+                        <div v-if="group.citation_ids && group.citation_ids.length" class="point-citations-row">
+                          <span class="citations-label"><el-icon><Link /></el-icon> 关联证据：</span>
+                          <el-tag
+                            v-for="cid in group.citation_ids"
+                            :key="cid"
+                            size="small"
+                            type="info"
+                            class="citation-chip"
+                          >
+                            #{{ cid }} {{ getCitationTitle(cid) }}
+                          </el-tag>
+                        </div>
+
+                        <!-- 嵌套衍生测试用例列表 -->
+                        <div v-if="group.cases && group.cases.length" class="cases-tree-list">
+                          <div
+                            v-for="c in group.cases"
+                            :key="c.case_key"
+                            class="case-card-unit"
+                          >
+                            <div class="case-card-header">
+                              <div class="case-title-left">
+                                <span class="case-badge-key">{{ c.case_key }}</span>
+                                <span class="case-main-title">{{ c.title }}</span>
+                                <el-tag v-if="c.type" size="small" type="primary" effect="plain" class="case-type-tag">
+                                  {{ c.type }}
+                                </el-tag>
+                                <el-tag size="small" :type="priorityTagType(c.priority)" effect="light" class="case-priority-tag">
+                                  {{ c.priority }}
+                                </el-tag>
+                              </div>
+                              <div class="case-actions-right">
+                                <el-button
+                                  size="small"
+                                  link
+                                  type="primary"
+                                  class="copy-btn"
+                                  @click="copyCaseMarkdown(c.raw_md)"
+                                >
+                                  <el-icon><CopyDocument /></el-icon>
+                                  <span>复制用例</span>
+                                </el-button>
+                              </div>
+                            </div>
+
+                            <div class="case-card-body">
+                              <!-- 前置条件 -->
+                              <div v-if="c.preconditions" class="case-section-block">
+                                <div class="section-label">前置条件</div>
+                                <div class="section-text pre-box">{{ c.preconditions }}</div>
+                              </div>
+
+                              <!-- 测试数据 -->
+                              <div v-if="c.test_data" class="case-section-block">
+                                <div class="section-label">测试数据</div>
+                                <div class="section-text data-box">{{ c.test_data }}</div>
+                              </div>
+
+                              <!-- 测试步骤与预期 -->
+                              <div v-if="c.steps && c.steps.length" class="case-steps-flow">
+                                <div class="section-label">测试步骤与断言</div>
+                                <div class="steps-table-list">
+                                  <div
+                                    v-for="step in c.steps"
+                                    :key="step.step_no"
+                                    class="step-item-row"
+                                  >
+                                    <div class="step-num-col">
+                                      <span class="step-pill">{{ step.step_no }}</span>
+                                    </div>
+                                    <div class="step-content-col">
+                                      <div class="step-action-desc">{{ step.action }}</div>
+                                      <div v-if="step.expected" class="step-expected-card">
+                                        <span class="expected-check-icon">✓</span>
+                                        <span class="expected-text-body">{{ step.expected }}</span>
+                                      </div>
+                                    </div>
+                                  </div>
+                                </div>
+                              </div>
+
+                              <!-- 待定事项 -->
+                              <div v-if="c.pending_items && c.pending_items.length" class="case-pending-block">
+                                <div class="pending-head">
+                                  <el-icon><Warning /></el-icon> 待定事项
+                                </div>
+                                <ul class="pending-list">
+                                  <li v-for="(pItem, pIdx) in c.pending_items" :key="pIdx">{{ pItem }}</li>
+                                </ul>
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                        <el-empty
+                          v-else
+                          description="该测试点尚未生成衍生测试用例"
+                          :image-size="48"
+                          class="empty-cases-placeholder"
+                        />
+                      </div>
+                    </el-collapse-item>
+                  </el-collapse>
+                </template>
+                <div v-else class="structured-fallback">
+                  <el-empty description="暂无结构化测试点关联数据，建议切换至 Markdown 视图查看" :image-size="64" />
+                </div>
+              </div>
+
+              <!-- 视图 2：完整 Markdown 视图 -->
+              <div v-else class="draft-scroll markdown-draft-view" :style="draftScrollStyle">
                 <MarkdownView :content="d.content_md" />
               </div>
             </el-tab-pane>
@@ -1172,7 +1564,7 @@ onUnmounted(() => {
         </el-card>
       </el-col>
 
-      <el-col :xs="24" :lg="10">
+      <el-col :xs="24" :md="10" :lg="10" class="right-main-col">
         <el-card shadow="never" class="block">
           <template #header>时间线</template>
           <TaskTimeline :events="events" />
@@ -1270,6 +1662,11 @@ onUnmounted(() => {
   font-size: 14px;
 }
 
+.task-spec-id {
+  font-family: var(--cg-font-mono);
+  letter-spacing: -0.02em;
+}
+
 .action-bar {
   display: flex;
   flex-wrap: wrap;
@@ -1278,11 +1675,7 @@ onUnmounted(() => {
   padding: 12px 14px;
   border-radius: var(--cg-radius);
   border: 1px solid var(--cg-border);
-  background: linear-gradient(
-    135deg,
-    rgba(var(--cg-primary-rgb), 0.06),
-    rgba(var(--cg-primary-2-rgb), 0.05)
-  );
+  background: var(--cg-surface-muted);
 }
 
 .main-grid {
@@ -1296,15 +1689,29 @@ onUnmounted(() => {
 
 .draft-scroll {
   min-height: 0;
-  max-height: clamp(320px, calc(100vh - 360px), 760px);
   overflow-y: auto;
+  overflow-x: hidden;
+  padding-right: 6px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--cg-border-strong, #cbd5e1) transparent;
+  box-sizing: border-box;
 }
 
-@media (max-width: 900px) {
-  .draft-scroll {
-    max-height: none;
-    overflow: visible;
-  }
+.draft-scroll::-webkit-scrollbar {
+  width: 6px;
+}
+
+.draft-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.draft-scroll::-webkit-scrollbar-thumb {
+  background-color: var(--cg-border-strong, #cbd5e1);
+  border-radius: 4px;
+}
+
+.draft-scroll::-webkit-scrollbar-thumb:hover {
+  background-color: var(--cg-text-muted, #71717a);
 }
 
 .checkpoint-list {
@@ -1448,5 +1855,456 @@ onUnmounted(() => {
 .apply-mode .label {
   margin-bottom: 6px;
   font-weight: 600;
+}
+
+/* ==================== 测试点关联视图与草稿卡片样式 ==================== */
+.draft-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.header-title-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.main-title {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--cg-text-primary, #0f172a);
+}
+
+.draft-count-tag {
+  font-size: 12px;
+  color: var(--cg-text-secondary, #64748b);
+  background: var(--cg-surface-muted, #f1f5f9);
+  padding: 2px 8px;
+  border-radius: 12px;
+}
+
+.view-mode-toggle :deep(.el-radio-button__inner) {
+  font-weight: 500;
+  padding: 6px 14px;
+}
+
+.draft-tabs {
+  margin-top: -8px;
+}
+
+.draft-meta {
+  display: flex;
+  align-items: center;
+  margin-bottom: 12px;
+  font-size: 12px;
+  color: var(--cg-text-secondary, #64748b);
+}
+
+.meta-time {
+  font-family: ui-monospace, SFMono-Regular, monospace;
+}
+
+/* 测试点折叠卡片树 */
+.point-collapse-tree {
+  border: none;
+  --el-collapse-header-height: auto;
+}
+
+.point-collapse-item {
+  border: 1px solid var(--cg-border, #e2e8f0) !important;
+  border-radius: 8px !important;
+  margin-bottom: 12px;
+  overflow: hidden;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.02);
+  transition: all 0.2s ease-in-out;
+}
+
+.point-collapse-item:hover {
+  border-color: #cbd5e1 !important;
+  box-shadow: 0 3px 8px rgba(0, 0, 0, 0.04);
+}
+
+.point-collapse-item :deep(.el-collapse-item__header) {
+  padding: 12px 16px;
+  background: #f8fafc;
+  border-bottom: 1px solid transparent;
+  line-height: normal;
+}
+
+.point-collapse-item.is-active :deep(.el-collapse-item__header) {
+  border-bottom-color: var(--cg-border, #e2e8f0);
+}
+
+.point-collapse-item :deep(.el-collapse-item__content) {
+  padding: 16px;
+  background: #ffffff;
+}
+
+.point-header-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  width: 100%;
+  padding-right: 12px;
+  gap: 12px;
+}
+
+.point-header-left {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.dimension-tag {
+  font-weight: 500;
+  border-radius: 4px;
+}
+
+.priority-pill {
+  font-family: var(--cg-font-mono);
+  font-weight: 700;
+  border-radius: 4px;
+  padding: 0 6px;
+}
+
+.priority-pill.el-tag--danger {
+  background: #ffe4e6 !important;
+  color: #e11d48 !important;
+  border: 1px solid #fecdd3 !important;
+}
+
+.priority-pill.el-tag--warning {
+  background: #fef3c7 !important;
+  color: #b45309 !important;
+  border: 1px solid #fde68a !important;
+}
+
+.priority-pill.el-tag--info {
+  background: #f4f4f5 !important;
+  color: #52525b !important;
+  border: 1px solid #e4e4e7 !important;
+}
+
+.point-stable-key {
+  font-family: var(--cg-font-mono);
+  font-weight: 700;
+  font-size: 12px;
+  color: #ffffff;
+  background: #18181b;
+  padding: 2px 8px;
+  border-radius: 4px;
+  letter-spacing: 0.5px;
+}
+
+.point-title-text {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--cg-text-primary, #0f172a);
+}
+
+.case-count-pill {
+  font-weight: 600;
+  font-size: 12px;
+}
+
+/* 验证目标 Callout */
+.point-goal-callout {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: #f0fdf4;
+  border-left: 3px solid #10b981;
+  border-radius: 6px;
+  padding: 8px 12px;
+  margin-bottom: 12px;
+  font-size: 13px;
+  color: #065f46;
+}
+
+.goal-icon {
+  font-size: 16px;
+  color: #10b981;
+  flex-shrink: 0;
+}
+
+.goal-label {
+  font-family: var(--cg-font-mono);
+  font-weight: 700;
+  color: #047857;
+}
+
+/* 关联证据 Row */
+.point-citations-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 14px;
+  font-size: 12px;
+  color: var(--cg-text-secondary, #64748b);
+}
+
+.citations-label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-weight: 600;
+}
+
+.citation-chip {
+  font-size: 12px;
+  font-family: var(--cg-font-mono);
+  background: #f4f4f5 !important;
+  border: 1px solid #e4e4e7 !important;
+  color: #27272a !important;
+}
+
+/* 衍生用例卡片 */
+.cases-tree-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.case-card-unit {
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  background: #ffffff;
+  padding: 14px 16px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.02);
+  transition: all 0.2s ease;
+}
+
+.case-card-unit:hover {
+  border-color: #cbd5e1;
+  box-shadow: 0 4px 10px rgba(0, 0, 0, 0.04);
+}
+
+.case-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding-bottom: 10px;
+  border-bottom: 1px dashed #e2e8f0;
+  margin-bottom: 12px;
+}
+
+.case-title-left {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.case-badge-key {
+  font-family: var(--cg-font-mono);
+  font-weight: 700;
+  font-size: 12px;
+  color: #18181b;
+  background: #f4f4f5;
+  border: 1px solid #e4e4e7;
+  padding: 2px 7px;
+  border-radius: 4px;
+}
+
+.case-priority-tag.el-tag--danger {
+  background: #ffe4e6 !important;
+  color: #e11d48 !important;
+  border: 1px solid #fecdd3 !important;
+}
+
+.case-priority-tag.el-tag--warning {
+  background: #fef3c7 !important;
+  color: #b45309 !important;
+  border: 1px solid #fde68a !important;
+}
+
+.case-priority-tag.el-tag--info {
+  background: #f4f4f5 !important;
+  color: #52525b !important;
+  border: 1px solid #e4e4e7 !important;
+}
+
+.case-main-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: #1e293b;
+}
+
+.copy-btn {
+  font-size: 12px;
+  font-weight: 500;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  border: 1px solid #e4e4e7;
+  border-radius: 4px;
+  color: #52525b;
+  background: #ffffff;
+  transition: all 0.15s ease;
+}
+
+.copy-btn:hover {
+  border-color: #10b981;
+  color: #10b981;
+  background: #ecfdf5;
+}
+
+.case-card-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.case-section-block {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.section-label {
+  font-size: 12px;
+  font-weight: 700;
+  color: #64748b;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.pre-box, .data-box {
+  background: #f8fafc;
+  border: 1px solid #f1f5f9;
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-size: 13px;
+  color: #334155;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+/* 测试步骤与断言 */
+.case-steps-flow {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.steps-table-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 2px;
+}
+
+.step-item-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 6px 0;
+}
+
+.step-num-col {
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.step-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: #18181b;
+  color: #ffffff;
+  font-family: var(--cg-font-mono);
+  font-size: 12px;
+  font-weight: 700;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12);
+}
+
+.step-content-col {
+  flex: 1;
+  min-width: 0;
+}
+
+.step-action-desc {
+  font-size: 13px;
+  line-height: 1.5;
+  color: #1e293b;
+  font-weight: 500;
+}
+
+.step-expected-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  background: #f0fdf4;
+  border: 1px solid #bbf7d0;
+  border-radius: 6px;
+  padding: 6px 10px;
+  margin-top: 6px;
+  color: #166534;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.expected-check-icon {
+  font-weight: bold;
+  color: #10b981;
+  flex-shrink: 0;
+}
+
+.expected-text-body {
+  word-break: break-word;
+}
+
+/* 待定事项 */
+.case-pending-block {
+  background: #fffbeb;
+  border: 1px solid #fde68a;
+  border-radius: 6px;
+  padding: 8px 12px;
+  color: #92400e;
+  font-size: 12px;
+}
+
+.pending-head {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-weight: 700;
+  margin-bottom: 4px;
+}
+
+.pending-list {
+  margin: 0;
+  padding-left: 18px;
+}
+
+/* 实时生成预览增强 */
+.live-progress-container {
+  margin-bottom: 12px;
+}
+
+.head-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.progress-pill {
+  font-size: 12px;
+  font-weight: 600;
+  background: #fef3c7;
+  color: #b45309;
+  padding: 2px 8px;
+  border-radius: 10px;
 }
 </style>

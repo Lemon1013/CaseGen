@@ -3,7 +3,12 @@ import json
 import httpx
 import pytest
 
-from app.services.llm import LLMError, build_chat_completions_url, chat_completion
+from app.services.llm import (
+    LLMError,
+    build_chat_completions_url,
+    build_responses_url,
+    chat_completion,
+)
 
 
 def test_build_chat_url_adds_v1_when_missing():
@@ -365,3 +370,78 @@ def test_chat_completion_502_exhausted_retries():
             max_retries=2,
             backoff_sec=0,
         )
+
+
+def test_build_responses_url():
+    assert build_responses_url("https://api.openai.com") == "https://api.openai.com/v1/responses"
+    assert build_responses_url("https://api.openai.com/v1") == "https://api.openai.com/v1/responses"
+    assert build_responses_url("https://api.openai.com/v1/responses") == "https://api.openai.com/v1/responses"
+    assert build_responses_url("https://custom.gateway/responses") == "https://custom.gateway/responses"
+
+
+def test_responses_api_non_streaming_success():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert str(request.url) == "https://api.openai.com/v1/responses"
+        payload = json.loads(request.content)
+        assert payload["model"] == "gpt-4o"
+        assert payload["instructions"] == "You are a test assistant."
+        assert payload["input"] == [{"role": "user", "content": "hello responses"}]
+        assert payload["max_output_tokens"] == 100
+        return httpx.Response(
+            200,
+            json={
+                "output_text": "Response from responses API",
+                "usage": {"total_tokens": 42},
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    content, usage = chat_completion(
+        base_url="https://api.openai.com/v1",
+        api_key="sk-test",
+        model="gpt-4o",
+        protocol="responses",
+        messages=[
+            {"role": "system", "content": "You are a test assistant."},
+            {"role": "user", "content": "hello responses"},
+        ],
+        max_tokens=100,
+        transport=transport,
+    )
+    assert content == "Response from responses API"
+    assert usage["total_tokens"] == 42
+
+
+def test_responses_api_streaming_success():
+    deltas: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert str(request.url) == "https://api.openai.com/v1/responses"
+        payload = json.loads(request.content)
+        assert payload["stream"] is True
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=(
+                b'data: {"type": "response.output_text.delta", "delta": "Chunk 1 "}\n\n'
+                b'data: {"type": "response.output_text.delta", "delta": "Chunk 2"}\n\n'
+                b'data: {"type": "response.completed", "response": {"usage": {"total_tokens": 15}}}\n\n'
+            ),
+        )
+
+    content, usage = chat_completion(
+        base_url="https://api.openai.com",
+        api_key="sk-test",
+        model="gpt-4o",
+        protocol="responses",
+        messages=[{"role": "user", "content": "stream please"}],
+        transport=httpx.MockTransport(handler),
+        stream=True,
+        on_delta=deltas.append,
+    )
+    assert content == "Chunk 1 Chunk 2"
+    assert usage["total_tokens"] == 15
+    assert deltas == ["Chunk 1 ", "Chunk 2"]
+

@@ -738,14 +738,15 @@ watch(
   transition: border-color 0.15s, box-shadow 0.15s;
 }
 
-.review-item:hover,
-.review-item.active {
+.review-item:hover {
   border-color: var(--cg-border-strong);
   box-shadow: var(--cg-shadow);
 }
 
 .review-item.active {
-  background: linear-gradient(90deg, rgba(var(--cg-primary-rgb), 0.07), var(--cg-surface) 55%);
+  border-color: #10b981;
+  box-shadow: 0 0 0 1px #10b981, var(--cg-shadow);
+  background: #ecfdf5;
 }
 
 .review-item-title,
@@ -891,9 +892,9 @@ watch(
   overflow: auto;
   border: 1px solid var(--cg-border);
   border-radius: var(--cg-radius-sm);
-  background: #0b1220;
-  color: #e5e7eb;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  background: #09090b;
+  color: #f4f4f5;
+  font-family: var(--cg-font-mono);
   font-size: 12px;
   line-height: 1.65;
   white-space: pre-wrap;
@@ -901,7 +902,7 @@ watch(
 }
 
 .diff-block {
-  color: #dbeafe;
+  color: #a7f3d0;
 }
 
 .revision-diff-meta {

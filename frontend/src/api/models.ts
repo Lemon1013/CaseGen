@@ -6,6 +6,7 @@ export interface ModelConfig {
   base_url: string
   api_key: string
   model_name: string
+  protocol: 'chat_completions' | 'responses'
   is_default: boolean
   created_at: string
   updated_at: string
@@ -16,6 +17,7 @@ export interface ModelCreate {
   base_url: string
   api_key: string
   model_name: string
+  protocol?: 'chat_completions' | 'responses'
   is_default?: boolean
 }
 
@@ -24,6 +26,7 @@ export interface ModelUpdate {
   base_url?: string
   api_key?: string
   model_name?: string
+  protocol?: 'chat_completions' | 'responses'
   is_default?: boolean
 }
 
