@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   Collection,
@@ -128,6 +128,21 @@ async function loadDefaultModel() {
     defaultModel.value = null
   }
 }
+
+// The chip must not go stale after the user edits model configuration in
+// /models: reload it on every route change...
+watch(
+  () => route.path,
+  () => {
+    void loadDefaultModel()
+  },
+)
+
+// ...and on a 60s fallback timer for long-lived views that never navigate.
+const modelTimer = window.setInterval(loadDefaultModel, 60_000)
+onUnmounted(() => {
+  window.clearInterval(modelTimer)
+})
 
 watch(
   () => route.query.project_id,

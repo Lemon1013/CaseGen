@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useProjectStore } from '../projectStore'
 import { ElMessage, ElMessageBox } from 'element-plus'
@@ -25,6 +25,7 @@ import {
   shouldPollTaskStatus,
   statusLabel,
   statusTagType,
+  stopTask,
   taskStreamUrl,
   type ApplyPromptMode,
   type CaseDraft,
@@ -67,6 +68,13 @@ const supplementalText = ref('')
 const knowledgeChoices = ref<Record<string, number>>({})
 const knowledgeScopes = ref<Record<string, boolean>>({})
 const confirmingCheckpoint = ref(false)
+const expandedCitations = reactive(new Set<number>())
+
+function toggleCitation(id: number) {
+  if (expandedCitations.has(id)) expandedCitations.delete(id)
+  else expandedCitations.add(id)
+}
+
 const testPointCheckpoint = ref<TestPointCheckpoint | null>(null)
 const testPoints = ref<TestPointItem[]>([])
 const confirmingTestPoints = ref(false)
@@ -142,6 +150,16 @@ function priorityTagType(priority?: string): 'danger' | 'warning' | 'primary' | 
   if (p === 'P1') return 'warning'
   if (p === 'P2') return 'info'
   return 'info'
+}
+
+const dimensionLabelMap = new Map<string, string>([
+  ['positive', '正向'], ['negative', '反向'], ['boundary', '边界'],
+  ['permission', '权限'], ['security', '安全'], ['compatibility', '兼容性'],
+  ['performance', '性能'], ['recovery', '恢复'], ['usability', '可用性'],
+])
+
+function dimensionLabel(value: string): string {
+  return dimensionLabelMap.get(value) || value
 }
 
 function getCitationTitle(id: number): string {
@@ -892,6 +910,31 @@ function onGenerate() {
   return runAction('生成', generateTask)
 }
 
+async function onStopGeneration() {
+  if (!task.value || task.value.status !== 'generating') return
+  try {
+    await ElMessageBox.confirm(
+      '停止将中止进行中的生成，已产生的部分内容会被丢弃且不可恢复。确定停止吗？',
+      '停止生成确认',
+      { type: 'warning', confirmButtonText: '停止生成', cancelButtonText: '继续生成' },
+    )
+  } catch {
+    return
+  }
+  acting.value = true
+  try {
+    const updated = await stopTask(task.value.id, projectId.value)
+    applyTaskUpdate(updated)
+    ElMessage.success('已停止生成')
+    await refreshLight(true)
+  } catch (e) {
+    ElMessage.error(`停止生成失败：${(e as Error).message}`)
+    await refreshLight(true)
+  } finally {
+    acting.value = false
+  }
+}
+
 function onReview() {
   return runAction('评审', reviewTask)
 }
@@ -1154,6 +1197,13 @@ onUnmounted(() => {
         <p class="title-line">{{ task?.title || '（无标题）' }}</p>
       </div>
       <div class="page-actions">
+        <el-button
+          v-if="task?.status === 'generating'"
+          type="danger"
+          plain
+          :loading="acting"
+          @click="onStopGeneration"
+        >停止生成</el-button>
         <el-button @click="refreshLight()">刷新</el-button>
       </div>
     </div>
@@ -1213,7 +1263,16 @@ onUnmounted(() => {
             {{ item.title }}
           </span>
           <span class="checkpoint-meta">{{ item.citation_type === 'external' ? '外部知识' : item.citation_type }} · score {{ item.score.toFixed(3) }} · {{ item.path }}</span>
-          <span class="checkpoint-snippet">{{ item.snippet || item.content_excerpt }}</span>
+          <span class="checkpoint-snippet" :class="{ expanded: expandedCitations.has(item.id) }">{{ item.snippet || item.content_excerpt }}</span>
+          <el-button
+            v-if="(item.snippet || item.content_excerpt || '').length >= 120"
+            class="checkpoint-expand"
+            link
+            type="primary"
+            @click.stop="toggleCitation(item.id)"
+          >
+            {{ expandedCitations.has(item.id) ? '收起' : '展开全文' }}
+          </el-button>
         </el-checkbox>
       </el-checkbox-group>
       <el-input v-model="supplementalText" type="textarea" :rows="4" maxlength="10000" show-word-limit placeholder="补充上下文（可选）" />
@@ -1226,15 +1285,17 @@ onUnmounted(() => {
       </template>
       <p class="meta">可编辑标题、验证目标、维度、优先级、选择状态和引用；删除或排除不需要的测试点。</p>
       <div v-for="(point, index) in testPoints" :key="point.id" class="test-point-editor">
-        <div class="test-point-editor-head"><strong>{{ point.stable_key }}</strong><el-button link type="danger" @click="removeTestPoint(index)">删除</el-button></div>
-        <el-input v-model="point.title" placeholder="测试点标题" class="point-title-input" />
-        <el-input v-model="point.verification_goal" type="textarea" :rows="2" placeholder="验证目标" />
-        <div class="point-controls">
-          <el-select v-model="point.dimension" style="width: 150px"><el-option v-for="dimension in (task?.test_dimensions || [])" :key="dimension" :label="dimension" :value="dimension" /></el-select>
-          <el-select v-model="point.priority" style="width: 110px"><el-option label="P0" value="P0" /><el-option label="P1" value="P1" /><el-option label="P2" value="P2" /></el-select>
+        <div class="test-point-editor-head">
+          <strong class="point-key">{{ point.stable_key }}</strong>
+          <el-select v-model="point.dimension" style="width: 130px"><el-option v-for="dimension in (task?.test_dimensions || [])" :key="dimension" :label="dimensionLabel(dimension)" :value="dimension" /></el-select>
+          <el-select v-model="point.priority" style="width: 96px"><el-option label="P0" value="P0" /><el-option label="P1" value="P1" /><el-option label="P2" value="P2" /></el-select>
           <el-checkbox v-model="point.is_selected">选中</el-checkbox>
           <el-checkbox v-model="point.is_excluded">排除</el-checkbox>
+          <span class="point-head-spacer" />
+          <el-button link type="danger" @click="removeTestPoint(index)">删除</el-button>
         </div>
+        <el-input v-model="point.title" placeholder="测试点标题" class="point-title-input" />
+        <el-input v-model="point.verification_goal" type="textarea" :rows="2" placeholder="验证目标" />
       </div>
       <div class="point-actions"><el-button @click="addTestPoint">新增测试点</el-button><el-button :loading="confirmingTestPoints" :disabled="task?.status !== 'awaiting_test_point_confirmation'" @click="saveTestPoints">保存编辑</el-button><el-button type="primary" :loading="confirmingTestPoints" :disabled="task?.status !== 'awaiting_test_point_confirmation'" @click="confirmTestPointStage">保存并确认测试点</el-button></div>
     </el-card>
@@ -1768,7 +1829,34 @@ onUnmounted(() => {
 
 .checkpoint-title { font-weight: 700; }
 .checkpoint-meta { color: var(--cg-text-muted); font-size: 12px; }
-.checkpoint-snippet { color: var(--cg-text-secondary); font-size: 12px; margin-top: 4px; }
+.checkpoint-snippet {
+  color: var(--cg-text-secondary);
+  font-size: 12px;
+  margin-top: 4px;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  line-height: 1.6;
+  word-break: break-word;
+}
+
+.checkpoint-snippet.expanded {
+  display: -webkit-box;
+  -webkit-line-clamp: unset;
+  max-width: 720px;
+  line-height: 1.7;
+  word-break: break-word;
+}
+
+.checkpoint-expand {
+  align-self: flex-start;
+  margin-top: 2px;
+  height: auto;
+  padding: 0;
+  font-size: 12px;
+  line-height: 1.5;
+}
 
 @media (max-width: 900px) {
   .checkpoint-list { max-height: none; overflow: visible; }
@@ -2307,4 +2395,34 @@ onUnmounted(() => {
   padding: 2px 8px;
   border-radius: 10px;
 }
+
+/* 测试点确认编辑器 */
+.test-point-editor {
+  border: 1px solid var(--cg-border);
+  border-radius: var(--cg-radius-sm, 6px);
+  padding: 12px;
+  background: var(--cg-bg-card, #fff);
+  margin-bottom: 10px;
+}
+
+.test-point-editor-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.point-key {
+  font-family: var(--cg-font-mono, monospace);
+}
+
+.point-head-spacer {
+  flex: 1;
+}
+
+.point-title-input {
+  margin-bottom: 8px;
+}
+
 </style>

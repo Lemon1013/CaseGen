@@ -298,6 +298,10 @@ export function updateTaskModel(id: number, modelId: number | null) {
   })
 }
 
+export function stopTask(id: number, projectId?: number | null) {
+  return api<TaskItem>(`/api/tasks/${id}/stop${_projectQuery(projectId)}`, { method: 'POST' })
+}
+
 export function createTask(body: TaskCreate) {
   return api<TaskItem>('/api/tasks', {
     method: 'POST',
