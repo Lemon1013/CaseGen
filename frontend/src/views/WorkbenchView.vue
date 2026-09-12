@@ -41,16 +41,16 @@ const granularityOptions: Array<{
   {
     value: 'compact',
     label: '精简',
-    badge: '[ 2-3 / PT ]',
-    amount: '2–3 条/功能点',
+    badge: '[ 3-5 / TP ]',
+    amount: '拆 3–5 个测试点 · 每点 1 条用例',
     coverage: '只展开最高优先级流程和阻断性异常',
     suitable: '适合快速评审、需求早期',
   },
   {
     value: 'standard',
     label: '标准',
-    badge: '[ 5-8 / PT ]',
-    amount: '5–8 条/功能点',
+    badge: '[ 5-8 / TP ]',
+    amount: '拆 5–8 个测试点 · 每点 2–3 条用例',
     coverage: '主要流程、常见异常和关键边界',
     suitable: '适合日常需求、常规回归',
     recommended: true,
@@ -58,8 +58,8 @@ const granularityOptions: Array<{
   {
     value: 'detailed',
     label: '全面',
-    badge: '[ 10+ / PT ]',
-    amount: '10+ 条/功能点',
+    badge: '[ 8-12+ / TP ]',
+    amount: '拆 8–12+ 个测试点 · 每点 3–5 条用例',
     coverage: '状态组合、异常链路和深层边界',
     suitable: '适合核心链路、高风险发布',
   },
@@ -305,15 +305,15 @@ small,
 
 .reference-list {
   display: grid;
-  gap: 8px;
-  max-height: 260px;
+  gap: 10px;
+  max-height: 300px;
   overflow: auto;
   margin-top: 12px;
 }
 
 .reference-row {
   height: auto;
-  padding: 8px;
+  padding: 10px 12px;
   border: 1px solid var(--cg-border);
   border-radius: var(--cg-radius-sm);
   white-space: normal;
@@ -322,7 +322,16 @@ small,
 .reference-row :deep(.el-checkbox__label) {
   display: flex;
   flex-direction: column;
+  gap: 4px;
   white-space: normal;
+}
+
+.reference-row :deep(.el-checkbox__label span) {
+  line-height: 1.5;
+}
+
+.reference-row :deep(.el-checkbox__label small) {
+  line-height: 1.4;
 }
 
 .reference-total {
@@ -421,6 +430,7 @@ small,
   font-size: 13px;
   font-weight: 700;
   font-family: var(--cg-font-mono);
+  line-height: 1.5;
 }
 
 .granularity-coverage,
