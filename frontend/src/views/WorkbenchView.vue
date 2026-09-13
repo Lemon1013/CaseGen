@@ -1,13 +1,13 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { listModels, type ModelConfig } from '../api/models'
 import { listPrompts, type PromptTemplate } from '../api/prompts'
 import { createTask, generateTask, optimizeRequirement } from '../api/tasks'
 import { listCases, type TestCaseItem } from '../api/cases'
 import { listWikiSpaces, type WikiSpace } from '../api/wikiSpaces'
-import { listRequirements, type RequirementItem } from '../api/requirements'
+import { importRequirementDoc, listRequirements, type RequirementItem } from '../api/requirements'
 import { chooseSpace, rememberAndRoute, spaceIdFromQuery } from '../utils/wikiSpace'
 
 const router = useRouter()
@@ -77,7 +77,12 @@ const form = reactive({
   wiki_space_id: null as number | null, requirement_id: null as number | null,
   generation_granularity: 'standard' as GenerationGranularity,
   test_dimensions: ['positive', 'negative', 'boundary'] as string[], reference_text: '',
+  source_filename: null as string | null,
 })
+const importingDoc = ref(false)
+const docDragOver = ref(false)
+const docFileInput = ref<HTMLInputElement | null>(null)
+const MAX_IMPORT_CHARS = 20000
 const selectedCases = computed(() => referenceCases.value.filter((row) => selectedReferenceIds.value.includes(row.id)))
 const referenceChars = computed(() => selectedCases.value.reduce((n, row) => n + row.content_md.length, 0) + form.reference_text.length)
 const selectedGranularity = computed(() => granularityOptions.find((item) => item.value === form.generation_granularity) || granularityOptions[1])
@@ -117,6 +122,55 @@ function selectRequirement(id: number | null) {
   form.title = row.title; form.description = row.description; form.focusText = row.focus_tags.join(', ')
 }
 
+function pickImportFile() { docFileInput.value?.click() }
+
+function onImportFileChange(event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = ''
+  if (file) void importDoc(file)
+}
+
+function onDropImport(event: DragEvent) {
+  docDragOver.value = false
+  const file = event.dataTransfer?.files?.[0]
+  if (file) void importDoc(file)
+}
+
+async function importDoc(file: File) {
+  importingDoc.value = true
+  try {
+    const result = await importRequirementDoc(file)
+    let text = result.text
+    if (text.length > MAX_IMPORT_CHARS) {
+      text = text.slice(0, MAX_IMPORT_CHARS)
+      ElMessage.warning(`已截断至 20000 字，原文共 ${result.char_count} 字，请人工补齐关键内容`)
+    }
+    if (!form.description.trim()) {
+      form.description = text
+    } else {
+      let merged: string | null = text
+      try {
+        await ElMessageBox.confirm('当前需求描述已有内容：「覆盖」替换原文，「追加」拼接在原文之后。', '描述非空', {
+          confirmButtonText: '覆盖',
+          cancelButtonText: '追加',
+          distinguishCancelAndClose: true,
+          type: 'warning',
+        })
+      } catch (action) {
+        if (action === 'cancel') merged = `${form.description}\n\n${text}`.slice(0, MAX_IMPORT_CHARS)
+        else merged = null
+      }
+      if (merged === null) return
+      form.description = merged
+    }
+    if (!form.title.trim()) form.title = result.title.slice(0, 120)
+    form.source_filename = file.name
+    ElMessage.success(`已导入 ${result.char_count} 字，请检查并手动编辑`)
+  } catch (e) { ElMessage.error(`导入需求文档失败：${(e as Error).message}`) }
+  finally { importingDoc.value = false }
+}
+
 function changeSpace(id: number) {
   currentSpace.value = spaces.value.find((row) => row.id === id) || null
   form.wiki_space_id = currentSpace.value?.id ?? null
@@ -143,6 +197,8 @@ async function submit() {
   try {
     const task = await createTask({
       requirement_id: form.requirement_id, title: form.title.trim(), description: form.description.trim(),
+      // Imported source file only applies to a brand-new requirement.
+      source_filename: form.requirement_id ? null : (form.source_filename || null),
       focus_tags: tags(form.focusText), model_id: form.model_id, prompt_template_id: form.prompt_template_id,
       auto_review: form.auto_review, wiki_space_id: form.wiki_space_id, generation_granularity: form.generation_granularity,
       test_dimensions: form.test_dimensions, reference_case_ids: selectedReferenceIds.value, reference_text: form.reference_text.trim(),
@@ -179,7 +235,22 @@ onMounted(loadOptions)
           <el-form label-position="top" @submit.prevent>
             <el-form-item label="已有需求"><el-select v-model="form.requirement_id" clearable filterable style="width:100%" placeholder="可选" @change="selectRequirement"><el-option v-for="row in requirements" :key="row.id" :label="`#${row.id} · ${row.title}`" :value="row.id" /></el-select></el-form-item>
             <el-form-item label="标题" required><el-input v-model="form.title" maxlength="120" show-word-limit /></el-form-item>
-            <el-form-item label="需求描述" required><el-input v-model="form.description" type="textarea" :rows="8" maxlength="20000" show-word-limit /></el-form-item>
+            <el-form-item label="需求描述" required>
+              <div class="description-field">
+                <div class="description-toolbar">
+                  <span class="hint">支持 .md / .txt / .pdf / .docx，≤ 20MB</span>
+                  <el-button size="small" plain :loading="importingDoc" @click="pickImportFile">📄 从文档导入</el-button>
+                </div>
+                <div class="description-dropzone" :class="{ 'drag-over': docDragOver }" @dragover.prevent="docDragOver = true" @dragleave.prevent="docDragOver = false" @drop.prevent="onDropImport">
+                  <el-input v-model="form.description" type="textarea" :rows="8" maxlength="20000" show-word-limit />
+                  <div v-if="form.source_filename" class="source-file-row">
+                    <span class="hint">来源文件：{{ form.source_filename }}</span>
+                    <el-button link size="small" @click="form.source_filename = null">清除</el-button>
+                  </div>
+                </div>
+              </div>
+              <input ref="docFileInput" class="import-file-input" type="file" accept=".md,.txt,.pdf,.docx" @change="onImportFileChange" />
+            </el-form-item>
             <el-form-item label="关注标签"><el-input v-model="form.focusText" placeholder="多个标签用逗号或空格分隔" /></el-form-item>
             <el-button type="primary" plain :loading="optimizing" @click="optimize">✦ 智能需求分析</el-button><span class="hint"> 返回结果可继续手动编辑，提交时才持久化。</span>
           </el-form>
@@ -292,6 +363,42 @@ small,
 .questions ul {
   margin: 0;
   padding-left: 18px;
+}
+
+.description-field {
+  width: 100%;
+}
+
+.description-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.description-dropzone {
+  width: 100%;
+  border: 1px dashed transparent;
+  border-radius: var(--cg-radius-sm);
+  transition: border-color 0.15s ease, background-color 0.15s ease;
+}
+
+.description-dropzone.drag-over {
+  border-color: #10b981;
+  background: #ecfdf5;
+}
+
+.source-file-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.import-file-input {
+  display: none;
 }
 
 .reference-search {

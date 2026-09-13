@@ -474,6 +474,7 @@ def create_task(
             title=(body.title or "").strip(),
             description=(body.description or "").strip(),
             focus_tags_json=json.dumps(body.focus_tags or [], ensure_ascii=False),
+            source_filename=body.source_filename or None,
         )
         session.add(requirement)
         session.commit()

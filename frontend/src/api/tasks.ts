@@ -53,6 +53,7 @@ export interface TaskCreate {
   requirement_id?: number | null
   title: string
   description: string
+  source_filename?: string | null
   focus_tags?: string[]
   model_id?: number | null
   prompt_template_id?: number | null
