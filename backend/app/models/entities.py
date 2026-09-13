@@ -299,6 +299,10 @@ class Requirement(SQLModel, table=True):
     title: str
     description: str
     focus_tags_json: str = "[]"
+    # Original requirement-document filename when the requirement was filled
+    # from an uploaded file.  The raw file is archived under raw/sources/, but
+    # it is not a Document row and never enters Wiki ingestion.
+    source_filename: Optional[str] = None
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow, sa_column_kwargs={"onupdate": _utcnow})
 

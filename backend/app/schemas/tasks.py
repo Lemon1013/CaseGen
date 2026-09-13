@@ -11,6 +11,9 @@ class TaskCreate(BaseModel):
     requirement_id: Optional[int] = Field(default=None, ge=1)
     title: Optional[str] = Field(default=None, max_length=120)
     description: Optional[str] = Field(default=None, max_length=20000)
+    # Original requirement-document filename for inline requirements created
+    # from an imported file; ignored when an existing requirement_id is used.
+    source_filename: Optional[str] = Field(default=None, max_length=255)
     # None means “not provided”; [] is an explicit request to clear tags on
     # an existing requirement.
     focus_tags: Optional[List[str]] = Field(default=None, max_length=30)

@@ -635,7 +635,7 @@ def _migrate_project_schema(engine, *, backfill: bool = False) -> None:
                 "canonical_topic": "VARCHAR",
                 "assertion_summary": "TEXT",
             },
-            "requirements": {"project_id": "INTEGER"},
+            "requirements": {"project_id": "INTEGER", "source_filename": "VARCHAR"},
             "generation_tasks": {"project_id": "INTEGER"},
         }
         for table, columns in additions.items():

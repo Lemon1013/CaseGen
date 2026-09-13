@@ -72,6 +72,18 @@ def _set_status(task: GenerationTask, new_status: str) -> None:
     task.updated_at = _utcnow()
 
 
+def _generation_stopped(session: Session, task: GenerationTask) -> bool:
+    """Re-read the durable row to observe a manual stop issued mid-generation.
+
+    ``POST /api/tasks/{id}/stop`` flips ``generating -> failed`` in its own
+    transaction while the worker is awaiting the LLM.  ``failed`` has no
+    outgoing edge to ``generated``, so a long-running worker must poll this
+    between LLM calls and bail out instead of overwriting the terminal state.
+    """
+    session.refresh(task)
+    return task.status != "generating"
+
+
 def _focus_tags(requirement: Requirement) -> list[str]:
     try:
         tags = json.loads(requirement.focus_tags_json or "[]")
@@ -2003,6 +2015,14 @@ def run_generate(
             seen_case_keys: set[str] = set()
             granularity = getattr(task, "generation_granularity", "standard") or "standard"
             for idx, pt in enumerate(confirmed_points, start=1):
+                # Cooperative exit: a manual stop flips the durable status while
+                # this loop is awaiting the LLM.  Discard the partial chunks and
+                # keep the failed state — never write a CaseDraft on top of it.
+                if _generation_stopped(session, task):
+                    point_chunks.clear()
+                    append_event(session, task.id, "generate", "检测到手动停止，中止后续生成")
+                    session.commit()
+                    return task
                 progress_msg = f"正在生成测试用例 [{idx}/{total_points}]: {pt.stable_key} · {pt.title}"
                 task_stream.status(
                     stream_task_id,
@@ -2038,6 +2058,18 @@ def run_generate(
                     point_chunks.append(normalized_chunk)
                     if idx < total_points:
                         task_stream.delta(stream_task_id, "\n\n")
+                    # Persist the per-point progress on the durable timeline (the
+                    # SSE preview alone disappears after the stream ends).  At
+                    # this point the session only holds the new event, so the
+                    # mid-loop commit mirrors the pipeline's existing
+                    # commit-per-stage pattern and cannot half-apply task state.
+                    append_event(
+                        session,
+                        task.id,
+                        "generate",
+                        f"测试点用例生成完成 [{idx}/{total_points}] {pt.stable_key} · {pt.title}",
+                    )
+                    session.commit()
 
             content = "\n\n".join(point_chunks)
         else:
@@ -2145,6 +2177,15 @@ def run_generate(
 
         if not content or not str(content).strip():
             raise LLMError("Empty LLM content")
+
+        # Final cooperative exit before persisting anything: the stop endpoint
+        # may have flipped the task to ``failed`` while the last LLM call was
+        # in flight.  The caller's ``_set_status(task, "generated")`` guard
+        # below stays as the last line of defence.
+        if _generation_stopped(session, task):
+            append_event(session, task.id, "generate", "检测到手动停止，中止后续生成")
+            session.commit()
+            return task
 
         version = _next_draft_version(session, task.id)
         draft = CaseDraft(

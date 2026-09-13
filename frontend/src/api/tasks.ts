@@ -53,6 +53,7 @@ export interface TaskCreate {
   requirement_id?: number | null
   title: string
   description: string
+  source_filename?: string | null
   focus_tags?: string[]
   model_id?: number | null
   prompt_template_id?: number | null
@@ -296,6 +297,10 @@ export function updateTaskModel(id: number, modelId: number | null) {
     method: 'PATCH',
     body: JSON.stringify({ model_id: modelId }),
   })
+}
+
+export function stopTask(id: number, projectId?: number | null) {
+  return api<TaskItem>(`/api/tasks/${id}/stop${_projectQuery(projectId)}`, { method: 'POST' })
 }
 
 export function createTask(body: TaskCreate) {

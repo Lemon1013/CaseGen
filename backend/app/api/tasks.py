@@ -474,6 +474,7 @@ def create_task(
             title=(body.title or "").strip(),
             description=(body.description or "").strip(),
             focus_tags_json=json.dumps(body.focus_tags or [], ensure_ascii=False),
+            source_filename=body.source_filename or None,
         )
         session.add(requirement)
         session.commit()
@@ -997,6 +998,55 @@ def _update_task_model_locked(
     )
     session.commit()
     session.refresh(task)
+    return to_task_out(session, task)
+
+
+@router.post("/{task_id}/stop", response_model=TaskOut)
+def stop_task(
+    task_id: int,
+    session: Session = Depends(get_session),
+) -> TaskOut:
+    """Manually stop a generating task and release its durable resume lease."""
+    with task_locks.hold(task_id):
+        session.expire_all()
+        return _stop_task_locked(task_id, session)
+
+
+def _stop_task_locked(task_id: int, session: Session) -> TaskOut:
+    task = session.get(GenerationTask, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if task.status != "generating":
+        raise HTTPException(status_code=409, detail="仅生成中的任务可以停止")
+
+    # ``failed`` has no outgoing edge to ``generated``: the still-running
+    # worker polls the row between LLM calls (see task_pipeline) and exits
+    # cooperatively instead of overwriting this terminal state.
+    task.status = transition(task.status, "failed")
+    task.error_message = "已手动停止生成"
+    task.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    session.add(task)
+    append_event(session, task.id, "generate", "用户手动停止生成")
+    checkpoint = session.exec(
+        select(TaskTestPointCheckpoint)
+        .where(TaskTestPointCheckpoint.task_id == task_id)
+        .where(TaskTestPointCheckpoint.status == "confirmed")
+        .order_by(col(TaskTestPointCheckpoint.attempt).desc())
+    ).first()
+    if checkpoint is not None:
+        # Release the lease: resume_status="stopped" is neither claimed|running
+        # (so recovery no longer treats it as a fresh claim) nor one of the
+        # reclaimable states (NULL/stale claim/completed), and the failed task
+        # is never selected by recover_generation_jobs anyway.  The token is
+        # kept for traceability; recovery would re-issue a fresh token first.
+        checkpoint.resume_status = "stopped"
+        checkpoint.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        session.add(checkpoint)
+    session.commit()
+    session.refresh(task)
+    # Publish post-commit so the SSE terminal event agrees with durable state
+    # (same ordering as _fail_task in the pipeline).
+    task_stream.fail(task_id, message="已手动停止生成")
     return to_task_out(session, task)
 
 
