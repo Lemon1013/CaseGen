@@ -652,10 +652,13 @@ def _migrate_project_schema(engine, *, backfill: bool = False) -> None:
         if not backfill:
             return
         spaces = conn.execute(
-            text("SELECT id, name, slug, description, status FROM wiki_spaces WHERE scope = 'project' OR scope IS NULL")
+            text("SELECT id, name, slug, description, status, project_id FROM wiki_spaces WHERE scope = 'project' OR scope IS NULL")
         ).fetchall()
         for space in spaces:
-            project_id = conn.execute(
+            owner = conn.execute(
+                text("SELECT id, slug FROM projects WHERE id = :id"), {"id": space.project_id}
+            ).first() if space.project_id is not None else None
+            project_id = owner.id if owner else conn.execute(
                 text("SELECT id FROM projects WHERE slug = :slug"), {"slug": space.slug}
             ).scalar()
             if project_id is None:
@@ -672,6 +675,80 @@ def _migrate_project_schema(engine, *, backfill: bool = False) -> None:
                 text("UPDATE wiki_spaces SET scope = 'project', project_id = :project_id WHERE id = :space_id"),
                 {"project_id": project_id, "space_id": space.id},
             )
+            conn.execute(
+                text("UPDATE projects SET default_wiki_space_id = COALESCE(default_wiki_space_id, :space_id) WHERE id = :project_id"),
+                {"project_id": project_id, "space_id": space.id},
+            )
+
+            # Repair only the exact duplicate produced by the old backfill:
+            # project `x-wiki` owns space `x-wiki`, while project `x` also
+            # points at that space as its default.
+            if not owner or owner.slug != space.slug:
+                continue
+            refs = conn.execute(
+                text("SELECT id, slug FROM projects WHERE default_wiki_space_id = :space_id ORDER BY id"),
+                {"space_id": space.id},
+            ).fetchall()
+            canonicals = [row for row in refs if row.id != owner.id and space.slug == f"{row.slug}-wiki"]
+            if len(refs) < 2 or not canonicals:
+                continue
+            if len(refs) != 2 or len(canonicals) != 1:
+                raise RuntimeError(f"ambiguous duplicate project for wiki space {space.id}")
+            canonical = canonicals[0]
+            other_spaces = conn.execute(
+                text("SELECT COUNT(*) FROM wiki_spaces WHERE scope = 'project' AND project_id = :project_id AND id != :space_id"),
+                {"project_id": owner.id, "space_id": space.id},
+            ).scalar_one()
+            if other_spaces:
+                raise RuntimeError(f"duplicate project {owner.id} owns additional wiki spaces")
+
+            duplicate_bindings = conn.execute(
+                text("SELECT id, wiki_space_id, priority, enabled FROM project_wiki_bindings WHERE project_id = :project_id"),
+                {"project_id": owner.id},
+            ).fetchall()
+            for binding in duplicate_bindings:
+                existing = conn.execute(
+                    text("SELECT id, priority, enabled FROM project_wiki_bindings WHERE project_id = :project_id AND wiki_space_id = :wiki_space_id"),
+                    {"project_id": canonical.id, "wiki_space_id": binding.wiki_space_id},
+                ).first()
+                if existing and (existing.priority != binding.priority or bool(existing.enabled) != bool(binding.enabled)):
+                    raise RuntimeError(f"conflicting shared wiki binding for project {canonical.id}")
+                if existing:
+                    conn.execute(text("DELETE FROM project_wiki_bindings WHERE id = :id"), {"id": binding.id})
+                else:
+                    conn.execute(text("UPDATE project_wiki_bindings SET project_id = :project_id WHERE id = :id"), {"project_id": canonical.id, "id": binding.id})
+
+            duplicate_decisions = conn.execute(
+                text("SELECT id, conflict_key, selected_page_id, selected_revision, decided_by, reason FROM project_knowledge_decisions WHERE project_id = :project_id"),
+                {"project_id": owner.id},
+            ).fetchall()
+            for decision in duplicate_decisions:
+                existing = conn.execute(
+                    text("SELECT id, selected_page_id, selected_revision, decided_by, reason FROM project_knowledge_decisions WHERE project_id = :project_id AND conflict_key = :conflict_key"),
+                    {"project_id": canonical.id, "conflict_key": decision.conflict_key},
+                ).first()
+                if existing and (
+                    existing.selected_page_id,
+                    existing.selected_revision,
+                    existing.decided_by,
+                    existing.reason,
+                ) != (
+                    decision.selected_page_id,
+                    decision.selected_revision,
+                    decision.decided_by,
+                    decision.reason,
+                ):
+                    raise RuntimeError(f"conflicting knowledge decision for project {canonical.id}")
+                if existing:
+                    conn.execute(text("DELETE FROM project_knowledge_decisions WHERE id = :id"), {"id": decision.id})
+                else:
+                    conn.execute(text("UPDATE project_knowledge_decisions SET project_id = :project_id WHERE id = :id"), {"project_id": canonical.id, "id": decision.id})
+
+            conn.execute(text("UPDATE requirements SET project_id = :canonical WHERE project_id = :duplicate"), {"canonical": canonical.id, "duplicate": owner.id})
+            conn.execute(text("UPDATE generation_tasks SET project_id = :canonical WHERE project_id = :duplicate"), {"canonical": canonical.id, "duplicate": owner.id})
+            conn.execute(text("UPDATE wiki_spaces SET project_id = :canonical WHERE id = :space_id"), {"canonical": canonical.id, "space_id": space.id})
+            conn.execute(text("UPDATE projects SET default_wiki_space_id = :space_id WHERE id = :canonical"), {"canonical": canonical.id, "space_id": space.id})
+            conn.execute(text("DELETE FROM projects WHERE id = :duplicate"), {"duplicate": owner.id})
         default_project = conn.execute(
             text("SELECT project_id FROM wiki_spaces WHERE slug = 'default'")
         ).scalar()

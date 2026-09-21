@@ -141,6 +141,10 @@ export function archiveDataPool(id: number, spaceId: number) {
   return api<DataPool>(`/api/data-pools/${id}/archive?wiki_space_id=${spaceId}`, { method: 'POST' })
 }
 
+export function deleteDataPool(id: number, spaceId: number) {
+  return api<{ ok: boolean }>(`/api/data-pools/${id}?wiki_space_id=${spaceId}`, { method: 'DELETE' })
+}
+
 export function listPlatforms(spaceId: number) {
   return api<PlatformProfile[]>(`/api/platforms?wiki_space_id=${spaceId}`)
 }

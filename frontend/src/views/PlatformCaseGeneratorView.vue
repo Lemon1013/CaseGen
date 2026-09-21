@@ -5,7 +5,7 @@ import { listDataPools, listPlatforms, listPlatformSemanticCases, renderExampleD
 import { useProjectStore } from '../projectStore'
 
 const projects=useProjectStore()
-const spaceId=computed(()=>projects.current.value?.default_wiki_space_id??undefined)
+const spaceId=projects.defaultWikiSpaceId
 const platforms=ref<PlatformProfile[]>([]),pools=ref<DataPool[]>([]),cases=ref<SemanticCase[]>([])
 const active=ref(0),inputMode=ref<'library'|'markdown'>('library'),selectedCases=ref<number[]>([]),externalMarkdown=ref(''),fileName=ref('')
 const platformId=ref<number>(),variantId=ref<number>(),selectedRevisions=ref<number[]>([]),keywords=ref<string[]>([])
@@ -35,7 +35,7 @@ onMounted(init)
 
 <template><div class="page">
  <div class="page-header"><div><h1 class="page-title">生成平台用例</h1><p class="page-subtitle">选择语义输入、单个示例类型和数据上下文，生成可下载的平台产物。</p></div></div>
- <el-empty v-if="!spaceId" description="当前空间没有默认知识库"/>
+ <el-empty v-if="!spaceId" description="当前空间默认知识库配置异常，请到知识库管理检查"/>
  <template v-else><el-card shadow="never"><el-steps :active="active" finish-status="success"><el-step title="01 选取输入"/><el-step title="02 平台与示例类型"/><el-step title="03 数据与关键字"/><el-step title="04 摘要与生成"/></el-steps></el-card>
  <el-card shadow="never" class="stage">
   <section v-show="active===0"><h3>01 选取输入</h3><el-radio-group v-model="inputMode"><el-radio-button value="library">现有语义用例</el-radio-button><el-radio-button value="markdown">本地 Markdown</el-radio-button></el-radio-group><div v-if="inputMode==='library'" class="field"><el-select v-model="selectedCases" multiple filterable placeholder="选择当前空间的语义用例" style="width:100%"><el-option v-for="c in cases" :key="c.id" :label="`${c.case_key} · ${c.title}`" :value="c.id"/></el-select><el-empty v-if="!cases.length" description="当前空间暂无已入库语义用例" :image-size="70"/></div><div v-else class="field"><input id="markdown-file" type="file" accept=".md,text/markdown" class="hidden" @change="readMarkdown"><label for="markdown-file" class="file-button">选择 .md 文件</label><span class="file-name">{{fileName||'未选择文件；内容只在浏览器读取并随生成请求提交'}}</span><el-input v-model="externalMarkdown" type="textarea" :rows="15" placeholder="# 在此预览或编辑 Markdown 用例"/></div></section>

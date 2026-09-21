@@ -5,7 +5,7 @@ import { createExample, createPlatform, createVariant, deleteExample, deletePlat
 import { useProjectStore } from '../projectStore'
 
 const projects = useProjectStore()
-const spaceId = computed(() => projects.current.value?.default_wiki_space_id ?? undefined)
+const spaceId = projects.defaultWikiSpaceId
 const platforms = ref<PlatformProfile[]>([])
 const platformId = ref<number>(), variantId = ref<number>()
 const platformDialog = ref(false), variantDialog = ref(false), exampleDialog = ref(false)
@@ -43,7 +43,7 @@ onMounted(init)
 
 <template><div class="page">
   <div class="page-header"><div><h1 class="page-title">平台管理</h1><p class="page-subtitle">先维护平台，再为平台维护可独立选择的示例类型和格式样例。</p></div></div>
-  <el-empty v-if="!spaceId" description="当前空间没有默认知识库"/>
+  <el-empty v-if="!spaceId" description="当前空间默认知识库配置异常，请到知识库管理检查"/>
   <template v-else><el-card shadow="never"><template #header><div class="head"><strong>1. 平台</strong><el-button type="primary" @click="openPlatform()">新建平台</el-button></div></template><el-table :data="platforms" highlight-current-row @current-change="(row:PlatformProfile)=>{platformId=row?.id;variantId=row?.variants[0]?.id}"><el-table-column prop="name" label="平台"/><el-table-column prop="description" label="说明"/><el-table-column prop="artifact_topology" label="产物拓扑" width="140"/><el-table-column label="操作" width="150"><template #default="{row}"><el-button link @click.stop="openPlatform(row)">编辑</el-button><el-button link type="danger" @click.stop="removePlatform(row)">删除</el-button></template></el-table-column></el-table></el-card>
   <el-card shadow="never" class="section"><template #header><div class="head"><strong>2. 示例类型 <span v-if="currentPlatform">· {{currentPlatform.name}}</span></strong><el-button type="primary" :disabled="!platformId" @click="openVariant()">新建示例类型</el-button></div></template><el-empty v-if="!platformId" description="请先在上方选择平台"/><el-table v-else :data="currentPlatform?.variants||[]" highlight-current-row @current-change="(row:ExampleVariant)=>variantId=row?.id"><el-table-column prop="name" label="示例类型"/><el-table-column prop="applicability" label="适用说明"/><el-table-column label="示例数" width="90"><template #default="{row}">{{row.examples.length}}</template></el-table-column><el-table-column label="操作" width="150"><template #default="{row}"><el-button link @click.stop="openVariant(row)">编辑</el-button><el-button link type="danger" @click.stop="removeVariant(row)">删除</el-button></template></el-table-column></el-table>
   <el-divider content-position="left">示例内容 · {{currentVariant?.name||'未选择'}}</el-divider><div class="head"><span class="hint">kind、媒体类型和内容都会作为该示例类型的参考格式。编辑仅影响后续生成，历史产物不会改变；历史已引用的示例不可删除。</span><el-button :disabled="!variantId" @click="openExample()">新增示例</el-button></div><el-table :data="currentVariant?.examples||[]"><el-table-column prop="name" label="名称"/><el-table-column prop="kind" label="Kind" width="110"/><el-table-column prop="media_type" label="媒体类型" width="180"/><el-table-column prop="content" label="内容预览" show-overflow-tooltip/><el-table-column label="操作" width="150"><template #default="{row}"><el-button link @click="openExample(row)">编辑</el-button><el-button link type="danger" @click="removeExample(row)">删除</el-button></template></el-table-column></el-table></el-card></template>

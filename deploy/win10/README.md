@@ -14,19 +14,31 @@ CaseGen/                     # 解压后的项目源码
 └── deploy/win10/
     ├── install.bat          # ① 一键安装（离线 pip，不联网）
     ├── run.bat              # ② 一键启动（单进程：后端 + 前端页面）
+    ├── package.ps1          # 在联网构建机生成离线 ZIP
     ├── requirements-offline.txt
-    └── backend_wheels/      # 31 个 Windows 版依赖包（Python 3.11 / win_amd64，含 socksio）
+    └── backend_wheels/      # Windows 版依赖包（Python 3.11 / win_amd64）
 ```
+
+## 在联网构建机打包
+
+构建机需安装 Git、Node.js/npm 和 Python（含 pip），并能访问 npm 与 PyPI。在仓库根目录执行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\deploy\win10\package.ps1
+```
+
+脚本会重新构建前端、下载 Python 3.11 / win_amd64 wheel，并在仓库根目录生成
+`CaseGen-intranet-win10-py311-YYYYMMDD.zip` 及对应 `.sha256`。目标文件已存在时可加
+`-Force`，也可用 `-OutputPath <路径.zip>` 指定输出位置。
 
 ## 部署步骤（Win10 目标机器）
 
 ### 前置要求
 
-1. 安装 **Python 3.11**（官网 python.org 下载，安装时务必勾选
+1. 安装 **64 位 Python 3.11**（不要使用 3.12/3.13；官网 python.org 下载，安装时务必勾选
    **"Add python.exe to PATH"**）。
    > 本包附带的后端依赖（`backend_wheels/`）为 **cp311 / win_amd64** 版本，
-   > 已针对 Python 3.11 预下载。若改用 3.12/3.13，需在可联网机器上重新下载 wheel
-   > （命令见文末"更换 Python 版本"）。
+   > 仅支持 64 位 Python 3.11。
 2. 将整个压缩包解压到目标机器（路径不要含中文或空格更稳妥，例如 `D:\CaseGen`）。
 
 ### 第一步：安装依赖（只需一次）
@@ -53,20 +65,10 @@ CaseGen/                     # 解压后的项目源码
 - **登录认证（默认开启）**：本版内置账号认证。首次访问会进入初始化（Setup）页面创建管理员账号，之后用该账号登录；前端新增登录 / 初始化 / 用例列表页面。若不需要认证，在 `run.bat` 的启动命令前加环境变量 `CASEGEN_AUTH_ENABLED=false` 后重启。
 - **停止服务**：在 run.bat 窗口按 `Ctrl+C` 或直接关闭窗口。
 - **修改端口**：编辑 `run.bat`，把 `--port 8000` 改成其它端口。
-- **更换 Python 版本**（如改用 3.12）：在可联网的 Windows 机器上重新下载对应版本 wheel：
+- **Python 版本固定为 3.11 x64**：`install.bat` 会拒绝其它 Python 版本或 32 位解释器。
 
-  ```
-  cd backend
-  pip download -r requirements.txt --platform win_amd64 --python-version 3.12 --implementation cp --only-binary=:all: -d ..\deploy\win10\backend_wheels
-  ```
+## 打包脚本验证记录（2026-09-01）
 
-  并把 `requirements.txt` 中 `uvicorn[standard]` 改为 `uvicorn`（uvloop 不支持 Windows），
-  同时清空 `backend_wheels\` 后再下载，避免新旧版本混用。
-
-## 本机验证记录
-
-- 后端 pytest：`289 passed`（含认证、Wiki spaces、任务流式输出、测试设计工作台）
-- 前端 `npm run build`：通过
-- 单进程模式（后端托管 dist）：健康检查、首页、SPA 路由、静态资源、API 全部 200
-- Python 3.11.14 实机验证通过（后端 `backend/.venv311` 与 Win10 同步）
-- 版本基线：`104e684`（Wiki 弹性 + Wiki spaces + 账号认证 + 任务流式输出 + 测试设计工作台）
+- Windows PowerShell 5.1 完整打包通过，前端 `npm run build` 通过。
+- 生成 32 个 CPython 3.11 / win_amd64 wheel，包内断网依赖解析通过。
+- ZIP 关键文件、排除项和 SHA256 校验通过。
