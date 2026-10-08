@@ -65,8 +65,22 @@ CaseGen/                     # 解压后的项目源码
 
 ## 本机验证记录
 
-- 后端 pytest：`289 passed`（含认证、Wiki spaces、任务流式输出、测试设计工作台）
+- 后端 pytest：`350 passed`（认证、Wiki spaces、任务流式输出、测试设计工作台、检索确认点、停止生成、需求导入、外部知识库 mock）
 - 前端 `npm run build`：通过
 - 单进程模式（后端托管 dist）：健康检查、首页、SPA 路由、静态资源、API 全部 200
 - Python 3.11.14 实机验证通过（后端 `backend/.venv311` 与 Win10 同步）
-- 版本基线：`104e684`（Wiki 弹性 + Wiki spaces + 账号认证 + 任务流式输出 + 测试设计工作台）
+- 版本基线：`073a907`（Wiki 弹性 + Wiki spaces + 账号认证 + 任务流式输出 + 测试设计工作台 + 生成停止/进度 + 需求文档导入 + 外部知识库 mock）
+- wheel 缓存：31 个 cp311 / win_amd64（含 `socksio`，配合 `httpx[socks]` 代理支持）
+
+## 可选：外部知识库 mock 服务
+
+验证"外部知识库"主流程时可启动随包的 mock（无需联网）：
+
+```
+cd backend
+python mock_external_wiki\server.py --port 8020
+```
+
+内置 2 个演示项目（上交所规则 / 基金规则）。在 CaseGen 界面把项目的外部知识库
+base_url 指向 `http://127.0.0.1:8020`（external_project_id 填 `proj-sse-rules`）
+即可在检索与生成确认中看到外部命中。详见 `backend/mock_external_wiki/README.md`。
