@@ -98,35 +98,38 @@ function onClick(e: MouseEvent) {
 }
 
 .markdown-view :deep(code) {
-  background: #eef2ff;
-  padding: 0.1em 0.35em;
+  background: #f4f4f5;
+  border: 1px solid #e4e4e7;
+  padding: 0.15em 0.4em;
   border-radius: 4px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 0.92em;
-  color: #4338ca;
+  font-family: var(--cg-font-mono);
+  font-size: 0.9em;
+  color: #18181b;
 }
 
 .markdown-view :deep(pre) {
-  background: #0b1220;
-  color: #e5e5e5;
+  background: #09090b;
+  color: #f4f4f5;
   padding: 12px 14px;
-  border-radius: 10px;
+  border-radius: 8px;
   overflow: auto;
-  border: 1px solid rgba(255, 255, 255, 0.06);
+  border: 1px solid #18181b;
+  font-family: var(--cg-font-mono);
 }
 
 .markdown-view :deep(pre code) {
   background: transparent;
+  border: none;
   padding: 0;
   color: inherit;
 }
 
 .markdown-view :deep(blockquote) {
   margin: 0.8em 0;
-  padding: 0.2em 0.8em;
-  border-left: 4px solid var(--cg-primary);
-  color: var(--cg-text-secondary);
-  background: rgba(var(--cg-primary-rgb), 0.05);
+  padding: 0.4em 0.9em;
+  border-left: 3px solid #10b981;
+  color: #52525b;
+  background: #f8fafc;
 }
 
 .markdown-view :deep(table) {
@@ -137,17 +140,24 @@ function onClick(e: MouseEvent) {
 
 .markdown-view :deep(th),
 .markdown-view :deep(td) {
-  border: 1px solid #ebeef5;
+  border: 1px solid #e4e4e7;
   padding: 6px 10px;
   text-align: left;
 }
 
 .markdown-view :deep(th) {
-  background: #f5f7ff;
+  background: #f4f4f5;
+  color: #18181b;
 }
 
 .markdown-view :deep(a) {
-  color: var(--cg-primary);
+  color: #059669;
   cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.markdown-view :deep(a:hover) {
+  color: #10b981;
 }
 </style>

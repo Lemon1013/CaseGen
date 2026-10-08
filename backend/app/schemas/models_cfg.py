@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -9,6 +9,7 @@ class ModelCreate(BaseModel):
     base_url: str
     api_key: str
     model_name: str
+    protocol: Literal["chat_completions", "responses"] = "chat_completions"
     is_default: bool = False
 
 
@@ -17,6 +18,7 @@ class ModelUpdate(BaseModel):
     base_url: Optional[str] = None
     api_key: Optional[str] = None
     model_name: Optional[str] = None
+    protocol: Optional[Literal["chat_completions", "responses"]] = None
     is_default: Optional[bool] = None
 
 
@@ -28,6 +30,7 @@ class ModelOut(BaseModel):
     base_url: str
     api_key: str
     model_name: str
+    protocol: str = "chat_completions"
     is_default: bool
     created_at: datetime
     updated_at: datetime

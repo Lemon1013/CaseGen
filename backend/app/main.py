@@ -19,6 +19,7 @@ from app.api.wiki import router as wiki_router
 from app.api.wiki_spaces import router as wiki_spaces_router
 from app.api.platform_data import router as platform_data_router
 from app.api.projects import router as projects_router
+from app.api.external_wikis import router as external_wikis_router
 from app import config
 from app.config import ensure_data_dirs
 from app.db import get_engine, init_db
@@ -184,6 +185,7 @@ def create_app() -> FastAPI:
     app.include_router(wiki_spaces_router)
     app.include_router(platform_data_router)
     app.include_router(projects_router)
+    app.include_router(external_wikis_router)
 
     _mount_frontend_dist(app)
 

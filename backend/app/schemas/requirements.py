@@ -9,6 +9,10 @@ class RequirementCreate(BaseModel):
     title: str
     description: str
     focus_tags: List[str] = Field(default_factory=list)
+    # Original requirement-document filename when the requirement content was
+    # filled from an uploaded file; the file itself is archived by the
+    # import-doc endpoint and never becomes a Document row.
+    source_filename: Optional[str] = Field(default=None, max_length=255)
 
 
 class RequirementOut(BaseModel):
@@ -19,5 +23,16 @@ class RequirementOut(BaseModel):
     title: str
     description: str
     focus_tags: List[str] = Field(default_factory=list)
+    source_filename: Optional[str] = None
     created_at: datetime
     updated_at: datetime
+
+
+class RequirementDocImportOut(BaseModel):
+    """Parsed requirement document returned by POST /api/requirements/import-doc."""
+
+    title: str
+    text: str
+    char_count: int
+    stored_path: str
+    sha256: str

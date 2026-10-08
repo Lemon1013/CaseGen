@@ -53,6 +53,7 @@ def to_model_out(row: ModelConfig) -> ModelOut:
         base_url=row.base_url,
         api_key=mask_api_key(row.api_key),
         model_name=row.model_name,
+        protocol=getattr(row, "protocol", "chat_completions") or "chat_completions",
         is_default=row.is_default,
         created_at=row.created_at,
         updated_at=row.updated_at,
@@ -73,6 +74,7 @@ def create_model(
         base_url=body.base_url,
         api_key=body.api_key,
         model_name=body.model_name,
+        protocol=body.protocol,
         is_default=body.is_default,
     )
     session.add(row)
@@ -142,6 +144,7 @@ def ping_model(model_id: int, session: Session = Depends(get_session)) -> ModelP
             base_url=row.base_url,
             api_key=row.api_key,
             model=row.model_name,
+            protocol=getattr(row, "protocol", "chat_completions") or "chat_completions",
             messages=[{"role": "user", "content": "ping"}],
             stream=True,
             max_tokens=32,

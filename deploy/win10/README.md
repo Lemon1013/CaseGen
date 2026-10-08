@@ -67,8 +67,24 @@ powershell -ExecutionPolicy Bypass -File .\deploy\win10\package.ps1
 - **修改端口**：编辑 `run.bat`，把 `--port 8000` 改成其它端口。
 - **Python 版本固定为 3.11 x64**：`install.bat` 会拒绝其它 Python 版本或 32 位解释器。
 
-## 打包脚本验证记录（2026-09-01）
+## 本机验证记录
 
-- Windows PowerShell 5.1 完整打包通过，前端 `npm run build` 通过。
-- 生成 32 个 CPython 3.11 / win_amd64 wheel，包内断网依赖解析通过。
-- ZIP 关键文件、排除项和 SHA256 校验通过。
+- 后端 pytest：`350 passed`（认证、Wiki spaces、任务流式输出、测试设计工作台、检索确认点、停止生成、需求导入、外部知识库 mock）
+- 前端 `npm run build`：通过
+- 单进程模式（后端托管 dist）：健康检查、首页、SPA 路由、静态资源、API 全部 200
+- Python 3.11.14 实机验证通过（后端 `backend/.venv311` 与 Win10 同步）
+- 版本基线：`073a907`（Wiki 弹性 + Wiki spaces + 账号认证 + 任务流式输出 + 测试设计工作台 + 生成停止/进度 + 需求文档导入 + 外部知识库 mock）
+- wheel 缓存：31 个 cp311 / win_amd64（含 `socksio`，配合 `httpx[socks]` 代理支持）
+
+## 可选：外部知识库 mock 服务
+
+验证"外部知识库"主流程时可启动随包的 mock（无需联网）：
+
+```
+cd backend
+python mock_external_wiki\server.py --port 8020
+```
+
+内置 2 个演示项目（上交所规则 / 基金规则）。在 CaseGen 界面把项目的外部知识库
+base_url 指向 `http://127.0.0.1:8020`（external_project_id 填 `proj-sse-rules`）
+即可在检索与生成确认中看到外部命中。详见 `backend/mock_external_wiki/README.md`。

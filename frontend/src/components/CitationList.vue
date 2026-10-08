@@ -19,6 +19,10 @@ export interface CitationItem {
   content_excerpt?: string
   clause_ids?: string[]
   anchor_clause?: string | null
+  heading_path?: string
+  headingPath?: string
+  evidence_snippet?: string
+  evidenceSnippet?: string
   available?: boolean
   legacy?: boolean
   legacy_reason?: string | null
@@ -56,17 +60,24 @@ const chunkDetail = ref<SourceChunkDetail | null>(null)
 
 const total = computed(() => props.count || props.citations.length)
 
+function isExternal(c: CitationItem | null | undefined) {
+  return c?.citation_type === 'external'
+}
+
 function isSource(c: CitationItem | null | undefined) {
+  if (isExternal(c)) return false
   return (c?.citation_type || 'wiki') === 'source' || !!c?.source_chunk_id
 }
 
 function typeLabel(c: CitationItem) {
   if (c.legacy) return '历史引用'
+  if (isExternal(c)) return '外部知识'
   return isSource(c) ? '原文' : 'Wiki'
 }
 
 function typeTagType(c: CitationItem): 'success' | 'primary' | 'warning' {
   if (c.legacy) return 'warning'
+  if (isExternal(c)) return 'warning'
   return isSource(c) ? 'success' : 'primary'
 }
 
@@ -76,6 +87,9 @@ async function openCitation(c: CitationItem, idx: number) {
   drawerVisible.value = true
   pageDetail.value = null
   chunkDetail.value = null
+  if (isExternal(c)) {
+    return
+  }
   loading.value = true
   try {
     if (isSource(c)) {
@@ -113,6 +127,15 @@ function scoreText(score?: number) {
 }
 
 const bodyText = computed(() => {
+  if (activeCitation.value && isExternal(activeCitation.value)) {
+    return (
+      activeCitation.value.evidence_snippet ||
+      activeCitation.value.evidenceSnippet ||
+      activeCitation.value.content_excerpt ||
+      activeCitation.value.snippet ||
+      ''
+    )
+  }
   if (chunkDetail.value?.text) return chunkDetail.value.text
   if (pageDetail.value?.content) return pageDetail.value.content
   if (activeCitation.value?.content_excerpt) return activeCitation.value.content_excerpt
@@ -173,7 +196,7 @@ const bodyText = computed(() => {
         </div>
         <div class="item-action">
           <el-icon :size="14"><View /></el-icon>
-          <span>{{ c.legacy ? '点击查看历史摘录' : isSource(c) ? '点击查看原文块' : '点击查看 Wiki 全文' }}</span>
+          <span>{{ c.legacy ? '点击查看历史摘录' : isExternal(c) ? '点击查看外部知识详情' : isSource(c) ? '点击查看原文块' : '点击查看 Wiki 全文' }}</span>
         </div>
       </button>
     </div>
@@ -270,7 +293,20 @@ const bodyText = computed(() => {
               </el-tag>
             </span>
           </div>
-          <div v-if="!isSource(activeCitation)" class="meta-actions">
+          <div v-if="isExternal(activeCitation)" class="meta-row">
+            <span class="meta-label">章节路径</span>
+            <span class="meta-value">{{ activeCitation.heading_path || activeCitation.headingPath || '—' }}</span>
+          </div>
+          <div
+            v-if="isExternal(activeCitation) && (activeCitation.evidence_snippet || activeCitation.evidenceSnippet)"
+            class="meta-row"
+          >
+            <span class="meta-label">证据摘录</span>
+            <span class="meta-value snippet-preview">
+              {{ activeCitation.evidence_snippet || activeCitation.evidenceSnippet }}
+            </span>
+          </div>
+          <div v-if="!isSource(activeCitation) && !isExternal(activeCitation)" class="meta-actions">
             <el-button
               type="primary"
               plain
@@ -285,7 +321,7 @@ const bodyText = computed(() => {
 
         <div class="content-box">
           <div class="section-label">
-            {{ isSource(activeCitation) ? '原文内容（无损摘录）' : '页面正文' }}
+            {{ isExternal(activeCitation) ? '外部知识内容' : isSource(activeCitation) ? '原文内容（无损摘录）' : '页面正文' }}
           </div>
           <template v-if="bodyText">
             <pre v-if="isSource(activeCitation)" class="source-text">{{ bodyText }}</pre>
@@ -322,6 +358,25 @@ const bodyText = computed(() => {
   display: flex;
   flex-direction: column;
   gap: 8px;
+  max-height: 250px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding-right: 4px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--cg-border-strong, #cbd5e1) transparent;
+}
+
+.items::-webkit-scrollbar {
+  width: 5px;
+}
+
+.items::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.items::-webkit-scrollbar-thumb {
+  background-color: var(--cg-border-strong, #cbd5e1);
+  border-radius: 4px;
 }
 
 .item {
@@ -339,14 +394,14 @@ const bodyText = computed(() => {
 }
 
 .item:hover {
-  border-color: rgba(var(--cg-primary-rgb), 0.45);
-  box-shadow: 0 4px 14px rgba(var(--cg-primary-rgb), 0.1);
+  border-color: rgba(16, 185, 129, 0.45);
+  box-shadow: 0 4px 14px rgba(16, 185, 129, 0.1);
   transform: translateY(-1px);
 }
 
 .item-source:hover {
-  border-color: rgba(18, 184, 134, 0.5);
-  box-shadow: 0 4px 14px rgba(18, 184, 134, 0.12);
+  border-color: rgba(16, 185, 129, 0.5);
+  box-shadow: 0 4px 14px rgba(16, 185, 129, 0.12);
 }
 
 .item-top {
@@ -358,9 +413,11 @@ const bodyText = computed(() => {
 .ref-badge {
   flex-shrink: 0;
   font-weight: 700;
+  font-family: var(--cg-font-mono);
   font-size: 12px;
-  color: var(--cg-primary);
-  background: rgba(var(--cg-primary-rgb), 0.1);
+  color: #18181b;
+  background: #f4f4f5;
+  border: 1px solid #e4e4e7;
   border-radius: 4px;
   padding: 1px 6px;
   line-height: 1.5;

@@ -37,27 +37,65 @@ function stepType(step: string): '' | 'success' | 'warning' | 'info' | 'danger' 
 <style scoped>
 .timeline-wrap {
   padding: 4px 8px;
-  max-height: clamp(280px, calc(100vh - 260px), 720px);
+  max-height: 190px;
   overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-width: thin;
+  scrollbar-color: var(--cg-border-strong, #cbd5e1) transparent;
+}
+
+.timeline-wrap::-webkit-scrollbar {
+  width: 5px;
+}
+
+.timeline-wrap::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.timeline-wrap::-webkit-scrollbar-thumb {
+  background-color: var(--cg-border-strong, #cbd5e1);
+  border-radius: 4px;
+}
+
+.timeline-wrap :deep(.el-timeline) {
+  padding-left: 2px;
+}
+
+.timeline-wrap :deep(.el-timeline-item) {
+  padding-bottom: 12px;
+}
+
+.timeline-wrap :deep(.el-timeline-item__node) {
+  width: 9px;
+  height: 9px;
+  left: -1px;
+}
+
+.timeline-wrap :deep(.el-timeline-item__timestamp) {
+  font-size: 11px;
+  line-height: 1.2;
+  margin-bottom: 4px;
 }
 
 @media (max-width: 900px) {
   .timeline-wrap {
-    max-height: none;
-    overflow: visible;
+    max-height: 220px;
+    overflow-y: auto;
   }
 }
 
 .ev-step {
-  font-weight: 600;
-  font-size: 13px;
-  margin-bottom: 2px;
+  font-weight: 700;
+  font-size: 11px;
+  margin-bottom: 1px;
   text-transform: uppercase;
   color: var(--cg-text);
+  letter-spacing: 0.5px;
 }
 
 .ev-msg {
   color: var(--cg-text-secondary);
-  font-size: 13px;
+  font-size: 12px;
+  line-height: 1.4;
 }
 </style>

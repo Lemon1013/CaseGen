@@ -1,13 +1,13 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { listModels, type ModelConfig } from '../api/models'
 import { listPrompts, type PromptTemplate } from '../api/prompts'
 import { createTask, generateTask, optimizeRequirement } from '../api/tasks'
 import { listCases, type TestCaseItem } from '../api/cases'
 import { listWikiSpaces, type WikiSpace } from '../api/wikiSpaces'
-import { listRequirements, type RequirementItem } from '../api/requirements'
+import { importRequirementDoc, listRequirements, type RequirementItem } from '../api/requirements'
 import { chooseSpace, rememberAndRoute, spaceIdFromQuery } from '../utils/wikiSpace'
 
 const router = useRouter()
@@ -32,6 +32,7 @@ type GenerationGranularity = 'compact' | 'standard' | 'detailed'
 const granularityOptions: Array<{
   value: GenerationGranularity
   label: string
+  badge: string
   amount: string
   coverage: string
   suitable: string
@@ -40,14 +41,16 @@ const granularityOptions: Array<{
   {
     value: 'compact',
     label: '精简',
-    amount: '2–3 条/功能点',
+    badge: '[ 3-5 / TP ]',
+    amount: '拆 3–5 个测试点 · 每点 1 条用例',
     coverage: '只展开最高优先级流程和阻断性异常',
     suitable: '适合快速评审、需求早期',
   },
   {
     value: 'standard',
     label: '标准',
-    amount: '5–8 条/功能点',
+    badge: '[ 5-8 / TP ]',
+    amount: '拆 5–8 个测试点 · 每点 2–3 条用例',
     coverage: '主要流程、常见异常和关键边界',
     suitable: '适合日常需求、常规回归',
     recommended: true,
@@ -55,7 +58,8 @@ const granularityOptions: Array<{
   {
     value: 'detailed',
     label: '全面',
-    amount: '10+ 条/功能点',
+    badge: '[ 8-12+ / TP ]',
+    amount: '拆 8–12+ 个测试点 · 每点 3–5 条用例',
     coverage: '状态组合、异常链路和深层边界',
     suitable: '适合核心链路、高风险发布',
   },
@@ -73,7 +77,12 @@ const form = reactive({
   wiki_space_id: null as number | null, requirement_id: null as number | null,
   generation_granularity: 'standard' as GenerationGranularity,
   test_dimensions: ['positive', 'negative', 'boundary'] as string[], reference_text: '',
+  source_filename: null as string | null,
 })
+const importingDoc = ref(false)
+const docDragOver = ref(false)
+const docFileInput = ref<HTMLInputElement | null>(null)
+const MAX_IMPORT_CHARS = 20000
 const selectedCases = computed(() => referenceCases.value.filter((row) => selectedReferenceIds.value.includes(row.id)))
 const referenceChars = computed(() => selectedCases.value.reduce((n, row) => n + row.content_md.length, 0) + form.reference_text.length)
 const selectedGranularity = computed(() => granularityOptions.find((item) => item.value === form.generation_granularity) || granularityOptions[1])
@@ -113,6 +122,55 @@ function selectRequirement(id: number | null) {
   form.title = row.title; form.description = row.description; form.focusText = row.focus_tags.join(', ')
 }
 
+function pickImportFile() { docFileInput.value?.click() }
+
+function onImportFileChange(event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = ''
+  if (file) void importDoc(file)
+}
+
+function onDropImport(event: DragEvent) {
+  docDragOver.value = false
+  const file = event.dataTransfer?.files?.[0]
+  if (file) void importDoc(file)
+}
+
+async function importDoc(file: File) {
+  importingDoc.value = true
+  try {
+    const result = await importRequirementDoc(file)
+    let text = result.text
+    if (text.length > MAX_IMPORT_CHARS) {
+      text = text.slice(0, MAX_IMPORT_CHARS)
+      ElMessage.warning(`已截断至 20000 字，原文共 ${result.char_count} 字，请人工补齐关键内容`)
+    }
+    if (!form.description.trim()) {
+      form.description = text
+    } else {
+      let merged: string | null = text
+      try {
+        await ElMessageBox.confirm('当前需求描述已有内容：「覆盖」替换原文，「追加」拼接在原文之后。', '描述非空', {
+          confirmButtonText: '覆盖',
+          cancelButtonText: '追加',
+          distinguishCancelAndClose: true,
+          type: 'warning',
+        })
+      } catch (action) {
+        if (action === 'cancel') merged = `${form.description}\n\n${text}`.slice(0, MAX_IMPORT_CHARS)
+        else merged = null
+      }
+      if (merged === null) return
+      form.description = merged
+    }
+    if (!form.title.trim()) form.title = result.title.slice(0, 120)
+    form.source_filename = file.name
+    ElMessage.success(`已导入 ${result.char_count} 字，请检查并手动编辑`)
+  } catch (e) { ElMessage.error(`导入需求文档失败：${(e as Error).message}`) }
+  finally { importingDoc.value = false }
+}
+
 function changeSpace(id: number) {
   currentSpace.value = spaces.value.find((row) => row.id === id) || null
   form.wiki_space_id = currentSpace.value?.id ?? null
@@ -139,6 +197,8 @@ async function submit() {
   try {
     const task = await createTask({
       requirement_id: form.requirement_id, title: form.title.trim(), description: form.description.trim(),
+      // Imported source file only applies to a brand-new requirement.
+      source_filename: form.requirement_id ? null : (form.source_filename || null),
       focus_tags: tags(form.focusText), model_id: form.model_id, prompt_template_id: form.prompt_template_id,
       auto_review: form.auto_review, wiki_space_id: form.wiki_space_id, generation_granularity: form.generation_granularity,
       test_dimensions: form.test_dimensions, reference_case_ids: selectedReferenceIds.value, reference_text: form.reference_text.trim(),
@@ -155,16 +215,44 @@ onMounted(loadOptions)
 <template>
   <div class="page workbench-page">
     <div class="page-header"><div><h1 class="page-title">测试设计工作台</h1><p class="page-subtitle">需求 → 策略 → 参考用例 → 证据与测试点 → 完整用例</p></div><el-button @click="router.push('/tasks')">查看任务</el-button></div>
-    <div class="step-rail"><div class="step-item active">01 需求与优化<br><small>标题、描述和待确认问题</small></div><div class="step-item">02 测试点确认<br><small>检索确认后的结构化检查点</small></div><div class="step-item">03 用例与覆盖<br><small>生成、评审、终版和追溯</small></div></div>
+    <div class="step-rail">
+      <div class="step-item active">
+        <div class="step-index">01 // 需求输入与优化</div>
+        <small class="step-desc">标题、描述和待确认问题</small>
+      </div>
+      <div class="step-item">
+        <div class="step-index">02 // 知识检索与测试点</div>
+        <small class="step-desc">检索确认后的结构化检查点</small>
+      </div>
+      <div class="step-item">
+        <div class="step-index">03 // 用例矩阵与覆盖</div>
+        <small class="step-desc">生成、评审、终版和追溯</small>
+      </div>
+    </div>
     <el-row :gutter="16">
       <el-col :xs="24" :lg="15">
         <el-card shadow="never" class="block"><template #header>需求输入与优化</template>
           <el-form label-position="top" @submit.prevent>
             <el-form-item label="已有需求"><el-select v-model="form.requirement_id" clearable filterable style="width:100%" placeholder="可选" @change="selectRequirement"><el-option v-for="row in requirements" :key="row.id" :label="`#${row.id} · ${row.title}`" :value="row.id" /></el-select></el-form-item>
             <el-form-item label="标题" required><el-input v-model="form.title" maxlength="120" show-word-limit /></el-form-item>
-            <el-form-item label="需求描述" required><el-input v-model="form.description" type="textarea" :rows="8" maxlength="20000" show-word-limit /></el-form-item>
+            <el-form-item label="需求描述" required>
+              <div class="description-field">
+                <div class="description-toolbar">
+                  <span class="hint">支持 .md / .txt / .pdf / .docx，≤ 20MB</span>
+                  <el-button size="small" plain :loading="importingDoc" @click="pickImportFile">📄 从文档导入</el-button>
+                </div>
+                <div class="description-dropzone" :class="{ 'drag-over': docDragOver }" @dragover.prevent="docDragOver = true" @dragleave.prevent="docDragOver = false" @drop.prevent="onDropImport">
+                  <el-input v-model="form.description" type="textarea" :rows="8" maxlength="20000" show-word-limit />
+                  <div v-if="form.source_filename" class="source-file-row">
+                    <span class="hint">来源文件：{{ form.source_filename }}</span>
+                    <el-button link size="small" @click="form.source_filename = null">清除</el-button>
+                  </div>
+                </div>
+              </div>
+              <input ref="docFileInput" class="import-file-input" type="file" accept=".md,.txt,.pdf,.docx" @change="onImportFileChange" />
+            </el-form-item>
             <el-form-item label="关注标签"><el-input v-model="form.focusText" placeholder="多个标签用逗号或空格分隔" /></el-form-item>
-            <el-button type="primary" plain :loading="optimizing" @click="optimize">AI 优化需求</el-button><span class="hint"> 返回结果可继续手动编辑，提交时才持久化。</span>
+            <el-button type="primary" plain :loading="optimizing" @click="optimize">✦ 智能需求分析</el-button><span class="hint"> 返回结果可继续手动编辑，提交时才持久化。</span>
           </el-form>
           <el-alert v-if="showQuestions" class="questions" type="warning" :closable="false" title="待确认问题"><ul><li v-for="item in questions" :key="item">{{ item }}</li><li v-if="!questions.length">暂无</li></ul></el-alert>
         </el-card>
@@ -188,10 +276,13 @@ onMounted(loadOptions)
                   :aria-pressed="form.generation_granularity === item.value"
                   @click="form.generation_granularity = item.value"
                 >
-                  <span class="granularity-title-row">
-                    <strong>{{ item.label }}</strong>
+                  <div class="granularity-badge-row">
+                    <span class="granularity-pt-code">{{ item.badge }}</span>
                     <span v-if="item.recommended" class="recommended-badge">推荐</span>
-                  </span>
+                  </div>
+                  <div class="granularity-title-row">
+                    <strong>{{ item.label }}</strong>
+                  </div>
                   <span class="granularity-amount">{{ item.amount }}</span>
                   <span class="granularity-coverage">{{ item.coverage }}</span>
                   <span class="granularity-suitable">{{ item.suitable }}</span>
@@ -208,7 +299,7 @@ onMounted(loadOptions)
           <el-form-item label="生成 Prompt"><el-select v-model="form.prompt_template_id" clearable style="width:100%"><el-option v-for="row in prompts" :key="row.id" :label="`${row.name} (v${row.version})`" :value="row.id" /></el-select></el-form-item>
           <el-form-item label="生成后自动评审"><el-switch v-model="form.auto_review" /></el-form-item>
         </el-form></el-card>
-        <el-card shadow="never" class="block"><template #header>提交摘要</template><el-descriptions :column="1" border size="small"><el-descriptions-item label="粒度">{{ selectedGranularity.label }}</el-descriptions-item><el-descriptions-item label="维度">{{ dimensionSummary }}</el-descriptions-item><el-descriptions-item label="参考">{{ selectedCases.length }} 条库内 + {{ form.reference_text.trim() ? '手动输入' : '无手动输入' }}</el-descriptions-item><el-descriptions-item label="流程">检索确认 → 测试点确认 → 完整用例</el-descriptions-item></el-descriptions><el-button class="submit" type="primary" size="large" :loading="submitting" @click="submit">创建并开始检索</el-button></el-card>
+        <el-card shadow="never" class="block"><template #header>提交摘要</template><el-descriptions :column="1" border size="small"><el-descriptions-item label="粒度">{{ selectedGranularity.label }}</el-descriptions-item><el-descriptions-item label="维度">{{ dimensionSummary }}</el-descriptions-item><el-descriptions-item label="参考">{{ selectedCases.length }} 条库内 + {{ form.reference_text.trim() ? '手动输入' : '无手动输入' }}</el-descriptions-item><el-descriptions-item label="流程">检索确认 → 测试点确认 → 完整用例</el-descriptions-item></el-descriptions><el-button class="submit" type="primary" size="large" :loading="submitting" @click="submit">创建任务并启动检索流水线 →</el-button></el-card>
       </el-col>
     </el-row>
   </div>
@@ -223,15 +314,34 @@ onMounted(loadOptions)
 }
 
 .step-item {
-  padding: 14px;
-  border: 1px solid var(--cg-border);
-  border-radius: var(--cg-radius);
-  background: var(--cg-surface);
-  font-weight: 700;
+  padding: 14px 16px;
+  border: 1px solid #e4e4e7;
+  border-left: 3px solid #e4e4e7;
+  border-radius: var(--cg-radius-sm);
+  background: #ffffff;
+  transition: all 0.2s ease;
 }
 
 .step-item.active {
-  border-color: var(--el-color-primary);
+  border-color: #18181b;
+  border-left: 3px solid #10b981;
+  background: #f8fafc;
+}
+
+.step-index {
+  font-family: var(--cg-font-mono);
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--cg-text);
+  letter-spacing: 0.02em;
+}
+
+.step-desc {
+  display: block;
+  margin-top: 4px;
+  font-family: var(--cg-font-mono);
+  color: var(--cg-text-muted);
+  font-size: 11.5px;
 }
 
 small,
@@ -255,6 +365,42 @@ small,
   padding-left: 18px;
 }
 
+.description-field {
+  width: 100%;
+}
+
+.description-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.description-dropzone {
+  width: 100%;
+  border: 1px dashed transparent;
+  border-radius: var(--cg-radius-sm);
+  transition: border-color 0.15s ease, background-color 0.15s ease;
+}
+
+.description-dropzone.drag-over {
+  border-color: #10b981;
+  background: #ecfdf5;
+}
+
+.source-file-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.import-file-input {
+  display: none;
+}
+
 .reference-search {
   display: flex;
   gap: 8px;
@@ -266,15 +412,15 @@ small,
 
 .reference-list {
   display: grid;
-  gap: 8px;
-  max-height: 260px;
+  gap: 10px;
+  max-height: 300px;
   overflow: auto;
   margin-top: 12px;
 }
 
 .reference-row {
   height: auto;
-  padding: 8px;
+  padding: 10px 12px;
   border: 1px solid var(--cg-border);
   border-radius: var(--cg-radius-sm);
   white-space: normal;
@@ -283,7 +429,16 @@ small,
 .reference-row :deep(.el-checkbox__label) {
   display: flex;
   flex-direction: column;
+  gap: 4px;
   white-space: normal;
+}
+
+.reference-row :deep(.el-checkbox__label span) {
+  line-height: 1.5;
+}
+
+.reference-row :deep(.el-checkbox__label small) {
+  line-height: 1.4;
 }
 
 .reference-total {
@@ -315,7 +470,7 @@ small,
   padding: 14px;
   flex-direction: column;
   appearance: none;
-  border: 1px solid var(--cg-border);
+  border: 1px solid #e4e4e7;
   border-radius: var(--cg-radius-sm);
   background: var(--cg-surface);
   color: var(--el-text-color-primary);
@@ -326,43 +481,63 @@ small,
 }
 
 .granularity-card:hover {
-  border-color: var(--el-color-primary-light-5);
+  border-color: #10b981;
 }
 
 .granularity-card:focus-visible {
-  outline: 3px solid var(--el-color-primary-light-5);
+  outline: 2px solid #10b981;
   outline-offset: 2px;
 }
 
 .granularity-card.selected {
-  border-color: var(--el-color-primary);
-  background: var(--el-color-primary-light-9);
-  box-shadow: inset 0 0 0 1px var(--el-color-primary), 0 6px 16px rgb(84 92 255 / 12%);
+  border: 1px solid #10b981;
+  background: #ecfdf5;
+  box-shadow: inset 0 0 0 1px #10b981, 0 1px 3px rgba(16, 185, 129, 0.08);
 }
 
-.granularity-title-row {
+.granularity-badge-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
-  font-size: 16px;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.granularity-pt-code {
+  font-family: var(--cg-font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  color: #71717a;
+  letter-spacing: 0.04em;
+}
+
+.granularity-card.selected .granularity-pt-code {
+  color: #059669;
 }
 
 .recommended-badge {
-  padding: 2px 7px;
+  padding: 1px 6px;
   border-radius: 999px;
-  background: var(--el-color-primary);
-  color: #fff;
-  font-size: 11px;
+  background: #10b981;
+  color: #ffffff;
+  font-size: 10.5px;
   font-weight: 700;
-  line-height: 18px;
+  line-height: 16px;
+}
+
+.granularity-title-row {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--cg-text);
 }
 
 .granularity-amount {
-  margin-top: 10px;
-  color: var(--el-color-primary);
+  margin-top: 8px;
+  color: #059669;
   font-size: 13px;
   font-weight: 700;
+  font-family: var(--cg-font-mono);
+  line-height: 1.5;
 }
 
 .granularity-coverage,

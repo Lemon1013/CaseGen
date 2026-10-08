@@ -15,7 +15,7 @@ ALLOWED = {
     "generating": {"generating_test_points", "retrieving", "generated", "failed"},
     "generated": {"reviewing", "regenerating", "finalized", "failed"},
     "reviewing": {"reviewed", "failed"},
-    "reviewed": {"optimizing", "regenerating", "finalized", "failed"},
+    "reviewed": {"reviewing", "optimizing", "regenerating", "finalized", "failed"},
     "optimizing": {"reviewed", "failed"},
     "regenerating": {"retrieving", "failed"},
     "finalized": set(),

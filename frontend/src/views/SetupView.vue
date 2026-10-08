@@ -67,8 +67,8 @@ async function submit() {
 </template>
 
 <style scoped>
-.auth-page { min-height: 100vh; display: grid; place-items: center; padding: 24px; background: var(--cg-bg-glow); }
-.auth-card { width: min(460px, 100%); border-radius: 16px; }
+.auth-page { min-height: 100vh; display: grid; place-items: center; padding: 24px; background: var(--cg-bg); }
+.auth-card { width: min(460px, 100%); border-radius: var(--cg-radius-lg); }
 .auth-brand { color: var(--cg-primary); font-weight: 800; letter-spacing: .04em; }
 h1 { margin: 18px 0 6px; font-size: 28px; }
 .auth-hint { margin: 0 0 22px; color: var(--cg-text-muted); font-size: 13px; }

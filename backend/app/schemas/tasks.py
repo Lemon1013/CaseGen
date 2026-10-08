@@ -11,6 +11,9 @@ class TaskCreate(BaseModel):
     requirement_id: Optional[int] = Field(default=None, ge=1)
     title: Optional[str] = Field(default=None, max_length=120)
     description: Optional[str] = Field(default=None, max_length=20000)
+    # Original requirement-document filename for inline requirements created
+    # from an imported file; ignored when an existing requirement_id is used.
+    source_filename: Optional[str] = Field(default=None, max_length=255)
     # None means “not provided”; [] is an explicit request to clear tags on
     # an existing requirement.
     focus_tags: Optional[List[str]] = Field(default=None, max_length=30)
@@ -242,6 +245,36 @@ class RequirementOptimizeOut(BaseModel):
     prompt_type: str = "requirement_optimize"
 
 
+class DraftCaseStepOut(BaseModel):
+    step_no: int
+    action: str
+    expected: str = ""
+
+
+class DraftCaseItemOut(BaseModel):
+    case_key: str
+    title: str
+    priority: str = "P1"
+    type: str = ""
+    verification_goal: str = ""
+    preconditions: str = ""
+    test_data: str = ""
+    steps: List[DraftCaseStepOut] = Field(default_factory=list)
+    pending_items: List[str] = Field(default_factory=list)
+    raw_md: str
+
+
+class DraftPointGroupOut(BaseModel):
+    test_point_id: Optional[int] = None
+    stable_key: str
+    title: str
+    verification_goal: str = ""
+    dimension: str = ""
+    priority: str = "P1"
+    citation_ids: List[int] = Field(default_factory=list)
+    cases: List[DraftCaseItemOut] = Field(default_factory=list)
+
+
 class CaseDraftOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -251,6 +284,7 @@ class CaseDraftOut(BaseModel):
     content_md: str
     prompt_version_ref: Optional[str] = None
     created_at: datetime
+    points_with_cases: Optional[List[DraftPointGroupOut]] = None
 
 
 class FinalizeTaskBody(BaseModel):

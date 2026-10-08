@@ -16,6 +16,7 @@ from app.services.clause_index import (
 )
 from app.services.retrieve import load_all_wiki_pages, rank_pages
 from app.services.source_chunks_store import load_all_source_chunks, rank_source_chunks
+from app.services.external_wiki_client import search_external_knowledge
 
 _WIKILINK_RE = re.compile(r"\[\[([^\]|#]+)(?:#[^\]|]+)?(?:\|[^\]]+)?\]\]")
 
@@ -393,12 +394,62 @@ def project_hybrid_retrieve(
         space = session.get(WikiSpace, hit.get("space_id"))
         hit.update(space_name=space.name if space else "", space_scope=space.scope if space else "project")
     limit = top_k if top_k is not None else config.RETRIEVE_TOP_K
+
+    from sqlmodel import select
+    from app.models.external_wiki import ProjectExternalWiki
+
+    external_hits: list[dict[str, Any]] = []
+    ext_cfg = session.exec(
+        select(ProjectExternalWiki).where(
+            ProjectExternalWiki.project_id == project_id,
+            ProjectExternalWiki.enabled == True,
+        )
+    ).first()
+
+    if ext_cfg and ext_cfg.external_project_id.strip():
+        raw_ext_hits = search_external_knowledge(
+            base_url=ext_cfg.base_url,
+            external_project_id=ext_cfg.external_project_id,
+            query=query,
+            limit=ext_cfg.top_k,
+            use_synonyms=ext_cfg.use_synonyms,
+            timeout_sec=ext_cfg.timeout_sec,
+        )
+        for eh in raw_ext_hits:
+            item = {
+                "id": eh.chunk_id,
+                "title": eh.title or eh.heading_path or eh.document_path or "外部知识",
+                "path": eh.document_path,
+                "heading_path": eh.heading_path,
+                "headingPath": eh.heading_path,
+                "snippet": eh.snippet,
+                "evidence_snippet": eh.evidence_snippet,
+                "evidenceSnippet": eh.evidence_snippet,
+                "content_excerpt": eh.evidence_snippet or eh.snippet,
+                "content": eh.evidence_snippet or eh.snippet,
+                "text": eh.evidence_snippet or eh.snippet,
+                "score": round(eh.score * ext_cfg.weight, 6),
+                "citation_type": "external",
+                "highlight_terms": eh.highlight_terms,
+                "source_chunk_id": None,
+                "wiki_page_id": None,
+                "page_type": "external_wiki",
+                "space_name": ext_cfg.external_project_name or ext_cfg.name or "外部知识库",
+                "space_scope": "external",
+            }
+            external_hits.append(item)
+
+    all_hits = [
+        hit for part in parts for hit in (part.get("hits") or [*(part.get("wiki_hits") or []), *(part.get("source_hits") or [])])
+    ] + external_hits
     hits = sorted(
-        [hit for part in parts for hit in (part.get("hits") or [*(part.get("wiki_hits") or []), *(part.get("source_hits") or [])])],
+        all_hits,
         key=lambda hit: float(hit.get("score") or 0),
         reverse=True,
     )[:limit]
     for hit in hits:
+        if hit.get("space_scope") == "external":
+            continue
         space = session.get(WikiSpace, hit.get("space_id"))
         hit.update(space_name=space.name if space else "", space_scope=space.scope if space else "project")
     topics: dict[str, list[dict[str, Any]]] = {}
@@ -406,4 +457,21 @@ def project_hybrid_retrieve(
         if hit.get("canonical_topic") and hit.get("assertion_summary"):
             topics.setdefault(str(hit["canonical_topic"]), []).append(hit)
     conflicts = [{"conflict_key": topic, "canonical_topic": topic, "candidates": candidates} for topic, candidates in topics.items() if len({str(item["assertion_summary"]).strip() for item in candidates}) > 1]
-    return {"query": query, "wiki_hits": wiki_hits, "source_hits": source_hits, "hits": hits, "wiki_hit_count": len(wiki_hits), "source_hit_count": len(source_hits), "clause_ids": list(dict.fromkeys(c for part in parts for c in part.get("clause_ids", []))), "anchored_clause_ids": list(dict.fromkeys(c for part in parts for c in part.get("anchored_clause_ids", []))), "retrieval_mode": "project_multi_space", "explain": {"space_ids": [*private_ids, *shared_ids]}, "conflict_groups": conflicts}
+    return {
+        "query": query,
+        "wiki_hits": wiki_hits,
+        "source_hits": source_hits,
+        "external_hits": external_hits,
+        "hits": hits,
+        "wiki_hit_count": len(wiki_hits),
+        "source_hit_count": len(source_hits),
+        "external_hit_count": len(external_hits),
+        "clause_ids": list(dict.fromkeys(c for part in parts for c in part.get("clause_ids", []))),
+        "anchored_clause_ids": list(dict.fromkeys(c for part in parts for c in part.get("anchored_clause_ids", []))),
+        "retrieval_mode": "project_multi_space",
+        "explain": {
+            "space_ids": [*private_ids, *shared_ids],
+            "external_wiki_enabled": bool(ext_cfg and ext_cfg.external_project_id),
+        },
+        "conflict_groups": conflicts,
+    }

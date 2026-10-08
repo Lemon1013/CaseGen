@@ -178,20 +178,30 @@ def _row_purge_path(space: WikiSpace, row: WikiPageRow) -> tuple[Path, str | Non
         return candidate, "path escapes configured Wiki root", _relative_identifier(candidate, row_id=row.id)
 
     # The authoritative check happens through the dir_fd/openat abstraction
-    # below.  Keep this lexical check only for a useful preview diagnostic;
-    # it never supplies the descriptor used by execute.
-    parent_fd = None
-    try:
-        parent_fd = _open_secure_parent(candidate)
-    except FileNotFoundError:
-        pass
-    except _PurgeUnsafeError as exc:
-        return candidate, str(exc), _relative_identifier(candidate, row_id=row.id)
-    except OSError as exc:
-        return candidate, f"cannot inspect path: {exc}", _relative_identifier(candidate, row_id=row.id)
-    finally:
-        if parent_fd is not None:
-            os.close(parent_fd)
+    # below (or _verify_secure_path on non-POSIX platforms). Keep this lexical check
+    # only for a useful preview diagnostic; it never supplies the descriptor used by execute.
+    if _purge_dirfd_supported():
+        parent_fd = None
+        try:
+            parent_fd = _open_secure_parent(candidate)
+        except FileNotFoundError:
+            pass
+        except _PurgeUnsafeError as exc:
+            return candidate, str(exc), _relative_identifier(candidate, row_id=row.id)
+        except OSError as exc:
+            return candidate, f"cannot inspect path: {exc}", _relative_identifier(candidate, row_id=row.id)
+        finally:
+            if parent_fd is not None:
+                os.close(parent_fd)
+    else:
+        try:
+            _verify_secure_path(candidate)
+        except FileNotFoundError:
+            pass
+        except _PurgeUnsafeError as exc:
+            return candidate, str(exc), _relative_identifier(candidate, row_id=row.id)
+        except OSError as exc:
+            return candidate, f"cannot inspect path: {exc}", _relative_identifier(candidate, row_id=row.id)
     return candidate, None, _relative_identifier(candidate, row_id=row.id)
 
 
@@ -203,18 +213,28 @@ def _safe_purge_path(path: Path) -> tuple[Path, str | None]:
         candidate.relative_to(root)
     except ValueError:
         return candidate, "path escapes configured Wiki root"
-    parent_fd = None
-    try:
-        parent_fd = _open_secure_parent(candidate)
-    except FileNotFoundError:
-        return candidate, None
-    except _PurgeUnsafeError as exc:
-        return candidate, str(exc)
-    except OSError as exc:
-        return candidate, f"cannot inspect path: {exc}"
-    finally:
-        if parent_fd is not None:
-            os.close(parent_fd)
+    if _purge_dirfd_supported():
+        parent_fd = None
+        try:
+            parent_fd = _open_secure_parent(candidate)
+        except FileNotFoundError:
+            return candidate, None
+        except _PurgeUnsafeError as exc:
+            return candidate, str(exc)
+        except OSError as exc:
+            return candidate, f"cannot inspect path: {exc}"
+        finally:
+            if parent_fd is not None:
+                os.close(parent_fd)
+    else:
+        try:
+            _verify_secure_path(candidate)
+        except FileNotFoundError:
+            return candidate, None
+        except _PurgeUnsafeError as exc:
+            return candidate, str(exc)
+        except OSError as exc:
+            return candidate, f"cannot inspect path: {exc}"
     return candidate, None
 
 
@@ -247,6 +267,79 @@ def _secure_relative_parts(path: Path) -> tuple[Path, tuple[str, ...]]:
     if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
         raise _PurgeUnsafeError("invalid Wiki path")
     return root, relative.parts
+
+
+def _is_symlink_or_reparse(st: os.stat_result, path: Path | str) -> bool:
+    if os.path.islink(path) or stat.S_ISLNK(st.st_mode):
+        return True
+    if getattr(st, "st_reparse_tag", 0) != 0:
+        return True
+    file_attr = getattr(st, "st_file_attributes", 0)
+    reparse_attr = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    if bool(file_attr & reparse_attr):
+        return True
+    return False
+
+
+def _verify_secure_path(path: Path) -> tuple[Path, tuple[str, ...]]:
+    root, parts = _secure_relative_parts(path)
+    root_fspath = os.fspath(root)
+    try:
+        root_st = os.lstat(root_fspath)
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise _PurgeUnsafeError("cannot inspect Wiki root") from exc
+
+    if _is_symlink_or_reparse(root_st, root_fspath) or not stat.S_ISDIR(root_st.st_mode):
+        raise _PurgeUnsafeError("Wiki path contains a symlink or non-directory")
+
+    try:
+        resolved_root = _lexical_path(root.resolve())
+    except (ValueError, RuntimeError, OSError) as exc:
+        raise _PurgeUnsafeError("cannot resolve Wiki root") from exc
+
+    current = root
+    for component in parts[:-1]:
+        current = current / component
+        current_fspath = os.fspath(current)
+        try:
+            st = os.lstat(current_fspath)
+        except FileNotFoundError:
+            raise
+        except OSError as exc:
+            raise _PurgeUnsafeError("cannot inspect Wiki path") from exc
+
+        if _is_symlink_or_reparse(st, current_fspath) or not stat.S_ISDIR(st.st_mode):
+            raise _PurgeUnsafeError("Wiki path contains a symlink or non-directory")
+
+        try:
+            resolved_current = _lexical_path(current.resolve())
+            if not resolved_current.is_relative_to(resolved_root):
+                raise _PurgeUnsafeError("path escapes configured Wiki root")
+        except (ValueError, RuntimeError):
+            raise _PurgeUnsafeError("path escapes configured Wiki root")
+
+    target = current / parts[-1]
+    target_fspath = os.fspath(target)
+    try:
+        target_st = os.lstat(target_fspath)
+    except FileNotFoundError:
+        return root, parts
+    except OSError as exc:
+        raise _PurgeUnsafeError("cannot inspect Wiki path") from exc
+
+    if _is_symlink_or_reparse(target_st, target_fspath) or not stat.S_ISREG(target_st.st_mode):
+        raise _PurgeUnsafeError("Wiki path contains a symlink or non-regular file")
+
+    try:
+        resolved_target = _lexical_path(target.resolve())
+        if not resolved_target.is_relative_to(resolved_root):
+            raise _PurgeUnsafeError("path escapes configured Wiki root")
+    except (ValueError, RuntimeError):
+        raise _PurgeUnsafeError("path escapes configured Wiki root")
+
+    return root, parts
 
 
 def _open_secure_parent(path: Path) -> int:
@@ -301,18 +394,24 @@ def _fingerprint_fd(fd: int) -> dict[str, Any]:
     }
 
 
-def _open_secure_file(path: Path) -> tuple[int, int, str]:
-    parent_fd = _open_secure_parent(path)
-    _root, parts = _secure_relative_parts(path)
-    name = parts[-1]
-    try:
-        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
-    except OSError as exc:
-        os.close(parent_fd)
-        if exc.errno in {getattr(os, "ELOOP", 40), getattr(os, "ENOTDIR", 20)}:
-            raise _PurgeUnsafeError("Wiki path contains a symlink or non-regular file") from exc
-        raise
-    return fd, parent_fd, name
+def _open_secure_file(path: Path) -> tuple[int, int | None, str]:
+    if _purge_dirfd_supported():
+        parent_fd = _open_secure_parent(path)
+        _root, parts = _secure_relative_parts(path)
+        name = parts[-1]
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
+        except OSError as exc:
+            os.close(parent_fd)
+            if exc.errno in {getattr(os, "ELOOP", 40), getattr(os, "ENOTDIR", 20)}:
+                raise _PurgeUnsafeError("Wiki path contains a symlink or non-regular file") from exc
+            raise
+        return fd, parent_fd, name
+    else:
+        _verify_secure_path(path)
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+        fd = os.open(os.fspath(path), flags)
+        return fd, None, os.fspath(path)
 
 
 def _path_fingerprint(path: Path) -> dict[str, Any]:
@@ -326,7 +425,8 @@ def _path_fingerprint(path: Path) -> dict[str, Any]:
         return _fingerprint_fd(fd)
     finally:
         os.close(fd)
-        os.close(parent_fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
 
 
 def _backup_file(path: Path, backup_root: Path) -> Path | None:
@@ -361,23 +461,31 @@ def _backup_file(path: Path, backup_root: Path) -> Path | None:
 def _restore_backups(backups: list[tuple[Path, Path]]) -> list[str]:
     failures: list[str] = []
     for original, backup in backups:
-        parent_fd = None
-        try:
-            parent_fd = _open_secure_parent(original)
-            _root, parts = _secure_relative_parts(original)
-            os.rename(os.fspath(backup), parts[-1], dst_dir_fd=parent_fd)
-        except FileNotFoundError:
-            failures.append(f"{original}: backup or destination parent is missing")
-        except _PurgeUnsafeError as exc:
-            failures.append(f"{original}: {exc}")
-        except Exception as exc:
-            failures.append(f"{original}: {exc}")
-        finally:
-            if parent_fd is not None:
-                try:
-                    os.close(parent_fd)
-                except OSError:
-                    pass
+        if _purge_dirfd_supported():
+            parent_fd = None
+            try:
+                parent_fd = _open_secure_parent(original)
+                _root, parts = _secure_relative_parts(original)
+                os.rename(os.fspath(backup), parts[-1], dst_dir_fd=parent_fd)
+            except FileNotFoundError:
+                failures.append(f"{original}: backup or destination parent is missing")
+            except _PurgeUnsafeError as exc:
+                failures.append(f"{original}: {exc}")
+            except Exception as exc:
+                failures.append(f"{original}: {exc}")
+            finally:
+                if parent_fd is not None:
+                    try:
+                        os.close(parent_fd)
+                    except OSError:
+                        pass
+        else:
+            try:
+                original.parent.mkdir(parents=True, exist_ok=True)
+                _verify_secure_path(original)
+                shutil.copy2(backup, original)
+            except Exception as exc:
+                failures.append(f"{original}: {exc}")
     return failures
 
 
@@ -389,7 +497,13 @@ def _unlink_secure_file(path: Path, expected: dict[str, Any]) -> None:
         actual = _fingerprint_fd(fd)
         if actual != expected:
             raise _PurgeStaleError("path changed after backup")
-        os.unlink(name, dir_fd=parent_fd)
+        if _purge_dirfd_supported():
+            os.unlink(name, dir_fd=parent_fd)
+        else:
+            os.close(fd)
+            fd = None
+            _verify_secure_path(path)
+            os.unlink(os.fspath(path))
     finally:
         if fd is not None:
             try:

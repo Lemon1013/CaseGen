@@ -77,7 +77,16 @@ def citation_label_map_from_context(citations: Iterable[Mapping[str, Any]]) -> d
         label = str(citation.get("label") or citation.get("citation_id") or "").strip()
         citation_id = citation.get("task_citation_id")
         if label and citation_id is not None:
-            mapping[label.strip("[]").lower()] = int(citation_id)
+            clean = label.strip("[]").lower()
+            cid = int(citation_id)
+            mapping[clean] = cid
+            mapping[f"[{clean}]"] = cid
+            if clean.startswith("e") and clean[1:].isdigit():
+                num = clean[1:]
+                mapping[f"e-{num}"] = cid
+                mapping[f"ext-{num}"] = cid
+                mapping[f"external-{num}"] = cid
+                mapping[f"[e-{num}]"] = cid
     return mapping
 
 
@@ -95,9 +104,11 @@ def _citation_ids(
         if not raw:
             continue
         candidate: int | None = None
-        # ``raw`` is a model-visible label such as ``1`` or ``S1``.  Only the
+        # ``raw`` is a model-visible label such as ``1``, ``S1``, or ``E1``. Only the
         # explicit prompt map is accepted; never compare it with DB ids.
         candidate = labels.get(raw.lower())
+        if candidate is None:
+            candidate = labels.get(raw.strip("[]").lower())
         if candidate is None:
             unknown += 1
             continue

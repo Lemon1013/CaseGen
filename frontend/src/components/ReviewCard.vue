@@ -69,9 +69,9 @@ const highScore = computed(() => score.value != null && score.value >= 80)
 }
 
 .review-card.highlight {
-  border-color: rgba(18, 184, 134, 0.45);
-  box-shadow: 0 0 0 1px rgba(18, 184, 134, 0.15);
-  background: linear-gradient(180deg, rgba(18, 184, 134, 0.08) 0%, #fff 48%);
+  border-color: rgba(16, 185, 129, 0.35);
+  box-shadow: 0 0 0 1px rgba(16, 185, 129, 0.15);
+  background: linear-gradient(180deg, rgba(16, 185, 129, 0.06) 0%, #fff 48%);
 }
 
 .header {
@@ -100,21 +100,22 @@ const highScore = computed(() => score.value != null && score.value >= 80)
 .score {
   width: 76px;
   height: 76px;
-  border-radius: 16px;
-  background: linear-gradient(135deg, #eef2ff, #f5f3ff);
+  border-radius: var(--cg-radius-lg);
+  background: #f8fafc;
   display: flex;
   align-items: center;
   justify-content: center;
   font-size: 28px;
   font-weight: 800;
-  color: var(--cg-text-secondary);
+  font-family: var(--cg-font-mono);
+  color: #71717a;
   border: 1px solid var(--cg-border);
 }
 
 .score.good {
-  background: linear-gradient(135deg, rgba(18, 184, 134, 0.16), rgba(var(--cg-primary-rgb), 0.1));
-  color: var(--cg-accent);
-  border-color: rgba(18, 184, 134, 0.3);
+  background: #ecfdf5;
+  color: #059669;
+  border-color: #a7f3d0;
 }
 
 .verdict .label {

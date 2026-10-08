@@ -93,3 +93,28 @@ def test_ping_uses_root_base_url_without_v1(tmp_app_data, monkeypatch):
     assert r.status_code == 200
     assert seen["url"] == "http://gpt.158918.xyz/v1/chat/completions"
     assert seen["model"] == "grok-4.5"
+
+
+def test_create_and_ping_responses_model(tmp_app_data, monkeypatch):
+    client = TestClient(create_app())
+    created = _create(
+        client,
+        name="o1-responses",
+        protocol="responses",
+        base_url="https://api.openai.com/v1",
+        model_name="o1",
+    )
+    assert created["protocol"] == "responses"
+
+    seen = {}
+
+    def fake_chat_completion(**kwargs):
+        seen["protocol"] = kwargs.get("protocol")
+        seen["model"] = kwargs.get("model")
+        return "pong", {}
+
+    monkeypatch.setattr("app.api.models_cfg.chat_completion", fake_chat_completion)
+    r = client.post(f"/api/models/{created['id']}/ping")
+    assert r.status_code == 200
+    assert seen["protocol"] == "responses"
+    assert seen["model"] == "o1"

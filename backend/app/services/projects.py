@@ -123,7 +123,6 @@ _PROJECT_SCOPED_PREFIXES = (
     "/api/ingest-jobs",
     "/api/wiki/pages",
     "/api/wiki/reviews",
-    "/api/wiki/index",
     "/api/wiki/retrieve",
     "/api/source-chunks",
     "/api/requirements",

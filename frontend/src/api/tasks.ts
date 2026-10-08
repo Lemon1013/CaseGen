@@ -53,6 +53,7 @@ export interface TaskCreate {
   requirement_id?: number | null
   title: string
   description: string
+  source_filename?: string | null
   focus_tags?: string[]
   model_id?: number | null
   prompt_template_id?: number | null
@@ -65,6 +66,36 @@ export interface TaskCreate {
   reference_text?: string
 }
 
+export interface DraftCaseStep {
+  step_no: number
+  action: string
+  expected: string
+}
+
+export interface DraftCaseItem {
+  case_key: string
+  title: string
+  priority: string
+  type: string
+  verification_goal: string
+  preconditions: string
+  test_data: string
+  steps: DraftCaseStep[]
+  pending_items: string[]
+  raw_md: string
+}
+
+export interface DraftPointGroup {
+  test_point_id: number | null
+  stable_key: string
+  title: string
+  verification_goal: string
+  dimension: string
+  priority: string
+  citation_ids: number[]
+  cases: DraftCaseItem[]
+}
+
 export interface CaseDraft {
   id: number
   task_id: number
@@ -72,6 +103,7 @@ export interface CaseDraft {
   content_md: string
   prompt_version_ref: string | null
   created_at: string
+  points_with_cases?: DraftPointGroup[]
 }
 
 export interface TaskEvent {
@@ -265,6 +297,10 @@ export function updateTaskModel(id: number, modelId: number | null) {
     method: 'PATCH',
     body: JSON.stringify({ model_id: modelId }),
   })
+}
+
+export function stopTask(id: number, projectId?: number | null) {
+  return api<TaskItem>(`/api/tasks/${id}/stop${_projectQuery(projectId)}`, { method: 'POST' })
 }
 
 export function createTask(body: TaskCreate) {

@@ -762,9 +762,9 @@ watch(
 }
 
 .page-item.active {
-  border-color: var(--cg-border-strong);
-  box-shadow: 0 0 0 1px rgba(var(--cg-primary-rgb), 0.12), var(--cg-shadow);
-  background: linear-gradient(90deg, rgba(var(--cg-primary-rgb), 0.06), var(--cg-surface) 40%);
+  border-color: #10b981;
+  box-shadow: 0 0 0 1px #10b981, var(--cg-shadow);
+  background: #ecfdf5;
 }
 
 .page-item.active::before {
@@ -775,7 +775,7 @@ watch(
   bottom: 10px;
   width: 3px;
   border-radius: 0 3px 3px 0;
-  background: var(--cg-gradient-brand);
+  background: #10b981;
 }
 
 .item-title {

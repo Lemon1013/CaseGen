@@ -81,6 +81,7 @@ from app.services.task_pipeline import (
     _fail_task,
 )
 from app.services.coverage import build_coverage
+from app.services.case_management import aggregate_draft_cases_by_points
 from app.services.requirement_optimizer import optimize_requirement
 from app.services.test_points import (
     TEST_DIMENSIONS,
@@ -473,6 +474,7 @@ def create_task(
             title=(body.title or "").strip(),
             description=(body.description or "").strip(),
             focus_tags_json=json.dumps(body.focus_tags or [], ensure_ascii=False),
+            source_filename=body.source_filename or None,
         )
         session.add(requirement)
         session.commit()
@@ -999,6 +1001,55 @@ def _update_task_model_locked(
     return to_task_out(session, task)
 
 
+@router.post("/{task_id}/stop", response_model=TaskOut)
+def stop_task(
+    task_id: int,
+    session: Session = Depends(get_session),
+) -> TaskOut:
+    """Manually stop a generating task and release its durable resume lease."""
+    with task_locks.hold(task_id):
+        session.expire_all()
+        return _stop_task_locked(task_id, session)
+
+
+def _stop_task_locked(task_id: int, session: Session) -> TaskOut:
+    task = session.get(GenerationTask, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if task.status != "generating":
+        raise HTTPException(status_code=409, detail="仅生成中的任务可以停止")
+
+    # ``failed`` has no outgoing edge to ``generated``: the still-running
+    # worker polls the row between LLM calls (see task_pipeline) and exits
+    # cooperatively instead of overwriting this terminal state.
+    task.status = transition(task.status, "failed")
+    task.error_message = "已手动停止生成"
+    task.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    session.add(task)
+    append_event(session, task.id, "generate", "用户手动停止生成")
+    checkpoint = session.exec(
+        select(TaskTestPointCheckpoint)
+        .where(TaskTestPointCheckpoint.task_id == task_id)
+        .where(TaskTestPointCheckpoint.status == "confirmed")
+        .order_by(col(TaskTestPointCheckpoint.attempt).desc())
+    ).first()
+    if checkpoint is not None:
+        # Release the lease: resume_status="stopped" is neither claimed|running
+        # (so recovery no longer treats it as a fresh claim) nor one of the
+        # reclaimable states (NULL/stale claim/completed), and the failed task
+        # is never selected by recover_generation_jobs anyway.  The token is
+        # kept for traceability; recovery would re-issue a fresh token first.
+        checkpoint.resume_status = "stopped"
+        checkpoint.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        session.add(checkpoint)
+    session.commit()
+    session.refresh(task)
+    # Publish post-commit so the SSE terminal event agrees with durable state
+    # (same ordering as _fail_task in the pipeline).
+    task_stream.fail(task_id, message="已手动停止生成")
+    return to_task_out(session, task)
+
+
 @router.delete("/{task_id}")
 def delete_task(task_id: int, session: Session = Depends(get_session)) -> dict:
     """Hard-delete a task and its dependent rows (drafts, reviews, events, …)."""
@@ -1177,7 +1228,7 @@ def _review_task_locked(
         task = run_review(session, task_id, chat_fn=_chat_for("review"))
         return to_task_out(session, task)
 
-    if task.status not in ("generated", "failed"):
+    if task.status not in ("generated", "failed", "reviewed"):
         task = run_review(session, task_id, chat_fn=_chat_for("review"))
         return to_task_out(session, task)
 
@@ -1342,7 +1393,7 @@ def _finalize_task_locked(
 
 
 @router.get("/{task_id}/drafts", response_model=List[CaseDraftOut])
-def list_drafts(task_id: int, session: Session = Depends(get_session)) -> list[CaseDraft]:
+def list_drafts(task_id: int, session: Session = Depends(get_session)) -> list[CaseDraftOut]:
     task = session.get(GenerationTask, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
@@ -1351,7 +1402,21 @@ def list_drafts(task_id: int, session: Session = Depends(get_session)) -> list[C
         .where(CaseDraft.task_id == task_id)
         .order_by(col(CaseDraft.version).desc())
     ).all()
-    return list(rows)
+    results: list[CaseDraftOut] = []
+    for d in rows:
+        points_with_cases = aggregate_draft_cases_by_points(session, task_id, d)
+        results.append(
+            CaseDraftOut(
+                id=int(d.id),
+                task_id=int(d.task_id),
+                version=int(d.version),
+                content_md=str(d.content_md),
+                prompt_version_ref=d.prompt_version_ref,
+                created_at=d.created_at,
+                points_with_cases=points_with_cases,
+            )
+        )
+    return results
 
 
 @router.get("/{task_id}/citations", response_model=List[TaskCitationOut])
@@ -1395,6 +1460,8 @@ def list_citations(
                 int(page.space_id) if page is not None and page.space_id is not None else default_space_id
             )
             target_available = page is not None and page_space_id == task_space_id
+        elif citation_type == "external":
+            target_available = True
         legacy = not target_available
         out.append(
             TaskCitationOut(
