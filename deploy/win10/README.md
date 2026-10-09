@@ -14,19 +14,42 @@ CaseGen/                     # 解压后的项目源码
 └── deploy/win10/
     ├── install.bat          # ① 一键安装（离线 pip，不联网）
     ├── run.bat              # ② 一键启动（单进程：后端 + 前端页面）
+    ├── package.ps1          # 生成本地项目快照
     ├── requirements-offline.txt
-    └── backend_wheels/      # 31 个 Windows 版依赖包（Python 3.11 / win_amd64，含 socksio）
+    └── backend_wheels/      # Windows 版依赖包（Python 3.11 / win_amd64）
 ```
+
+## 本地项目快照
+
+脚本按当前磁盘内容递归生成源码/项目快照，不运行 npm/pip，也不创建或检查虚拟环境。
+普通未跟踪项目文件和已有的 `frontend/dist` 会包含在内。在仓库根目录执行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\deploy\win10\package.ps1
+```
+
+默认生成 `CaseGen-intranet-YYYYMMDD-HHmmss.zip` 和对应的 `.sha256`。指定输出路径或覆盖已有文件：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\deploy\win10\package.ps1 `
+  -OutputPath .\CaseGen-intranet-manual.zip -Force
+```
+
+脚本会排除运行数据、数据库、虚拟环境、`node_modules`、开发缓存、Git 元数据、已有
+`CaseGen-*.zip*`、真实 `.env`、凭据及常见私钥文件，并跳过符号链接/目录联接等重解析点；
+完成前会校验压缩包内容与 SHA256。
+
+这是源码/项目快照，不保证解压后即可离线运行：它不包含 `.venv`、`node_modules`，也不会
+自动下载离线 wheels。目标机器仍需按下方安装说明准备 `backend_wheels/` 和 Python 依赖。
 
 ## 部署步骤（Win10 目标机器）
 
 ### 前置要求
 
-1. 安装 **Python 3.11**（官网 python.org 下载，安装时务必勾选
+1. 安装 **64 位 Python 3.11**（不要使用 3.12/3.13；官网 python.org 下载，安装时务必勾选
    **"Add python.exe to PATH"**）。
    > 本包附带的后端依赖（`backend_wheels/`）为 **cp311 / win_amd64** 版本，
-   > 已针对 Python 3.11 预下载。若改用 3.12/3.13，需在可联网机器上重新下载 wheel
-   > （命令见文末"更换 Python 版本"）。
+   > 仅支持 64 位 Python 3.11。
 2. 将整个压缩包解压到目标机器（路径不要含中文或空格更稳妥，例如 `D:\CaseGen`）。
 
 ### 第一步：安装依赖（只需一次）
@@ -53,15 +76,7 @@ CaseGen/                     # 解压后的项目源码
 - **登录认证（默认开启）**：本版内置账号认证。首次访问会进入初始化（Setup）页面创建管理员账号，之后用该账号登录；前端新增登录 / 初始化 / 用例列表页面。若不需要认证，在 `run.bat` 的启动命令前加环境变量 `CASEGEN_AUTH_ENABLED=false` 后重启。
 - **停止服务**：在 run.bat 窗口按 `Ctrl+C` 或直接关闭窗口。
 - **修改端口**：编辑 `run.bat`，把 `--port 8000` 改成其它端口。
-- **更换 Python 版本**（如改用 3.12）：在可联网的 Windows 机器上重新下载对应版本 wheel：
-
-  ```
-  cd backend
-  pip download -r requirements.txt --platform win_amd64 --python-version 3.12 --implementation cp --only-binary=:all: -d ..\deploy\win10\backend_wheels
-  ```
-
-  并把 `requirements.txt` 中 `uvicorn[standard]` 改为 `uvicorn`（uvloop 不支持 Windows），
-  同时清空 `backend_wheels\` 后再下载，避免新旧版本混用。
+- **Python 版本固定为 3.11 x64**：`install.bat` 会拒绝其它 Python 版本或 32 位解释器。
 
 ## 本机验证记录
 

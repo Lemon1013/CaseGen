@@ -1,10 +1,11 @@
+import pytest
 from fastapi.testclient import TestClient
 from sqlmodel import Session, select
 
 from app.db import _migrate_project_schema, get_engine
 from app.main import create_app
 from app import config
-from app.models.entities import Document, GenerationTask, IngestJob, Project, TaskCitation, TaskKnowledgeDecision, User, WikiPageRevision, WikiPageRow, WikiReviewItem, WikiSpace
+from app.models.entities import Document, GenerationTask, IngestJob, Project, ProjectKnowledgeDecision, ProjectWikiBinding, Requirement, TaskCitation, TaskKnowledgeDecision, User, WikiPageRevision, WikiPageRow, WikiReviewItem, WikiSpace
 from app.services.auth import hash_password
 from app.services.wiki_repository import WikiRepository
 from app.services.wiki_schema import WikiFrontmatter, WikiPage
@@ -103,6 +104,106 @@ def test_legacy_space_backfill_creates_project_without_making_it_shared(tmp_app_
         assert legacy.scope == "project"
         assert project.slug == "legacy"
         assert project.default_wiki_space_id == legacy_id
+
+
+def test_normal_project_backfill_twice_keeps_owner_and_project_count(tmp_app_data):
+    client = TestClient(create_app())
+    project = client.post("/api/projects", json={"name": "Stable", "slug": "stable"}).json()
+    before = len(client.get("/api/projects").json())
+    _migrate_project_schema(get_engine(), backfill=True)
+    _migrate_project_schema(get_engine(), backfill=True)
+    with Session(get_engine()) as session:
+        assert len(session.exec(select(Project)).all()) == before
+        space = session.get(WikiSpace, project["default_wiki_space_id"])
+        assert space.project_id == project["id"]
+        assert session.get(Project, project["id"]).default_wiki_space_id == space.id
+
+
+def test_project_backfill_is_idempotent_and_repairs_strict_duplicate(tmp_app_data):
+    client = TestClient(create_app())
+    canonical = client.post("/api/projects", json={"name": "Repair", "slug": "repair"}).json()
+    outsider = client.post("/api/projects", json={"name": "Outside", "slug": "outside"}).json()
+    space_id = canonical["default_wiki_space_id"]
+    with Session(get_engine()) as session:
+        duplicate = Project(name="Repair Wiki", slug="repair-wiki", default_wiki_space_id=space_id)
+        session.add(duplicate); session.flush()
+        duplicate_id = int(duplicate.id)
+        space = session.get(WikiSpace, space_id); space.project_id = duplicate_id
+        requirement = Requirement(project_id=duplicate_id, title="R", description="D")
+        session.add(requirement); session.flush()
+        task = GenerationTask(requirement_id=int(requirement.id), project_id=duplicate_id, wiki_space_id=space_id, status="draft")
+        session.add(task); session.commit()
+        requirement_id, task_id = int(requirement.id), int(task.id)
+
+    _migrate_project_schema(get_engine(), backfill=True)
+    _migrate_project_schema(get_engine(), backfill=True)
+    with Session(get_engine()) as session:
+        assert len(session.exec(select(Project)).all()) == 3  # default, canonical, outsider
+        assert session.get(Project, duplicate_id) is None
+        assert session.get(Project, canonical["id"]).default_wiki_space_id == space_id
+        assert session.get(WikiSpace, space_id).project_id == canonical["id"]
+        assert session.get(Requirement, requirement_id).project_id == canonical["id"]
+        assert session.get(GenerationTask, task_id).project_id == canonical["id"]
+    for path in ("/api/data-pools", "/api/platforms", "/api/platform-cases"):
+        assert client.get(path, params={"project_id": canonical["id"], "wiki_space_id": space_id}).status_code == 200
+        assert client.get(path, params={"project_id": outsider["id"], "wiki_space_id": space_id}).status_code == 404
+
+
+def _make_strict_duplicate(session: Session, slug: str):
+    canonical = Project(name=slug, slug=slug)
+    session.add(canonical); session.flush()
+    space = WikiSpace(name=slug, slug=f"{slug}-wiki", project_id=int(canonical.id))
+    session.add(space); session.flush()
+    duplicate = Project(name=f"{slug} wiki", slug=f"{slug}-wiki", default_wiki_space_id=int(space.id))
+    session.add(duplicate); session.flush()
+    canonical.default_wiki_space_id = int(space.id)
+    space.project_id = int(duplicate.id)
+    session.commit()
+    return int(canonical.id), int(duplicate.id), int(space.id)
+
+
+def test_project_backfill_binding_conflict_rolls_back(tmp_app_data):
+    TestClient(create_app())
+    with Session(get_engine()) as session:
+        canonical_id, duplicate_id, space_id = _make_strict_duplicate(session, "binding-repair")
+        shared = WikiSpace(name="Shared", slug="binding-shared", scope="shared", namespace="binding")
+        session.add(shared); session.flush()
+        session.add(ProjectWikiBinding(project_id=canonical_id, wiki_space_id=int(shared.id), priority=10, enabled=True))
+        session.add(ProjectWikiBinding(project_id=duplicate_id, wiki_space_id=int(shared.id), priority=20, enabled=True))
+        session.commit()
+    with pytest.raises(RuntimeError, match="conflicting shared wiki binding"):
+        _migrate_project_schema(get_engine(), backfill=True)
+    with Session(get_engine()) as session:
+        assert session.get(Project, duplicate_id) is not None
+        assert session.get(WikiSpace, space_id).project_id == duplicate_id
+
+
+def test_project_backfill_decision_conflict_rolls_back(tmp_app_data):
+    TestClient(create_app())
+    with Session(get_engine()) as session:
+        canonical_id, duplicate_id, space_id = _make_strict_duplicate(session, "decision-repair")
+        session.add(ProjectKnowledgeDecision(project_id=canonical_id, conflict_key="topic", selected_page_id=1, selected_revision=1))
+        session.add(ProjectKnowledgeDecision(project_id=duplicate_id, conflict_key="topic", selected_page_id=2, selected_revision=1))
+        session.commit()
+    with pytest.raises(RuntimeError, match="conflicting knowledge decision"):
+        _migrate_project_schema(get_engine(), backfill=True)
+    with Session(get_engine()) as session:
+        assert session.get(Project, duplicate_id) is not None
+        assert session.get(WikiSpace, space_id).project_id == duplicate_id
+
+
+def test_project_backfill_decision_audit_conflict_rolls_back(tmp_app_data):
+    TestClient(create_app())
+    with Session(get_engine()) as session:
+        canonical_id, duplicate_id, space_id = _make_strict_duplicate(session, "decision-audit-repair")
+        session.add(ProjectKnowledgeDecision(project_id=canonical_id, conflict_key="topic", selected_page_id=1, selected_revision=1, decided_by="alice", reason="reviewed"))
+        session.add(ProjectKnowledgeDecision(project_id=duplicate_id, conflict_key="topic", selected_page_id=1, selected_revision=1, decided_by="bob", reason="imported"))
+        session.commit()
+    with pytest.raises(RuntimeError, match="conflicting knowledge decision"):
+        _migrate_project_schema(get_engine(), backfill=True)
+    with Session(get_engine()) as session:
+        assert session.get(Project, duplicate_id) is not None
+        assert session.get(WikiSpace, space_id).project_id == duplicate_id
 
 
 def test_shared_write_endpoints_require_admin(tmp_app_data, monkeypatch):
