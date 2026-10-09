@@ -14,22 +14,33 @@ CaseGen/                     # 解压后的项目源码
 └── deploy/win10/
     ├── install.bat          # ① 一键安装（离线 pip，不联网）
     ├── run.bat              # ② 一键启动（单进程：后端 + 前端页面）
-    ├── package.ps1          # 在联网构建机生成离线 ZIP
+    ├── package.ps1          # 生成本地项目快照
     ├── requirements-offline.txt
     └── backend_wheels/      # Windows 版依赖包（Python 3.11 / win_amd64）
 ```
 
-## 在联网构建机打包
+## 本地项目快照
 
-构建机需安装 Git、Node.js/npm 和 Python（含 pip），并能访问 npm 与 PyPI。在仓库根目录执行：
+脚本按当前磁盘内容递归生成源码/项目快照，不运行 npm/pip，也不创建或检查虚拟环境。
+普通未跟踪项目文件和已有的 `frontend/dist` 会包含在内。在仓库根目录执行：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\deploy\win10\package.ps1
 ```
 
-脚本会重新构建前端、下载 Python 3.11 / win_amd64 wheel，并在仓库根目录生成
-`CaseGen-intranet-win10-py311-YYYYMMDD.zip` 及对应 `.sha256`。目标文件已存在时可加
-`-Force`，也可用 `-OutputPath <路径.zip>` 指定输出位置。
+默认生成 `CaseGen-intranet-YYYYMMDD-HHmmss.zip` 和对应的 `.sha256`。指定输出路径或覆盖已有文件：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\deploy\win10\package.ps1 `
+  -OutputPath .\CaseGen-intranet-manual.zip -Force
+```
+
+脚本会排除运行数据、数据库、虚拟环境、`node_modules`、开发缓存、Git 元数据、已有
+`CaseGen-*.zip*`、真实 `.env`、凭据及常见私钥文件，并跳过符号链接/目录联接等重解析点；
+完成前会校验压缩包内容与 SHA256。
+
+这是源码/项目快照，不保证解压后即可离线运行：它不包含 `.venv`、`node_modules`，也不会
+自动下载离线 wheels。目标机器仍需按下方安装说明准备 `backend_wheels/` 和 Python 依赖。
 
 ## 部署步骤（Win10 目标机器）
 
