@@ -2,7 +2,7 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { listWikiSpaces, type WikiSpace } from '../api/wikiSpaces'
-import { archiveDataPool, createDataPool, listDataPools, type DataPool } from '../api/platformData'
+import { archiveDataPool, createDataPool, deleteDataPool, listDataPools, type DataPool } from '../api/platformData'
 
 const spaces = ref<WikiSpace[]>([])
 const spaceId = ref<number>()
@@ -50,6 +50,18 @@ async function archive(row: DataPool) {
   }
 }
 
+async function remove(row: DataPool) {
+  if (!spaceId.value) return
+  try {
+    await ElMessageBox.confirm(`永久删除数据池「${row.name}」及其所有版本？此操作不可恢复。`, '确认永久删除', { type: 'warning' })
+    await deleteDataPool(row.id, spaceId.value)
+    await load()
+    ElMessage.success('数据池已永久删除')
+  } catch (e) {
+    if (e !== 'cancel' && e !== 'close') ElMessage.error(`删除失败：${(e as Error).message}`)
+  }
+}
+
 onMounted(init)
 </script>
 
@@ -64,6 +76,7 @@ onMounted(init)
           <div v-if="pool.latest_revision" class="meta">版本 {{ pool.latest_revision.revision }} · {{ pool.latest_revision.source_kind }} · {{ pool.latest_revision.record_count }} 条</div>
           <el-collapse v-if="pool.latest_revision"><el-collapse-item title="Schema 与记录预览"><pre>{{ JSON.stringify(pool.latest_revision.schema, null, 2) }}</pre><pre>{{ JSON.stringify(pool.latest_revision.records.slice(0, 5), null, 2) }}</pre></el-collapse-item></el-collapse>
           <el-button v-if="pool.status === 'active'" link type="danger" @click="archive(pool)">归档</el-button>
+          <el-button v-else-if="pool.status === 'archived'" link type="danger" @click="remove(pool)">删除</el-button>
         </el-card>
       </el-col>
     </el-row>

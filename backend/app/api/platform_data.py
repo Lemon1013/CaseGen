@@ -295,6 +295,37 @@ def archive_data_pool(pool_id: int, wiki_space_id: int = Query(ge=1), session: S
     return _pool_out(session, row)
 
 
+@router.delete("/api/data-pools/{pool_id}")
+def delete_data_pool(pool_id: int, wiki_space_id: int = Query(ge=1), session: Session = Depends(get_session)) -> dict[str, bool]:
+    _space(session, wiki_space_id)
+    row = session.get(DataPool, pool_id)
+    if row is None or row.wiki_space_id != wiki_space_id:
+        raise HTTPException(status_code=404, detail="Data pool not found")
+    if row.status != "archived":
+        raise HTTPException(status_code=409, detail="请先归档数据池，再永久删除")
+
+    revisions = session.exec(select(DataPoolRevision).where(DataPoolRevision.data_pool_id == row.id)).all()
+    revision_ids = {item.id for item in revisions}
+    runs = session.exec(select(PlatformRenderRun).where(PlatformRenderRun.wiki_space_id == wiki_space_id)).all()
+    for run in runs:
+        manifest = _json(run.input_snapshot_json, {})
+        refs = manifest.get("data_refs", []) if isinstance(manifest, dict) else []
+        if not isinstance(refs, list):
+            continue
+        if any(
+            isinstance(item, dict)
+            and (item.get("pool_id") == row.id or item.get("revision_id") in revision_ids)
+            for item in refs
+        ):
+            raise HTTPException(status_code=409, detail="该数据池已被生成历史引用，不能永久删除")
+
+    for revision in revisions:
+        session.delete(revision)
+    session.delete(row)
+    session.commit()
+    return {"ok": True}
+
+
 def _example_out(row: PlatformExample) -> ExampleOut:
     return ExampleOut(**row.model_dump())
 

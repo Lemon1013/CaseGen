@@ -11,7 +11,7 @@ import { useProjectStore } from '../projectStore'
 
 interface TreeNode { id: string; label: string; children?: TreeNode[] }
 const projects=useProjectStore()
-const spaceId=computed(()=>projects.current.value?.default_wiki_space_id??undefined)
+const spaceId=projects.defaultWikiSpaceId
 const platforms=ref<PlatformProfile[]>([]),rows=ref<PlatformCaseSummary[]>([])
 const page=ref(1),pageSize=ref(20),total=ref(0)
 const loading=ref(false),detailLoading=ref(false),drawer=ref(false),detail=ref<PlatformCaseDetail>(),dialog=ref(false),saving=ref(false)
@@ -45,7 +45,7 @@ onMounted(init)
 
 <template><div class="page">
   <div class="page-header"><div><h1 class="page-title">平台用例管理</h1><p class="page-subtitle">编辑生成产物的管理副本；历史生成记录与原始产物始终保持不变。</p></div></div>
-  <el-empty v-if="!spaceId" description="当前空间没有默认知识库"/>
+  <el-empty v-if="!spaceId" description="当前空间默认知识库配置异常，请到知识库管理检查"/>
   <template v-else><el-card shadow="never" class="filters"><el-form inline><el-form-item label="平台"><el-select v-model="filters.platform_id" clearable style="width:170px" @change="changeFilterPlatform"><el-option v-for="p in platforms" :key="p.id" :label="p.name" :value="p.id"/></el-select></el-form-item><el-form-item label="示例类型"><el-select v-model="filters.variant_id" clearable style="width:170px" @change="applyFilters"><el-option v-for="v in filterPlatform?.variants||[]" :key="v.id" :label="v.name" :value="v.id"/></el-select></el-form-item><el-form-item label="格式"><el-select v-model="filters.media_type" clearable style="width:160px" @change="applyFilters"><el-option label="JSON" value="application/json"/><el-option label="CSV" value="text/csv"/><el-option label="Markdown" value="text/markdown"/><el-option label="纯文本" value="text/plain"/></el-select></el-form-item><el-form-item><el-input v-model="filters.search" clearable placeholder="搜索文件名或名称" @keyup.enter="applyFilters" @clear="applyFilters"/></el-form-item><el-form-item><el-checkbox v-model="filters.include_archived" @change="applyFilters">显示已归档</el-checkbox></el-form-item><el-form-item><el-button @click="applyFilters">查询</el-button></el-form-item></el-form></el-card>
   <el-card shadow="never" class="list"><el-table v-loading="loading" :data="rows" row-key="id" @row-click="openDetail"><el-table-column prop="filename" label="文件名" min-width="180"/><el-table-column prop="platform_name" label="平台"/><el-table-column prop="variant_name" label="示例类型"/><el-table-column prop="media_type" label="格式" min-width="140"/><el-table-column prop="source_run_id" label="来源 Run" width="105"><template #default="{row}">{{row.source_run_id||'手工'}}</template></el-table-column><el-table-column prop="updated_at" label="更新时间" min-width="175"/><el-table-column prop="status" label="状态" width="90"><template #default="{row}"><el-tag :type="row.status==='active'?'success':'info'">{{row.status==='active'?'使用中':'已归档'}}</el-tag></template></el-table-column></el-table><el-empty v-if="!loading&&!rows.length" description="暂无平台用例，可通过生成平台产物获得"/><el-pagination v-if="total" v-model:current-page="page" v-model:page-size="pageSize" class="pager" :page-sizes="[20,50,100]" layout="total, sizes, prev, pager, next" :total="total" @current-change="load" @size-change="()=>{page=1;load()}"/></el-card></template>
 
