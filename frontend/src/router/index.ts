@@ -41,6 +41,12 @@ const router = createRouter({
           meta: { title: '生成任务详情', description: '查看生成草稿、评审结果与执行时间线' },
         },
         {
+          path: 'agent',
+          name: 'agent-chat',
+          component: () => import('../views/AgentChatView.vue'),
+          meta: { title: 'Agent 对话', description: '选择专家技能，与 Agent 多轮对话生成测试用例' },
+        },
+        {
           path: 'cases',
           name: 'cases',
           component: () => import('../views/CasesView.vue'),

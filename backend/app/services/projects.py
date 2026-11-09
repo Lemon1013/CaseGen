@@ -3,6 +3,7 @@ from sqlmodel import Session, select
 
 from app import config
 from app.models.entities import (
+    AgentConversation,
     DataPool,
     Document,
     GenerationTask,
@@ -115,6 +116,16 @@ def validate_request_project_scope(
         requirement = session.get(Requirement, case.requirement_id) if case else None
         if case is None or requirement is None or requirement.project_id != project_id:
             raise ValueError("Test case not found in project")
+    agent_match = re.fullmatch(r"/api/agent/conversations/([A-Za-z0-9_-]+)(?:/.*)?", path)
+    if agent_match:
+        # AgentConversation.project_id is a uuid-string column, so both sides
+        # are compared as text.  /api/agent is intentionally absent from
+        # _PROJECT_SCOPED_PREFIXES (the agent plane validates ownership in its
+        # own handlers); this rule is defence in depth should the prefix list
+        # ever grow.
+        conversation = session.get(AgentConversation, agent_match.group(1))
+        if conversation is None or str(conversation.project_id) != str(project_id):
+            raise ValueError("Agent conversation not found in project")
 
 
 _PROJECT_SCOPED_PREFIXES = (

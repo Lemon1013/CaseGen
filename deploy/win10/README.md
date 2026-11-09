@@ -63,6 +63,61 @@ CaseGen/                     # 解压后的项目源码
   并把 `requirements.txt` 中 `uvicorn[standard]` 改为 `uvicorn`（uvloop 不支持 Windows），
   同时清空 `backend_wheels\` 后再下载，避免新旧版本混用。
 
+## DSH Agent 会话（line A，可选能力）
+
+CaseGen 后端通过本地 **DeepSeek Harness（DSH）web-service** 提供「Agent 对话」能力。
+浏览器永远不直接访问 DSH 端口，所有请求都由后端代理。
+
+### 前置条件（目标机器需要额外安装）
+
+1. 安装 DSH 本体，并启用其 **web-service / dsh-webapi** 插件；
+2. 服务监听回环地址 `127.0.0.1:31800`（默认 `authEnabled=false`，即不需要令牌）；
+3. 存活探测：浏览器或命令行访问 `http://127.0.0.1:31800/api/v1/presets`，
+   返回 `{"ok":true,...}` 即表示服务可用；
+4. 若目标机器**没有** DSH 运行时，把 `AGENT_ENABLED` 设为 `false`：
+   `/api/agent/*` 全部返回 **410**，前端菜单软降级隐藏，其余功能不受影响。
+
+### 两种配置途径（本启动命令没有 `--env-file`）
+
+`run.bat` 的启动命令是 `python -m uvicorn app.main:app ...`，**不带 `--env-file`**，
+所以 `backend/.env` 在这条路径下**不会被读取**。可选：
+
+- **途径 A（推荐，随包生效）**：直接改 `run.bat` 中已有的
+  `if not defined XXX set XXX=...` 语句块（位于启动命令之前）。
+  `if not defined` 意味着系统环境变量优先级更高，不会被这里覆盖。
+- **途径 B（系统环境变量）**：在 Windows「系统属性 → 环境变量」里为当前用户设置
+  同名变量后重新打开 `run.bat`。适合运维统一配置、不希望改动脚本的场景。
+- 如确需使用 `backend/.env`，可自行把启动命令改为
+  `".venv\Scripts\python.exe" -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --env-file .env`。
+
+### 变量清单（与 `backend/app/config.py` 默认值一致）
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `DSH_BASE_URL` | `http://127.0.0.1:31800/api/v1` | DSH web-service API 根地址，仅回环 |
+| `DSH_API_TOKEN` | 空 | DSH 开启鉴权时的 Bearer 令牌 |
+| `AGENT_ENABLED` | `true` | `false` 时 `/api/agent/*` 返回 410 |
+| `AGENT_MAX_CONCURRENT` | `4` | 全局并发轮次上限（信号量） |
+| `AGENT_WORKSPACE_ROOT` | `~/.casegen/agent-workspace` | `~` 展开为用户目录，工作区不落在项目内；设为空则回退 `<APP_DATA_DIR>/agent-workspace` |
+| `AGENT_FIRST_TOKEN_TIMEOUT_SEC` | `600` | 首字读超时；模型冷加载可能 5–8 分钟 |
+| `AGENT_STALL_TIMEOUT_SEC` | `300` | 无任何帧的停滞看门狗时长 |
+| `AGENT_STAGE_MAX_CALLS` | `4` | 仅 line B 流水线预算，当前未使用 |
+| `PIPELINE_AGENT_STAGES` | 空 | 空表示全部阶段仍走旧路径 |
+| `AGENT_SKILLS_DIR` | `.agents/skills` | 技能目录（相对仓库根） |
+
+### 工作目录与安全边界
+
+- 每个对话一个独立工作目录 `<AGENT_WORKSPACE_ROOT>/<conversation_id>/`（默认
+  `~/.casegen/agent-workspace/<conversation_id>/`，已移出 `data/`）；与保存明文
+  模型 API Key 的 `<data>/meta/` 完全隔离，数据库文件永远不会成为 Agent 的工作目录；
+- 改根目录只对**新会话**生效：老会话 `workspace_dir` 已落库，删除时守卫会跳过旧
+  路径（可能留下孤儿目录，需手工清理）；Windows 用户名含中文或空格时建议改成简单
+  绝对路径（如 `D:\CaseGenAgentWorkspaces`）；
+- 会话创建后后端会立刻把 DSH 会话权限压降为 `workspace-write`；
+  压降失败则整次创建失败（绝不带 `danger-full-access` 继续）；
+- Agent 的思考过程、工具调用与工具结果**不落库、不转发、不写日志**，仅计数；
+  转发给前端的错误文案是白名单原语，不含 DSH 原始响应体、URL 或凭据。
+
 ## 本机验证记录
 
 - 后端 pytest：`350 passed`（认证、Wiki spaces、任务流式输出、测试设计工作台、检索确认点、停止生成、需求导入、外部知识库 mock）
