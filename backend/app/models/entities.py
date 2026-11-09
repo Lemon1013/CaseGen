@@ -1,7 +1,8 @@
+import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import Column, ForeignKey, Index, Integer, UniqueConstraint, text
+from sqlalchemy import Column, ForeignKey, Index, Integer, Text, UniqueConstraint, text
 from sqlmodel import Field, SQLModel
 
 from app.models.external_wiki import ProjectExternalWiki
@@ -447,6 +448,8 @@ class TaskTestPointCheckpoint(SQLModel, table=True):
 
     __tablename__ = "task_test_point_checkpoints"
 
+    coverage_metadata_json: str = Field(default="{}", sa_column=Column(Text, nullable=False, server_default="{}"))
+
     id: Optional[int] = Field(default=None, primary_key=True)
     task_id: int = Field(foreign_key="generation_tasks.id", index=True)
     retrieval_checkpoint_id: Optional[int] = Field(
@@ -841,3 +844,65 @@ class AuthSession(SQLModel, table=True):
     created_at: datetime = Field(default_factory=_utcnow)
     user_agent: Optional[str] = None
     ip: Optional[str] = None
+
+def _uuid_hex() -> str:
+    # String primary keys keep agent rows addressable across restarts and avoid
+    # the SQLite integer-id reuse hazard that task_stream.discard guards against.
+    return uuid.uuid4().hex
+
+
+class AgentConversation(SQLModel, table=True):
+    """One DSH-backed agent chat conversation, scoped to a single project.
+
+    ``project_id`` is stored as text because the conversation id itself is a
+    uuid string; the API layer converts it back to the integer project id used
+    everywhere else.  Conversation status (``active`` / ``busy`` / ``closed``)
+    deliberately does not enter the ``task_state`` machine: it describes chat
+    turn activity, not a generation task lifecycle.
+    """
+
+    __tablename__ = "agent_conversations"
+
+    id: str = Field(default_factory=_uuid_hex, primary_key=True)
+    project_id: str = Field(index=True)
+    title: str = ""
+    dsh_session_id: Optional[str] = None
+    # DSH sessions have no ``cwd`` field: the working directory comes from a
+    # workspace row, so the workspace id has to be retained for reuse.
+    dsh_workspace_id: Optional[str] = None
+    skill_name: Optional[str] = None
+    model: Optional[str] = None
+    workspace_dir: str = ""
+    status: str = Field(default="active", index=True)
+    # Cooperative cancellation: POST .../cancel flips this flag and the running
+    # turn polls it between DSH events before calling DSH cancel.
+    cancel_requested: bool = False
+    # Optimistic locking for write endpoints, following the expected_version
+    # convention used by the task and case routes.
+    version: int = 1
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow, sa_column_kwargs={"onupdate": _utcnow})
+
+
+class AgentMessage(SQLModel, table=True):
+    """Persisted assistant/user chat body plus the thinking process.
+
+    content = final answer only, reasoning = thinking process; never tool args
+    or tool results.
+
+    The full DSH-side history (including tool calls) stays queryable through
+    ``GET /sessions/:id/history`` and is intentionally not mirrored here.
+    """
+
+    __tablename__ = "agent_messages"
+
+    id: str = Field(default_factory=_uuid_hex, primary_key=True)
+    conversation_id: str = Field(index=True)
+    role: str = Field(index=True)
+    content: str = ""
+    # Thinking process shown as a collapsible panel; answer stays in content.
+    reasoning: str = ""
+    # Client-supplied dedupe key so a retried POST cannot start a second turn.
+    idempotency_key: Optional[str] = Field(default=None, index=True)
+    created_at: datetime = Field(default_factory=_utcnow)
+

@@ -97,6 +97,21 @@ def _migrate_sqlite_columns(engine) -> None:
         conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_task_retrieval_checkpoint_attempt ON task_retrieval_checkpoints(task_id, attempt)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_task_retrieval_checkpoint_task_status ON task_retrieval_checkpoints(task_id, status)"))
 
+        # Agent thinking process (user-approved display).  Idempotent: only add
+        # when the table exists and the column is missing.
+        agent_message_cols = conn.execute(
+            text("PRAGMA table_info(agent_messages)")
+        ).fetchall()
+        if agent_message_cols:
+            agent_message_names = {row[1] for row in agent_message_cols}
+            if "reasoning" not in agent_message_names:
+                conn.execute(
+                    text(
+                        "ALTER TABLE agent_messages "
+                        "ADD COLUMN reasoning TEXT DEFAULT ''"
+                    )
+                )
+
 
 def _migrate_model_defaults(engine) -> None:
     """Normalize legacy duplicate defaults, add protocol column, and install the DB constraint."""

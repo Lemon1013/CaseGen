@@ -4,6 +4,7 @@ import { useRoute, useRouter } from 'vue-router'
 import {
   Collection,
   Cpu,
+  ChatDotRound,
   CircleCheck,
   Document,
   EditPen,
@@ -20,6 +21,8 @@ import {
   SetUp,
   Upload,
   Grid,
+  Expand,
+  Fold,
 } from '@element-plus/icons-vue'
 import { listModels, type ModelConfig } from '../api/models'
 import { useAuthStore } from '../authStore'
@@ -46,6 +49,7 @@ const platformPaths = ['/platform-management', '/platform-case-generate', '/plat
 const useCaseItems = [
   { path: '/', label: '用例生成', icon: Tickets },
   { path: '/tasks', label: '生成任务', icon: List },
+  { path: '/agent', label: 'Agent 对话', icon: ChatDotRound },
   { path: '/cases', label: '用例管理', icon: Collection },
   { path: '/data-pools', label: '数据池', icon: DataAnalysis },
 ]
@@ -72,6 +76,13 @@ const wikiItems = [
 
 const wikiExpanded = ref(false)
 const platformExpanded = ref(false)
+
+const navCollapsed = ref(localStorage.getItem('casegen:nav-collapsed') === '1')
+
+function toggleNav() {
+  navCollapsed.value = !navCollapsed.value
+  localStorage.setItem('casegen:nav-collapsed', navCollapsed.value ? '1' : '0')
+}
 
 const allMenuItems = computed(() => [...useCaseItems, ...platformItems, ...wikiItems, ...systemItems])
 
@@ -105,6 +116,26 @@ function toggleWiki() {
 
 function togglePlatform() {
   platformExpanded.value = !platformExpanded.value
+}
+
+function onPlatformGroupClick() {
+  if (navCollapsed.value) {
+    navCollapsed.value = false
+    localStorage.setItem('casegen:nav-collapsed', '0')
+    platformExpanded.value = true
+    return
+  }
+  togglePlatform()
+}
+
+function onWikiGroupClick() {
+  if (navCollapsed.value) {
+    navCollapsed.value = false
+    localStorage.setItem('casegen:nav-collapsed', '0')
+    wikiExpanded.value = true
+    return
+  }
+  toggleWiki()
 }
 
 watch(
@@ -161,7 +192,7 @@ onMounted(async () => {
 
 <template>
   <el-container class="main-layout">
-    <el-aside width="228px" class="sidebar">
+    <el-aside width="228px" class="sidebar" :class="{ 'sidebar--collapsed': navCollapsed }">
       <div class="logo">
         <BrandMark class="logo-mark" :size="36" title="CaseGen 用例叠层" />
         <div class="logo-text">
@@ -179,6 +210,7 @@ onMounted(async () => {
             :to="{ path: item.path, query: projectQuery }"
             class="nav-item"
             :class="{ active: isActive(item.path) }"
+            :title="item.label"
           >
             <el-icon class="nav-icon" :size="18">
               <component :is="item.icon" />
@@ -188,7 +220,7 @@ onMounted(async () => {
         </section>
 
         <section class="nav-group wiki-group">
-          <button type="button" class="nav-group-toggle" :class="{ active: isPlatformActive }" :aria-expanded="platformExpanded" aria-controls="platform-submenu" @click="togglePlatform">
+          <button type="button" class="nav-group-toggle" :class="{ active: isPlatformActive }" :aria-expanded="platformExpanded" aria-controls="platform-submenu" title="平台适配" @click="onPlatformGroupClick">
             <el-icon class="nav-icon" :size="18"><Connection /></el-icon><span>平台适配</span><el-icon class="nav-chevron" :size="14"><ArrowDown v-if="platformExpanded"/><ArrowRight v-else/></el-icon>
           </button>
           <div v-show="platformExpanded" id="platform-submenu" class="nav-submenu">
@@ -203,7 +235,8 @@ onMounted(async () => {
             :class="{ active: isWikiActive }"
             :aria-expanded="wikiExpanded"
             aria-controls="wiki-submenu"
-            @click="toggleWiki"
+            title="Wiki 知识库"
+            @click="onWikiGroupClick"
           >
             <el-icon class="nav-icon" :size="18"><Reading /></el-icon>
             <span>Wiki 知识库</span>
@@ -236,6 +269,7 @@ onMounted(async () => {
             :to="{ path: item.path, query: projectQuery }"
             class="nav-item"
             :class="{ active: isActive(item.path) }"
+            :title="item.label"
           >
             <el-icon class="nav-icon" :size="18">
               <component :is="item.icon" />
@@ -245,6 +279,17 @@ onMounted(async () => {
         </section>
       </nav>
 
+      <button
+        type="button"
+        class="sidebar-collapse"
+        :title="navCollapsed ? '展开导航' : '收起导航'"
+        :aria-label="navCollapsed ? '展开导航' : '收起导航'"
+        @click="toggleNav"
+      >
+        <el-icon :size="18"><Expand v-if="navCollapsed" /><Fold v-else /></el-icon>
+        <span v-if="!navCollapsed">收起导航</span>
+      </button>
+
       <div class="sidebar-footer">
         <div class="footer-label">Quality First</div>
         <div class="footer-hint">文档 → Wiki → 生成 → 评审</div>
@@ -252,7 +297,11 @@ onMounted(async () => {
     </el-aside>
 
     <!-- direction=vertical: topbar above content (default horizontal left the title column empty) -->
-    <el-container class="body" direction="vertical">
+    <el-container
+      class="body"
+      :class="{ 'body--fill': route.name === 'agent-chat', 'body--nav-collapsed': navCollapsed }"
+      direction="vertical"
+    >
       <header class="topbar">
         <div class="topbar-left">
           <h1 class="topbar-title">{{ pageTitle }}</h1>
@@ -300,6 +349,7 @@ onMounted(async () => {
   flex-direction: column;
   border-right: 1px solid #18181b;
   overflow: hidden;
+  transition: width 0.18s ease;
 }
 
 .logo {
@@ -337,6 +387,13 @@ onMounted(async () => {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.nav-item span,
+.nav-group-toggle span,
+.nav-group-title {
+  white-space: nowrap;
 }
 
 .nav-group {
@@ -462,6 +519,10 @@ onMounted(async () => {
 }
 
 .sidebar-footer {
+  flex: 0 0 auto;
+  height: 68px;
+  box-sizing: border-box;
+  overflow: hidden;
   padding: 16px 18px 20px;
   border-top: 1px solid #18181b;
 }
@@ -486,6 +547,93 @@ onMounted(async () => {
   min-width: 0;
   min-height: 100vh;
   background: var(--cg-bg-glow);
+  transition: margin-left 0.18s ease;
+}
+
+.sidebar--collapsed {
+  width: 68px !important;
+}
+
+.body--nav-collapsed {
+  margin-left: 68px;
+}
+
+.sidebar--collapsed .logo {
+  padding: 18px 0;
+  justify-content: center;
+}
+
+.sidebar--collapsed .logo-text,
+.sidebar--collapsed .nav-group-title,
+.sidebar--collapsed .nav-item span,
+.sidebar--collapsed .nav-group-toggle span,
+.sidebar--collapsed .nav-chevron,
+.sidebar--collapsed .nav-submenu,
+.sidebar--collapsed .sidebar-collapse span {
+  display: none;
+}
+
+.sidebar--collapsed .sidebar-footer {
+  visibility: hidden;
+  padding-left: 0;
+  padding-right: 0;
+}
+
+.sidebar--collapsed .nav {
+  padding: 14px 8px;
+}
+
+.sidebar--collapsed .nav-item,
+.sidebar--collapsed .nav-group-toggle {
+  justify-content: center;
+  padding-left: 0;
+  padding-right: 0;
+  gap: 0;
+}
+
+.sidebar-collapse {
+  align-self: flex-start;
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: auto;
+  height: 36px;
+  margin: 0 16px 12px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: #a1a1aa;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.sidebar-collapse:hover {
+  background: rgba(255, 255, 255, 0.06);
+  color: #fff;
+}
+
+.sidebar--collapsed .sidebar-collapse {
+  justify-content: flex-start;
+  margin-left: 16px;
+  margin-right: 0;
+  padding: 0 12px;
+}
+
+.body--fill {
+  height: 100vh;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.body--fill .main-content {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .topbar {
@@ -605,6 +753,21 @@ onMounted(async () => {
 
   .body {
     margin-left: 0;
+  }
+
+  .body--nav-collapsed {
+    margin-left: 0;
+  }
+
+  .body--fill {
+    height: auto;
+    min-height: 100vh;
+    overflow: visible;
+  }
+
+  .body--fill .main-content {
+    overflow: visible;
+    display: block;
   }
 
   .topbar {

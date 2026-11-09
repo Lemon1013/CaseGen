@@ -33,6 +33,9 @@ def pytest_sessionstart(session):
     temp_dir = _PYTEST_SESSION_ROOT / "tmp"
     temp_dir.mkdir(parents=True, exist_ok=True)
     os.environ["APP_DATA_DIR"] = str(data_dir)
+    # Keep the production default (~/.casegen/agent-workspace) out of tests:
+    # an empty value makes agent_workspace_root() follow the temp APP_DATA_DIR.
+    os.environ["AGENT_WORKSPACE_ROOT"] = ""
     for name in ("TEMP", "TMP", "TMPDIR"):
         os.environ[name] = str(temp_dir)
     tempfile.tempdir = str(temp_dir)
