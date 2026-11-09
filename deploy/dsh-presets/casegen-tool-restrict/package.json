@@ -1,0 +1,17 @@
+{
+  "name": "@local/dsh-casegen-tool-restrict",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./tool-restrict.mjs": "./tool-restrict.mjs",
+    "./casegen-tool-restrict.mjs": "./casegen-tool-restrict.mjs",
+    "./casegen-tool-restrict-entry.mjs": "./casegen-tool-restrict-entry.mjs"
+  },
+  "files": [
+    "tool-restrict.mjs",
+    "casegen-tool-restrict.mjs",
+    "casegen-tool-restrict-entry.mjs",
+    "selftest.mjs"
+  ]
+}
