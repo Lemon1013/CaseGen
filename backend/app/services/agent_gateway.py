@@ -36,7 +36,7 @@ from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import Any, Literal, Optional, Union
 from urllib.parse import quote
 
 import httpx
@@ -707,6 +707,43 @@ def ensure_workspace_dir(conversation_id: str) -> Path:
     return target
 
 
+def project_workspace_dir(project_id: Union[str, int]) -> Path:
+    """Resolve and guard the per-project shared workspace directory.
+
+    The directory must stay strictly under the configured workspace root.
+    Directory format: 'project-{id}' (e.g. 'project-1').
+    """
+
+    raw = str(project_id or "").strip()
+    if not raw:
+        raise AgentGatewayError(_category_message("bad_response"), category="bad_response")
+    root = Path(config.agent_workspace_root()).resolve()
+    candidate = (root / raw).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        raise AgentGatewayError(
+            _category_message("configuration"), category="configuration"
+        ) from None
+    dir_name = f"project-{raw}" if not raw.startswith("project-") else raw
+    target = (root / dir_name).resolve()
+    try:
+        target.relative_to(root)
+    except ValueError:
+        raise AgentGatewayError(
+            _category_message("configuration"), category="configuration"
+        ) from None
+    return target
+
+
+def ensure_project_workspace_dir(project_id: Union[str, int]) -> Path:
+    """Create the project workspace directory and return its path."""
+
+    target = project_workspace_dir(project_id)
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
 def _split_model(model: Optional[str]) -> tuple[str, str]:
     """Split a 'provider/model' string into (provider, model)."""
 
@@ -874,37 +911,77 @@ class DshAgentGateway:
         self,
         *,
         conversation_id: str,
+        project_id: Optional[Union[str, int]] = None,
+        workspace_dir: Optional[Union[str, Path]] = None,
         title: str = "",
         model: Optional[str] = None,
         workspace_id: Optional[str] = None,
         agent_preset: Optional[str] = None,
         transport: Optional[httpx.BaseTransport] = None,
     ) -> SessionHandle:
-        """Three-step session provisioning (spec 3.3 erratum, lead-approved).
+        """Three-step session provisioning with workspace reuse and fallback.
 
-        DSH has no cwd field on POST /sessions, so the working directory comes
-        from a workspace row: create the workspace (path guarded under the
-        workspace root), create the session bound to it, then downgrade the
-        permission preset from the danger-full-access default to
-        workspace-write.  If the downgrade fails the whole call fails; the
-        gateway never continues with full access.
+        Supports per-project shared workspace directory and workspace reuse.
+        If an existing workspace_id fails with not_found (404), it falls back
+        to creating a new workspace under the resolved workspace directory.
         """
 
-        workspace_dir = ensure_workspace_dir(conversation_id)
+        if workspace_dir:
+            resolved_workspace_dir = Path(workspace_dir).resolve()
+            root = Path(config.agent_workspace_root()).resolve()
+            try:
+                resolved_workspace_dir.relative_to(root)
+            except ValueError:
+                raise AgentGatewayError(
+                    _category_message("configuration"), category="configuration"
+                ) from None
+            resolved_workspace_dir.mkdir(parents=True, exist_ok=True)
+        elif project_id is not None and str(project_id).strip():
+            resolved_workspace_dir = ensure_project_workspace_dir(project_id)
+        else:
+            resolved_workspace_dir = ensure_workspace_dir(conversation_id)
+
         resolved_workspace_id = (workspace_id or "").strip()
+        session_id = None
+
+        if resolved_workspace_id:
+            try:
+                session_id = self.create_session(
+                    workspace_id=resolved_workspace_id,
+                    title=title,
+                    model=model,
+                    agent_preset=agent_preset,
+                    transport=transport,
+                )
+            except AgentGatewayError as exc:
+                if exc.category == "not_found" or getattr(exc, "http_status", None) == 404:
+                    logger.warning(
+                        "已存在的 DSH 工作区 %s 失效/404，自动重新创建降级自愈",
+                        resolved_workspace_id,
+                    )
+                    resolved_workspace_id = ""
+                else:
+                    raise
+
         if not resolved_workspace_id:
+            ws_title = (
+                f"casegen-project-{project_id}"
+                if project_id is not None and str(project_id).strip()
+                else (title or ("casegen-" + str(conversation_id)[:8]))
+            )
             resolved_workspace_id = self.create_workspace(
-                str(workspace_dir),
-                title=title or ("casegen-" + str(conversation_id)[:8]),
+                str(resolved_workspace_dir),
+                title=ws_title,
                 transport=transport,
             )
-        session_id = self.create_session(
-            workspace_id=resolved_workspace_id,
-            title=title,
-            model=model,
-            agent_preset=agent_preset,
-            transport=transport,
-        )
+            session_id = self.create_session(
+                workspace_id=resolved_workspace_id,
+                title=title,
+                model=model,
+                agent_preset=agent_preset,
+                transport=transport,
+            )
+
         try:
             self.set_permission(session_id, "workspace-write", transport=transport)
         except AgentGatewayError:
@@ -915,7 +992,7 @@ class DshAgentGateway:
         return SessionHandle(
             session_id=session_id,
             workspace_id=resolved_workspace_id,
-            cwd=str(workspace_dir),
+            cwd=str(resolved_workspace_dir),
         )
 
     def stream_prompt(
@@ -1086,11 +1163,11 @@ class _LockEntry:
     users: int = 0
 
 
-class ConversationLockRegistry:
-    """Per-conversation mutex with the TaskLockRegistry eviction discipline.
+class NamedLockPool:
+    """Named mutex pool with the TaskLockRegistry eviction discipline.
 
     Entries are removed when the holder and all waiters leave, so arbitrary
-    conversation ids cannot grow the registry without bound.
+    conversation or project ids cannot grow the pool without bound.
     """
 
     def __init__(self) -> None:
@@ -1098,8 +1175,8 @@ class ConversationLockRegistry:
         self._entries: dict[str, _LockEntry] = {}
 
     @contextmanager
-    def hold(self, conversation_id: str) -> Iterator[None]:
-        key = str(conversation_id)
+    def hold(self, name: Any) -> Iterator[None]:
+        key = str(name)
         with self._guard:
             entry = self._entries.get(key)
             if entry is None:
@@ -1119,6 +1196,9 @@ class ConversationLockRegistry:
     def size(self) -> int:
         with self._guard:
             return len(self._entries)
+
+
+ConversationLockRegistry = NamedLockPool
 
 
 class AgentSemaphore:
@@ -1147,7 +1227,8 @@ class AgentSemaphore:
             semaphore.release()
 
 
-conversation_locks = ConversationLockRegistry()
+conversation_locks = NamedLockPool()
+project_locks = NamedLockPool()
 agent_semaphore = AgentSemaphore()
 gateway = DshAgentGateway()
 
@@ -1159,6 +1240,8 @@ gateway = DshAgentGateway()
 def ensure_session(
     *,
     conversation_id: str,
+    project_id: Optional[Union[str, int]] = None,
+    workspace_dir: Optional[Union[str, Path]] = None,
     title: str = "",
     model: Optional[str] = None,
     workspace_id: Optional[str] = None,
@@ -1167,6 +1250,8 @@ def ensure_session(
 ) -> SessionHandle:
     return gateway.ensure_session(
         conversation_id=conversation_id,
+        project_id=project_id,
+        workspace_dir=workspace_dir,
         title=title,
         model=model,
         workspace_id=workspace_id,

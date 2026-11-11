@@ -36,7 +36,7 @@ from sqlmodel import Session, col, select
 
 from app import config
 from app.db import get_engine, get_session
-from app.models.entities import AgentConversation, AgentMessage
+from app.models.entities import AgentConversation, AgentMessage, Project
 from app.schemas.agent import (
     AgentCancelOut,
     AgentConversationCreate,
@@ -229,13 +229,11 @@ def _cleanup_workspace(workspace_dir: str) -> None:
     shutil.rmtree(target, ignore_errors=True)
 
 
-def _close_dsh_session(dsh_session_id: str, dsh_workspace_id: str) -> None:
-    """Release DSH-side rows for a deleted conversation (best effort)."""
+def _close_dsh_session(dsh_session_id: str) -> None:
+    """Release DSH-side session for a deleted conversation (best effort)."""
 
     if str(dsh_session_id or "").strip():
         agent_gateway.delete_session(dsh_session_id)
-    if str(dsh_workspace_id or "").strip():
-        agent_gateway.delete_workspace(dsh_workspace_id)
 
 
 def _recover_orphaned_turn(session: Session, conversation: AgentConversation) -> None:
@@ -296,12 +294,16 @@ def create_conversation(
 
     _require_agent_enabled()
     project_id = _require_project(request)
+    project = session.get(Project, project_id)
+    ws_id = project.dsh_workspace_id if project else None
+    ws_dir = project.workspace_dir if project else ""
     conversation = AgentConversation(
         project_id=str(project_id),
         title=_normalize_title(body.title),
         skill_name=(body.skill_name or "").strip() or None,
         model=(body.model or "").strip() or None,
-        workspace_dir="",
+        dsh_workspace_id=ws_id,
+        workspace_dir=ws_dir,
         status=_IDLE_STATUS,
     )
     session.add(conversation)
@@ -385,9 +387,7 @@ def delete_conversation(
         conversation = _get_conversation(session, conversation_id, project_id)
         if conversation.status == _BUSY_STATUS:
             raise HTTPException(status_code=409, detail=_DETAIL_DELETE_BUSY)
-        workspace_dir = conversation.workspace_dir
         dsh_session_id = conversation.dsh_session_id
-        dsh_workspace_id = conversation.dsh_workspace_id
         messages = session.exec(
             select(AgentMessage).where(col(AgentMessage.conversation_id) == str(conversation_id))
         ).all()
@@ -398,8 +398,8 @@ def delete_conversation(
     # Publish after the commit so a subscriber never sees a stream for a
     # conversation that no longer exists.
     agent_stream.discard(conversation_id)
-    _cleanup_workspace(workspace_dir)
-    _close_dsh_session(dsh_session_id or "", dsh_workspace_id or "")
+    # Only close the session; shared project workspace & dir are preserved.
+    _close_dsh_session(dsh_session_id or "")
     return AgentDeleteOut(id=str(conversation_id), status="deleted", message=_DETAIL_DELETE_OK)
 
 

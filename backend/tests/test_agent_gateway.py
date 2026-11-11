@@ -630,3 +630,105 @@ def test_stream_prompt_includes_model_when_provided():
     assert events[-1].kind == "completed"
     assert captured["body"]["provider"] == "openai"
     assert captured["body"]["model"] == "gpt-4o"
+
+def test_project_workspace_dir_format_and_traversal(tmp_app_data):
+    from app.services.agent_gateway import (
+        project_workspace_dir,
+        ensure_project_workspace_dir,
+        AgentGatewayError,
+    )
+
+    p1 = project_workspace_dir("1")
+    assert p1.name == "project-1"
+    assert project_workspace_dir(1).name == "project-1"
+    assert project_workspace_dir("project-1").name == "project-1"
+
+    with pytest.raises(AgentGatewayError) as caught_traversal:
+        project_workspace_dir("../evil")
+    assert caught_traversal.value.category == "configuration"
+
+    with pytest.raises(AgentGatewayError) as caught_empty:
+        project_workspace_dir("")
+    assert caught_empty.value.category == "bad_response"
+
+    created = ensure_project_workspace_dir("42")
+    assert created.is_dir()
+    assert created.name == "project-42"
+
+
+def test_named_lock_pool_mutex_and_eviction():
+    from app.services.agent_gateway import NamedLockPool
+
+    pool = NamedLockPool()
+    assert pool.size() == 0
+
+    with pool.hold("proj-1"):
+        assert pool.size() == 1
+        with pool.hold("proj-2"):
+            assert pool.size() == 2
+
+    assert pool.size() == 0
+
+
+def test_ensure_session_with_project_id_provisions_project_workspace(tmp_app_data):
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content or b"{}")
+        calls.append((request.method, request.url.path, payload))
+        path = request.url.path
+        if request.method == "POST" and path.endswith("/workspaces"):
+            return httpx.Response(200, json={"ok": True, "data": {"id": "ws-proj-1"}})
+        if request.method == "POST" and path.endswith("/sessions"):
+            return httpx.Response(200, json={"ok": True, "data": {"sessionId": "sess-proj-1"}})
+        if request.method == "PUT" and path.endswith("/permission"):
+            return httpx.Response(200, json={"ok": True, "data": {}})
+        return httpx.Response(404, json={"ok": False})
+
+    handle = agent_gateway.gateway.ensure_session(
+        conversation_id="conv-test",
+        project_id=1,
+        title="测试项目对话",
+        transport=_transport(handler),
+    )
+
+    assert handle.session_id == "sess-proj-1"
+    assert handle.workspace_id == "ws-proj-1"
+    assert handle.cwd.endswith("project-1")
+    assert calls[0][2]["path"].endswith("project-1")
+    assert calls[0][2]["title"] == "casegen-project-1"
+
+
+def test_ensure_session_recovers_when_workspace_id_is_404(tmp_app_data):
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        payload = json.loads(request.content or b"{}")
+        calls.append((request.method, path, payload))
+        if request.method == "POST" and path.endswith("/sessions"):
+            if payload.get("workspaceId") == "stale-ws-404":
+                return httpx.Response(404, json={"ok": False, "error": "Workspace not found"})
+            return httpx.Response(200, json={"ok": True, "data": {"sessionId": "recovered-sess"}})
+        if request.method == "POST" and path.endswith("/workspaces"):
+            return httpx.Response(200, json={"ok": True, "data": {"id": "recreated-ws"}})
+        if request.method == "PUT" and path.endswith("/permission"):
+            return httpx.Response(200, json={"ok": True, "data": {}})
+        return httpx.Response(404, json={"ok": False})
+
+    handle = agent_gateway.gateway.ensure_session(
+        conversation_id="conv-recover",
+        project_id=99,
+        workspace_id="stale-ws-404",
+        transport=_transport(handler),
+    )
+
+    assert handle.session_id == "recovered-sess"
+    assert handle.workspace_id == "recreated-ws"
+    assert handle.cwd.endswith("project-99")
+    # Verify sequence: tried POST /sessions -> got 404 -> fallback POST /workspaces -> POST /sessions -> PUT /permission
+    methods = [c[0] for c in calls]
+    assert methods == ["POST", "POST", "POST", "PUT"]
+    assert calls[0][2]["workspaceId"] == "stale-ws-404"
+    assert calls[2][2]["workspaceId"] == "recreated-ws"
+

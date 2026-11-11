@@ -519,3 +519,114 @@ def test_patch_conversation_model_forwards_to_dsh_session(agent_env):
     assert resp.status_code == 200
     assert resp.json()["model"] == "openai/gpt-4o"
     assert called == {"session_id": "sess-live-1", "model": "openai/gpt-4o"}
+
+def test_delete_conversation_preserves_project_shared_workspace(agent_env):
+    from app.services import agent_gateway
+    from app.services.agent_gateway import ensure_project_workspace_dir
+
+    client = agent_env.client
+    pid = _make_project(client)
+    conv = _make_conversation(client, pid)
+
+    proj_dir = ensure_project_workspace_dir(pid)
+    marker_file = proj_dir / "keep_me.txt"
+    marker_file.write_text("important project context", encoding="utf-8")
+
+    ws_deleted = []
+    sess_deleted = []
+    agent_env.monkeypatch.setattr(
+        agent_gateway, "delete_workspace", lambda wid: ws_deleted.append(wid)
+    )
+    agent_env.monkeypatch.setattr(
+        agent_gateway, "delete_session", lambda sid: sess_deleted.append(sid)
+    )
+
+    with Session(get_engine()) as session:
+        row = session.get(AgentConversation, str(conv["id"]))
+        row.dsh_session_id = "sess-to-delete"
+        row.dsh_workspace_id = "ws-shared"
+        row.workspace_dir = str(proj_dir)
+        session.add(row)
+        session.commit()
+
+    del_resp = client.delete(f"/api/agent/conversations/{conv['id']}?project_id={pid}")
+    assert del_resp.status_code == 200
+
+    # Session was deleted, but shared workspace was NOT deleted
+    assert sess_deleted == ["sess-to-delete"]
+    assert ws_deleted == []
+    # Shared project directory still exists and files are preserved
+    assert marker_file.exists()
+    assert marker_file.read_text(encoding="utf-8") == "important project context"
+
+
+def test_project_workspace_sharing_across_conversations(agent_env):
+    from types import SimpleNamespace
+    from app.models.entities import Project
+    from app.services import agent_turn, agent_gateway
+    from app.services.agent_gateway import SessionHandle, AgentEvent
+
+    client = agent_env.client
+    pid = _make_project(client)
+
+    conv1 = _make_conversation(client, pid, title="对话1")
+
+    workspace_calls = []
+
+    def fake_ensure_session(*, conversation_id, project_id=None, workspace_dir=None, title="", model=None, workspace_id=None, agent_preset=None, transport=None):
+        workspace_calls.append({
+            "conv_id": conversation_id,
+            "project_id": project_id,
+            "workspace_id": workspace_id,
+        })
+        ws = workspace_id or "ws-shared-p1"
+        return SessionHandle(
+            session_id=f"sess-{conversation_id}",
+            workspace_id=ws,
+            cwd=f"/tmp/project-{project_id}",
+        )
+
+    agent_env.monkeypatch.setattr(agent_gateway, "ensure_session", fake_ensure_session)
+    agent_env.monkeypatch.setattr(agent_gateway.gateway, "ensure_session", fake_ensure_session)
+    agent_env.monkeypatch.setattr(
+        agent_gateway,
+        "stream_prompt",
+        lambda *args, **kwargs: iter([AgentEvent(kind="completed", reason="done")]),
+    )
+
+    r1 = client.post(
+        f"/api/agent/conversations/{conv1['id']}/messages?project_id={pid}",
+        json={"content": "msg 1", "idempotency_key": "k1", "expected_version": 1},
+    )
+    assert r1.status_code == 200
+
+    agent_turn.run_turn(conv1["id"])
+
+    with Session(get_engine()) as session:
+        c1_row = session.get(AgentConversation, str(conv1["id"]))
+        p_row = session.get(Project, pid)
+        assert c1_row.dsh_session_id == f"sess-{conv1['id']}"
+        assert c1_row.dsh_workspace_id == "ws-shared-p1"
+        assert p_row.dsh_workspace_id == "ws-shared-p1"
+        assert p_row.workspace_dir == f"/tmp/project-{pid}"
+
+    conv2 = _make_conversation(client, pid, title="对话2")
+    assert conv2["workspace_dir"] == f"/tmp/project-{pid}"
+
+    r2 = client.post(
+        f"/api/agent/conversations/{conv2['id']}/messages?project_id={pid}",
+        json={"content": "msg 2", "idempotency_key": "k2", "expected_version": 1},
+    )
+    assert r2.status_code == 200
+
+    agent_turn.run_turn(conv2["id"])
+
+    with Session(get_engine()) as session:
+        c2_row = session.get(AgentConversation, str(conv2["id"]))
+        assert c2_row.dsh_session_id == f"sess-{conv2['id']}"
+        assert c2_row.dsh_workspace_id == "ws-shared-p1"
+
+    assert len(workspace_calls) == 2
+    assert workspace_calls[0]["workspace_id"] is None
+    assert workspace_calls[1]["workspace_id"] == "ws-shared-p1"
+

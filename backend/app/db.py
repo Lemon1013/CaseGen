@@ -633,7 +633,10 @@ def _migrate_project_schema(engine, *, backfill: bool = False) -> None:
             CREATE TABLE IF NOT EXISTS projects (
                 id INTEGER PRIMARY KEY, name VARCHAR NOT NULL, slug VARCHAR NOT NULL,
                 description VARCHAR NOT NULL DEFAULT '', status VARCHAR NOT NULL DEFAULT 'active',
-                default_wiki_space_id INTEGER, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                default_wiki_space_id INTEGER,
+                dsh_workspace_id VARCHAR,
+                workspace_dir VARCHAR NOT NULL DEFAULT '',
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
         """))
@@ -641,6 +644,10 @@ def _migrate_project_schema(engine, *, backfill: bool = False) -> None:
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_projects_status ON projects(status)"))
 
         additions = {
+            "projects": {
+                "dsh_workspace_id": "VARCHAR",
+                "workspace_dir": "VARCHAR NOT NULL DEFAULT ''",
+            },
             "wiki_spaces": {
                 "scope": "VARCHAR NOT NULL DEFAULT 'project'",
                 "project_id": "INTEGER",

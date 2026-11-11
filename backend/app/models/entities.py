@@ -60,6 +60,8 @@ class Project(SQLModel, table=True):
     description: str = ""
     status: str = Field(default="active", index=True)
     default_wiki_space_id: Optional[int] = Field(default=None, index=True)
+    dsh_workspace_id: Optional[str] = None
+    workspace_dir: str = ""
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow, sa_column_kwargs={"onupdate": _utcnow})
 
