@@ -356,24 +356,35 @@ def _knowledge_space_dirs(project_id: str) -> list[str]:
         return []
     try:
         with Session(get_engine()) as session:
+            project = session.get(Project, pid)
             try:
                 space_ids = project_space_ids(session, pid)
             except Exception:
                 # Project deleted / inactive must not break the chat turn.
-                return []
-            project = session.get(Project, pid)
-            preferred = (
-                int(project.default_wiki_space_id)
-                if project is not None and project.default_wiki_space_id is not None
-                else None
-            )
-            ordered = ([preferred] if preferred in space_ids else []) + [
-                sid for sid in space_ids if sid != preferred
-            ]
+                space_ids = []
+
+            ordered_sids: list[int] = []
+            if project is not None and project.default_wiki_space_id is not None:
+                try:
+                    pref_id = int(project.default_wiki_space_id)
+                    pref_space = session.get(WikiSpace, pref_id)
+                    if pref_space is not None and getattr(pref_space, "status", "active") == "active":
+                        ordered_sids.append(pref_id)
+                except (TypeError, ValueError):
+                    pass
+
+            for sid in space_ids:
+                try:
+                    s_id = int(sid)
+                    if s_id not in ordered_sids:
+                        ordered_sids.append(s_id)
+                except (TypeError, ValueError):
+                    pass
+
             dirs: list[str] = []
-            for sid in ordered:
+            for sid in ordered_sids:
                 space = session.get(WikiSpace, int(sid))
-                if space is None:
+                if space is None or getattr(space, "status", "active") != "active":
                     continue
                 try:
                     root = ensure_space_dirs(space)
