@@ -487,3 +487,35 @@ def test_stream_forwards_deltas_then_completes(agent_env):
     assert events[1]["data"] == {"delta": "Hel"}
     assert events[2]["data"] == {"delta": "lo"}
     assert events[0]["id"] < events[1]["id"] < events[2]["id"] < events[3]["id"]
+
+
+def test_patch_conversation_model_forwards_to_dsh_session(agent_env):
+    from app.services import agent_gateway
+
+    client = agent_env.client
+    pid = _make_project(client)
+    conv = _make_conversation(client, pid, model="deepseek/deepseek-chat")
+    with Session(get_engine()) as session:
+        row = session.get(AgentConversation, str(conv["id"]))
+        row.dsh_session_id = "sess-live-1"
+        session.add(row)
+        session.commit()
+
+    called = {}
+
+    def _fake_update_session_model(session_id, model, *, transport=None):
+        called["session_id"] = session_id
+        called["model"] = model
+        return True
+
+    agent_env.monkeypatch.setattr(
+        agent_gateway, "update_session_model", _fake_update_session_model
+    )
+
+    resp = client.patch(
+        f"/api/agent/conversations/{conv['id']}?project_id={pid}",
+        json={"model": "openai/gpt-4o"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["model"] == "openai/gpt-4o"
+    assert called == {"session_id": "sess-live-1", "model": "openai/gpt-4o"}

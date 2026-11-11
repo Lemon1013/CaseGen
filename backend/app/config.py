@@ -89,7 +89,7 @@ AGENT_MAX_CONCURRENT = max(1, int(os.getenv("AGENT_MAX_CONCURRENT", "4")))
 # empty value to fall back to ``DATA_DIR / "agent-workspace"`` (test fixtures
 # redirect ``DATA_DIR`` to a temporary directory).  ``data/meta`` holds
 # plaintext model API keys and is never inside this root.
-AGENT_WORKSPACE_ROOT = os.getenv("AGENT_WORKSPACE_ROOT", "~/.casegen/agent-workspace").strip()
+AGENT_WORKSPACE_ROOT = os.getenv("AGENT_WORKSPACE_ROOT", "").strip()
 # DSH can take 5-8 minutes to emit the first token while a model loads, so the
 # read timeout must stay far above the LLM defaults.
 AGENT_FIRST_TOKEN_TIMEOUT_SEC = max(30, int(os.getenv("AGENT_FIRST_TOKEN_TIMEOUT_SEC", "600")))

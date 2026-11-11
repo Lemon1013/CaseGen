@@ -460,7 +460,7 @@ def _iter_raw_sse(response: httpx.Response, stats: DshTurnStats) -> Iterator[tup
     event_name = ""
     data_lines: list[str] = []
     for raw_line in response.iter_lines():
-        line = raw_line if isinstance(raw_line, str) else str(raw_line)
+        line = (raw_line if isinstance(raw_line, str) else str(raw_line)).rstrip("\r\n")
         if line == "":
             if event_name or data_lines:
                 yield event_name, "\n".join(data_lines)
@@ -842,6 +842,34 @@ class DshAgentGateway:
             transport=transport,
         )
 
+    def update_session_model(
+        self,
+        session_id: str,
+        model: Optional[str],
+        *,
+        transport: Optional[httpx.BaseTransport] = None,
+    ) -> bool:
+        """PATCH /sessions/:id {provider?, model} to switch model on an existing session."""
+
+        text_id = str(session_id or "").strip()
+        if not text_id:
+            return False
+        provider, model_name = _split_model(model)
+        payload: dict[str, Any] = {"model": model_name}
+        if provider:
+            payload["provider"] = provider
+        try:
+            self._request(
+                "PATCH",
+                "/sessions/" + quote(text_id, safe=""),
+                json_body=payload,
+                transport=transport,
+            )
+        except AgentGatewayError as exc:
+            logger.warning("DSH 会话模型更新失败：%s", getattr(exc, "category", "unknown"))
+            return False
+        return True
+
     def ensure_session(
         self,
         *,
@@ -895,6 +923,7 @@ class DshAgentGateway:
         session_id: str,
         prompt: str,
         *,
+        model: Optional[str] = None,
         should_stop: Optional[Any] = None,
         stats: Optional[DshTurnStats] = None,
         transport: Optional[httpx.BaseTransport] = None,
@@ -914,10 +943,16 @@ class DshAgentGateway:
             with _create_client(
                 url, timeout=_request_timeout(), transport=client_transport
             ) as client:
+                prompt_body: dict[str, Any] = {"prompt": str(prompt), "mode": "normal"}
+                provider, model_name = _split_model(model)
+                if provider:
+                    prompt_body["provider"] = provider
+                if model_name:
+                    prompt_body["model"] = model_name
                 with client.stream(
                     "POST",
                     url,
-                    json={"prompt": str(prompt), "mode": "normal"},
+                    json=prompt_body,
                     headers=_stream_headers(),
                 ) as response:
                     if response.status_code >= 400:
@@ -1140,16 +1175,31 @@ def ensure_session(
     )
 
 
+def update_session_model(
+    session_id: str,
+    model: Optional[str],
+    *,
+    transport: Optional[httpx.BaseTransport] = None,
+) -> bool:
+    return gateway.update_session_model(session_id, model, transport=transport)
+
+
 def stream_prompt(
     session_id: str,
     prompt: str,
     *,
+    model: Optional[str] = None,
     should_stop: Optional[Any] = None,
     stats: Optional[DshTurnStats] = None,
     transport: Optional[httpx.BaseTransport] = None,
 ) -> Iterator[AgentEvent]:
     return gateway.stream_prompt(
-        session_id, prompt, should_stop=should_stop, stats=stats, transport=transport
+        session_id,
+        prompt,
+        model=model,
+        should_stop=should_stop,
+        stats=stats,
+        transport=transport,
     )
 
 

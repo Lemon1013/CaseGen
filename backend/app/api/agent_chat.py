@@ -348,12 +348,20 @@ def update_conversation(
         conversation.title = _normalize_title(body.title)
     if body.skill_name is not None:
         conversation.skill_name = body.skill_name.strip() or None
+    model_changed = False
     if body.model is not None:
-        conversation.model = body.model.strip() or None
+        next_model = body.model.strip() or None
+        if next_model != conversation.model:
+            model_changed = True
+        conversation.model = next_model
     conversation.version = int(conversation.version or 1) + 1
     session.add(conversation)
     session.commit()
     session.refresh(conversation)
+    if model_changed and str(conversation.dsh_session_id or "").strip():
+        agent_gateway.update_session_model(
+            str(conversation.dsh_session_id), conversation.model
+        )
     return _conversation_out(session, conversation)
 
 

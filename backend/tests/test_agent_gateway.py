@@ -588,3 +588,45 @@ def test_knowledge_space_dirs_unknown_project_is_empty(tmp_app_data):
     init_db()
     assert agent_turn._knowledge_space_dirs("999999") == []
     assert agent_turn._knowledge_space_dirs("not-a-number") == []
+
+
+def test_update_session_model_sends_patch_with_provider_and_model(tmp_app_data):
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content or b"{}")
+        return httpx.Response(200, json={"ok": True, "data": {}})
+
+    ok = agent_gateway.gateway.update_session_model(
+        "sess-42", "deepseek/deepseek-reasoner", transport=_transport(handler)
+    )
+    assert ok is True
+    assert captured["method"] == "PATCH"
+    assert captured["path"].endswith("/sessions/sess-42")
+    assert captured["body"] == {"provider": "deepseek", "model": "deepseek-reasoner"}
+
+
+def test_stream_prompt_includes_model_when_provided():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content or b"{}")
+        body = _assemble([
+            ("delta", json.dumps({"delta": "ok"})),
+            ("done", "[DONE]"),
+        ])
+        return _sse_response(body)
+
+    events = list(
+        agent_gateway.gateway.stream_prompt(
+            "sess-1",
+            "hello",
+            model="openai/gpt-4o",
+            transport=_transport(handler),
+        )
+    )
+    assert events[-1].kind == "completed"
+    assert captured["body"]["provider"] == "openai"
+    assert captured["body"]["model"] == "gpt-4o"

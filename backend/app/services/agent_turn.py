@@ -534,6 +534,12 @@ def run_turn(
                     provisioned.workspace_id,
                     provisioned.cwd,
                 )
+            elif inputs.get("model") is not None:
+                agent_gateway.update_session_model(
+                    dsh_session_id,
+                    inputs.get("model"),
+                    transport=transport,
+                )
 
             stop_event.clear()
             watchdog_thread = threading.Thread(
@@ -552,6 +558,7 @@ def run_turn(
             for event in agent_gateway.stream_prompt(
                 dsh_session_id,
                 prompt,
+                model=inputs.get("model"),
                 should_stop=active_handle.should_stop,
                 stats=stats,
                 transport=transport,

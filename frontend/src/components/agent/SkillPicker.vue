@@ -6,7 +6,7 @@ import type { AgentSkillItem } from '../../api/agent'
 
 // 技能 + 模型选择器。
 // 技能来自 GET /api/agent/skills（后端扫描 .agents 下每个技能目录的 SKILL.md frontmatter，spec §3.4）；
-// 模型是自由输入的 provider/model 字符串（spec §3.1），选择器提供 ModelConfig 候选但不强制。
+// 模型支持从 ModelConfig 候选中下拉选择，也支持直接自由输入 provider/model 字符串（filterable + allow-create）。
 
 const props = withDefaults(
   defineProps<{
@@ -84,14 +84,10 @@ function onSkillChange(value: string | null) {
   }
 }
 
-function onModelInput(value: string) {
-  modelDraft.value = value
-  emit('update:modelValue', value)
-}
-
-function pickModel(value: string) {
-  modelDraft.value = value
-  emit('update:modelValue', value)
+function onModelChange(value: unknown) {
+  const next = value == null ? '' : String(value)
+  modelDraft.value = next
+  emit('update:modelValue', next)
 }
 
 function refresh() {
@@ -103,10 +99,23 @@ function refresh() {
   <div class="skill-picker" :class="{ 'is-disabled': disabled }">
     <div class="picker-row">
       <div class="picker-field skill-field">
-        <label class="picker-label">
-          <el-icon><MagicStick /></el-icon>
-          <span>专家技能</span>
-        </label>
+        <div class="picker-label-row">
+          <label class="picker-label">
+            <el-icon><MagicStick /></el-icon>
+            <span>专家技能</span>
+          </label>
+          <el-button
+            size="small"
+            link
+            type="primary"
+            :loading="modelLoading"
+            :disabled="disabled"
+            @click="refresh"
+          >
+            <el-icon><Refresh /></el-icon>
+            <span>刷新</span>
+          </el-button>
+        </div>
         <el-select
           :model-value="selectedSkill"
           placeholder="不指定技能（通用对话）"
@@ -130,34 +139,21 @@ function refresh() {
             </div>
           </el-option>
         </el-select>
-        <el-button
-          size="small"
-          link
-          type="primary"
-          :loading="modelLoading"
-          :disabled="disabled"
-          @click="refresh"
-        >
-          <el-icon><Refresh /></el-icon>
-          <span>刷新</span>
-        </el-button>
       </div>
       <div class="picker-field model-field">
-        <label class="picker-label">模型</label>
-        <el-input
-          :model-value="modelDraft"
-          placeholder="provider/model，留空则用后端默认"
-          clearable
-          :disabled="disabled"
-          class="picker-input"
-          @update:model-value="onModelInput"
-        />
+        <div class="picker-label-row">
+          <label class="picker-label">模型（可选或自定义输入）</label>
+        </div>
         <el-select
-          v-if="modelOptions.length"
-          placeholder="从已配置模型选"
-          class="picker-select picker-select-small"
+          :model-value="modelDraft"
+          placeholder="选择已配置模型或输入 provider/model，留空用默认"
+          clearable
+          filterable
+          allow-create
+          default-first-option
           :disabled="disabled"
-          @update:model-value="pickModel"
+          class="picker-select"
+          @update:model-value="onModelChange"
         >
           <el-option
             v-for="item in modelOptions"
@@ -185,6 +181,7 @@ function refresh() {
   display: flex;
   flex-direction: column;
   gap: 8px;
+  width: 100%;
 }
 
 .skill-picker.is-disabled {
@@ -193,20 +190,23 @@ function refresh() {
 
 .picker-row {
   display: flex;
-  gap: 16px;
+  gap: 14px;
   flex-wrap: wrap;
 }
 
 .picker-field {
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  min-width: 240px;
+  gap: 6px;
+  min-width: 220px;
   flex: 1;
 }
 
-.skill-field {
-  flex: 1.4;
+.picker-label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 20px;
 }
 
 .picker-label {
@@ -218,13 +218,8 @@ function refresh() {
   color: var(--cg-text-secondary, #52525b);
 }
 
-.picker-select,
-.picker-input {
+.picker-select {
   width: 100%;
-}
-
-.picker-select-small {
-  max-width: 220px;
 }
 
 .skill-option {
@@ -276,6 +271,7 @@ function refresh() {
   display: flex;
   flex-direction: column;
   gap: 4px;
+  align-items: flex-start;
 }
 
 .detail-text {
@@ -286,6 +282,7 @@ function refresh() {
   background: var(--cg-surface-muted, #f4f4f5);
   border-radius: var(--cg-radius-sm, 6px);
   padding: 8px 10px;
+  width: 100%;
 }
 
 .picker-hint {

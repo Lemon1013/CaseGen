@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
-import { CircleClose, Connection } from '@element-plus/icons-vue'
+import { ChatDotRound, CircleClose, Connection, MagicStick } from '@element-plus/icons-vue'
 import { useAgentChatStore } from '../../stores/agentChatStore'
 import { hasAgentCaseJson } from './parseAgentCases'
 import ChatMessage from './ChatMessage.vue'
@@ -22,6 +22,7 @@ const emit = defineEmits<{
 const store = useAgentChatStore()
 
 const scrollHost = ref<HTMLElement | null>(null)
+const composerRef = ref<InstanceType<typeof ChatComposer> | null>(null)
 const stickToBottom = ref(true)
 
 const messages = computed(() => store.displayMessages)
@@ -30,11 +31,25 @@ const progress = computed(() => store.stageProgress)
 const busy = computed(() => store.isBusy)
 const closed = computed(() => conversation.value?.status === 'closed')
 
-const emptyHint = computed(() => {
-  if (store.detailLoading) return '正在载入会话历史…'
-  if (messages.value.length) return ''
-  return '这条会话还没有消息，直接输入需求开始第一轮对话。'
+const currentSkillInfo = computed(() => {
+  const skillName = conversation.value?.skill_name
+  if (!skillName) return null
+  return store.skills.find((item) => item.name === skillName) ?? {
+    name: skillName,
+    description: '',
+  }
 })
+
+const quickPrompts = [
+  '请阅读当前项目知识空间文档，帮我拆解核心业务与非功能/架构瓶颈测试点清单',
+  '针对并发请求、幂等性与超时重试场景，设计一组高优先级（P0/P1）边界测试用例',
+  '请把刚才讨论的测试点按 CaseGen 标准 JSON 契约输出结构化测试用例，以便转存草稿',
+]
+
+function fillQuickPrompt(text: string) {
+  if (busy.value || closed.value) return
+  composerRef.value?.setDraft(text)
+}
 
 /** 只有「最后一条 assistant 且含用例 JSON」才允许转存草稿（spec §3.5 取最近一条 assistant）。 */
 const canSaveDraft = computed(() => {
@@ -124,17 +139,19 @@ const composerDisabled = computed(() =>
 
 <template>
   <section class="chat-panel">
-    <div v-if="busy || store.streamError" class="panel-status" :class="{ 'is-active': busy }">
-      <div class="status-left">
-        <el-icon class="status-icon"><Connection /></el-icon>
-        <span class="status-text">{{ store.stageMessage || '空闲' }}</span>
-      </div>
-      <div class="status-right">
-        <el-tag v-if="store.streamConnected" size="small" type="success" effect="plain">实时流已连接</el-tag>
-        <el-tag v-else-if="store.streamConnecting" size="small" type="warning" effect="plain">连接中…</el-tag>
-        <el-tag v-else-if="busy" size="small" type="info" effect="plain">轮询兜底</el-tag>
-        <el-tag v-else size="small" type="info" effect="plain">未连接</el-tag>
-        <el-tag v-if="closed" size="small" type="danger" effect="plain">会话已关闭</el-tag>
+    <div v-if="busy || store.streamError" class="panel-status-wrap">
+      <div class="panel-status" :class="{ 'is-active': busy }">
+        <div class="status-left">
+          <el-icon class="status-icon"><Connection /></el-icon>
+          <span class="status-text">{{ store.stageMessage || '空闲' }}</span>
+        </div>
+        <div class="status-right">
+          <el-tag v-if="store.streamConnected" size="small" type="success" effect="plain">实时流已连接</el-tag>
+          <el-tag v-else-if="store.streamConnecting" size="small" type="warning" effect="plain">连接中…</el-tag>
+          <el-tag v-else-if="busy" size="small" type="info" effect="plain">轮询兜底</el-tag>
+          <el-tag v-else size="small" type="info" effect="plain">未连接</el-tag>
+          <el-tag v-if="closed" size="small" type="danger" effect="plain">会话已关闭</el-tag>
+        </div>
       </div>
     </div>
 
@@ -149,26 +166,56 @@ const composerDisabled = computed(() =>
       :format="() => (progress.determinate ? `${progress.current}/${progress.total}` : '')"
     />
 
-    <el-alert
-      v-if="store.streamError"
-      class="panel-alert"
-      type="error"
-      :closable="false"
-      show-icon
-      :title="store.streamError"
-    />
-    <el-alert
-      v-if="store.savingDraftError"
-      class="panel-alert"
-      type="warning"
-      :closable="false"
-      show-icon
-      :title="store.savingDraftError"
-    />
+    <div v-if="store.streamError || store.savingDraftError" class="panel-alerts">
+      <el-alert
+        v-if="store.streamError"
+        class="panel-alert"
+        type="error"
+        :closable="false"
+        show-icon
+        :title="store.streamError"
+      />
+      <el-alert
+        v-if="store.savingDraftError"
+        class="panel-alert"
+        type="warning"
+        :closable="false"
+        show-icon
+        :title="store.savingDraftError"
+      />
+    </div>
 
     <div ref="scrollHost" class="panel-scroll" @scroll="onScroll">
       <div class="msg-column">
-        <p v-if="emptyHint" class="panel-empty">{{ emptyHint }}</p>
+        <p v-if="store.detailLoading" class="panel-empty">正在载入会话历史…</p>
+        <div v-else-if="!messages.length" class="welcome-card">
+          <div class="welcome-icon-wrap">
+            <el-icon :size="22"><ChatDotRound /></el-icon>
+          </div>
+          <div class="welcome-title">开始第一轮测试设计对话</div>
+          <p class="welcome-subtitle">
+            你可以直接描述测试需求、投喂需求文档，或让 Agent 查阅当前项目的知识空间，按「先拆解测试点 → 再生成结构化用例」两步协同产出高覆盖率用例。
+          </p>
+          <div v-if="currentSkillInfo" class="welcome-skill-pill">
+            <el-icon><MagicStick /></el-icon>
+            <span>当前技能：<strong>{{ currentSkillInfo.name }}</strong></span>
+            <span v-if="currentSkillInfo.description" class="welcome-skill-desc">
+              — {{ currentSkillInfo.description }}
+            </span>
+          </div>
+          <div class="welcome-prompts">
+            <button
+              v-for="(item, idx) in quickPrompts"
+              :key="idx"
+              type="button"
+              class="quick-prompt-btn"
+              :disabled="composerDisabled || busy"
+              @click="fillQuickPrompt(item)"
+            >
+              {{ item }}
+            </button>
+          </div>
+        </div>
         <ChatMessage
           v-for="message in messages"
           :key="message.id"
@@ -187,6 +234,7 @@ const composerDisabled = computed(() =>
 
     <div class="panel-composer">
       <ChatComposer
+        ref="composerRef"
         :disabled="composerDisabled"
         :sending="store.sending"
         :busy="busy"
@@ -197,6 +245,7 @@ const composerDisabled = computed(() =>
         <template #extra-actions>
           <el-button
             v-if="busy"
+            size="small"
             type="danger"
             plain
             :loading="store.cancelling"
@@ -207,6 +256,7 @@ const composerDisabled = computed(() =>
           </el-button>
           <el-button
             v-if="canSaveDraft"
+            size="small"
             type="primary"
             plain
             :loading="store.savingDraft"
@@ -224,9 +274,21 @@ const composerDisabled = computed(() =>
 .chat-panel {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 8px;
   flex: 1 1 auto;
   min-height: 0;
+  background: var(--cg-bg, #f8fafc);
+}
+
+.panel-status-wrap,
+.panel-alerts {
+  width: 100%;
+  max-width: 932px;
+  margin: 0 auto;
+  padding: 8px 16px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
 }
 
 .panel-status {
@@ -234,15 +296,15 @@ const composerDisabled = computed(() =>
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 8px 12px;
+  padding: 7px 12px;
   border: 1px solid var(--cg-border, #e4e4e7);
-  border-radius: var(--cg-radius-sm, 6px);
-  background: var(--cg-surface-muted, #f4f4f5);
+  border-radius: var(--cg-radius, 8px);
+  background: var(--cg-surface, #ffffff);
 }
 
 .panel-status.is-active {
   background: var(--cg-accent-brand-soft, #ecfdf5);
-  border-color: var(--cg-focus-ring, rgba(16, 185, 129, 0.2));
+  border-color: var(--cg-focus-ring, rgba(16, 185, 129, 0.25));
 }
 
 .status-left {
@@ -253,7 +315,7 @@ const composerDisabled = computed(() =>
 }
 
 .status-icon {
-  color: var(--cg-text-muted, #71717a);
+  color: var(--cg-accent-brand-deep, #059669);
   flex-shrink: 0;
 }
 
@@ -273,7 +335,10 @@ const composerDisabled = computed(() =>
 }
 
 .panel-progress {
-  padding: 0 2px;
+  max-width: 900px;
+  width: 100%;
+  margin: 0 auto;
+  padding: 0 16px;
 }
 
 .panel-alert {
@@ -284,7 +349,7 @@ const composerDisabled = computed(() =>
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
-  padding: 8px 12px;
+  padding: 14px 20px 10px;
 }
 
 .msg-column {
@@ -297,14 +362,106 @@ const composerDisabled = computed(() =>
 }
 
 .panel-empty {
-  margin: 24px auto;
+  margin: 32px auto;
   font-size: 13px;
   color: var(--cg-text-muted, #71717a);
 }
 
+.welcome-card {
+  margin: 28px auto 12px;
+  max-width: 680px;
+  width: 100%;
+  background: var(--cg-surface, #ffffff);
+  border: 1px solid var(--cg-border, #e4e4e7);
+  border-radius: 14px;
+  padding: 24px 26px;
+  box-shadow: 0 2px 8px rgba(9, 9, 11, 0.03);
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.welcome-icon-wrap {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border-radius: 10px;
+  background: var(--cg-accent-brand-soft, #ecfdf5);
+  color: var(--cg-accent-brand-deep, #059669);
+}
+
+.welcome-title {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--cg-text, #09090b);
+}
+
+.welcome-subtitle {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.65;
+  color: var(--cg-text-secondary, #52525b);
+}
+
+.welcome-skill-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: var(--cg-surface-muted, #f4f4f5);
+  border: 1px solid var(--cg-border, #e4e4e7);
+  font-size: 12px;
+  color: var(--cg-text-secondary, #52525b);
+  max-width: 100%;
+}
+
+.welcome-skill-desc {
+  color: var(--cg-text-muted, #71717a);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.welcome-prompts {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+  margin-top: 4px;
+}
+
+.quick-prompt-btn {
+  text-align: left;
+  width: 100%;
+  padding: 9px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--cg-border, #e4e4e7);
+  background: var(--cg-bg, #f8fafc);
+  color: var(--cg-text-secondary, #52525b);
+  font-family: var(--cg-font-sans);
+  font-size: 12.5px;
+  line-height: 1.5;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background-color 0.15s ease, color 0.15s ease;
+}
+
+.quick-prompt-btn:hover:not(:disabled) {
+  border-color: var(--cg-accent-brand, #10b981);
+  background: var(--cg-accent-brand-soft, #ecfdf5);
+  color: var(--cg-text, #09090b);
+}
+
+.quick-prompt-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
 .panel-composer {
   flex: 0 0 auto;
-  border-top: 1px solid var(--cg-border, #e4e4e7);
-  padding-top: 10px;
+  padding: 4px 20px 14px;
 }
 </style>

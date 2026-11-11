@@ -856,14 +856,19 @@ export const useAgentChatStore = defineStore('agentChat', () => {
     const target = id ?? currentId.value
     if (!target) return
     await closeAgentConversation(target, projectId.value)
-    const conversation = conversations.value.find((item) => item.id === target)
-    if (conversation) applyConversation({ ...conversation, status: 'closed' })
+    delete messagesByConversation.value[target]
+    conversations.value = conversations.value.filter((item) => item.id !== target)
     if (target === currentId.value) {
       teardownStream('manual')
       stopPolling()
       resetStage()
+      currentId.value = null
     }
     await loadConversations()
+    if (!currentId.value && conversations.value.length) {
+      const next = conversations.value[0]
+      if (next) await selectConversation(next.id)
+    }
   }
 
   async function saveAsDraft() {

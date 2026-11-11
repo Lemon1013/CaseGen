@@ -1,10 +1,10 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
-import { CopyDocument, UserFilled } from '@element-plus/icons-vue'
+import { ArrowRight, CopyDocument, UserFilled } from '@element-plus/icons-vue'
 import MarkdownView from '../MarkdownView.vue'
 import CaseResultCard from './CaseResultCard.vue'
-import { parseAgentCaseGroups, stripAgentCaseJson } from './parseAgentCases'
+import { hasAgentCaseJson, parseAgentCaseGroups, stripAgentCaseJson } from './parseAgentCases'
 import { formatDateTime } from '../../utils/datetime'
 import type { DraftPointGroup } from '../../api/tasks'
 
@@ -13,7 +13,7 @@ import type { DraftPointGroup } from '../../api/tasks'
  *
  * 性能守则（spec §3.6）：MarkdownView 每次 content 变化都会全量重 parse + 整块 v-html 替换，
  * 长对话累积是 O(n²) ⇒ 只有 streaming=true 的那条实时渲染 Markdown；
- * 历史 assistant 消息默认折叠成纯文本摘要（不做 markdown parse），展开时才渲染一次。
+ * 历史 assistant 消息按 collapseThreshold 控制折叠（默认 0 全量 Markdown 渲染）。
  */
 
 const props = defineProps<{
@@ -27,7 +27,7 @@ const props = defineProps<{
   /** 是否展示「转存为用例草稿」入口（只对含用例 JSON 的 assistant 消息有意义）。 */
   canSaveDraft?: boolean
   savingDraft?: boolean
-  /** 预留：Agent 思考过程文本；无值时不渲染，不伪造内容。 */
+  /** Agent 思考过程文本；无值时不渲染，不伪造内容。 */
   thought?: string
 }>()
 
@@ -37,9 +37,23 @@ const emit = defineEmits<{
 
 const expanded = ref(false)
 const showCases = ref(false)
+const thoughtOpen = ref(Boolean(props.streaming))
+
+watch(
+  () => props.streaming,
+  (isStreaming, wasStreaming) => {
+    if (isStreaming && !wasStreaming) thoughtOpen.value = true
+    else if (!isStreaming && wasStreaming) thoughtOpen.value = false
+  },
+)
+
+function onThoughtToggle(event: Event) {
+  const target = event.target as HTMLDetailsElement | null
+  if (target) thoughtOpen.value = target.open
+}
 
 const displayContent = computed(() =>
-  props.role === "assistant" ? stripAgentCaseJson(props.content || "") : (props.content || ""),
+  props.role === 'assistant' ? stripAgentCaseJson(props.content || '') : (props.content || ''),
 )
 
 const threshold = computed(() => props.collapseThreshold ?? 0)
@@ -53,7 +67,7 @@ const previewText = computed(() => {
   return `${displayContent.value.slice(0, threshold.value).trimEnd()}…`
 })
 
-/** 只在展开或流式时解析用例 JSON，避免每条历史消息都做正则 + JSON.parse。 */
+/** 只在展开或非流式时解析用例 JSON，避免每条流式帧重复做 JSON.parse。 */
 const caseGroups = computed<DraftPointGroup[] | null>(() => {
   if (props.role !== 'assistant') return null
   if (!props.content) return null
@@ -64,8 +78,8 @@ const caseGroups = computed<DraftPointGroup[] | null>(() => {
 })
 
 const hasCases = computed(() => {
-  if (props.role !== 'assistant' || !props.content) return false
-  return props.content.includes('```json')
+  if (props.role !== 'assistant' || !props.content || props.streaming) return false
+  return hasAgentCaseJson(props.content)
 })
 
 const isUser = computed(() => props.role === 'user')
@@ -75,7 +89,7 @@ function toggleExpanded() {
 }
 
 async function copyContent() {
-  const payload = displayContent.value
+  const payload = displayContent.value || props.thought || ''
   if (!payload) {
     ElMessage.warning('这条消息没有可复制的内容')
     return
@@ -112,8 +126,14 @@ async function copyContent() {
         <el-tag v-if="pending" size="small" type="info" effect="plain">发送中</el-tag>
         <el-tag v-else-if="streaming" size="small" type="warning" effect="plain">生成中</el-tag>
       </div>
-      <details v-if="thought" class="thought-block" :open="streaming">
+      <details
+        v-if="thought"
+        class="thought-block"
+        :open="thoughtOpen"
+        @toggle="onThoughtToggle"
+      >
         <summary class="thought-summary">
+          <el-icon class="thought-chevron"><ArrowRight /></el-icon>
           <span class="thought-label">思考过程</span>
           <span class="thought-hint">{{ streaming ? '思考中…' : '已深度思考' }}</span>
         </summary>
@@ -132,17 +152,17 @@ async function copyContent() {
           <MarkdownView class="preview-text" :content="previewText" />
           <el-button size="small" link type="primary" @click="toggleExpanded">展开全文</el-button>
         </div>
-        <div v-if="streaming && !content" class="streaming-placeholder">
+        <div v-if="streaming && !displayContent" class="streaming-placeholder">
           <span class="dot" />
           <span class="dot" />
           <span class="dot" />
         </div>
       </div>
-      <div v-if="!isUser && !isCollapsed" class="bubble-actions">
+      <div v-if="!isUser && !isCollapsed && !streaming && (displayContent || thought || hasCases || canSaveDraft)" class="bubble-actions">
         <el-button v-if="collapsible && expanded" size="small" link @click="toggleExpanded">收起</el-button>
-        <el-button size="small" link class="copy-action" @click="copyContent">
+        <el-button v-if="displayContent || thought" size="small" link class="copy-action" @click="copyContent">
           <el-icon><CopyDocument /></el-icon>
-          <span>复制</span>
+          <span>{{ displayContent ? '复制' : '复制思考内容' }}</span>
         </el-button>
         <el-button
           v-if="hasCases"
@@ -177,7 +197,7 @@ async function copyContent() {
 <style scoped>
 .chat-message {
   display: flex;
-  gap: 10px;
+  gap: 12px;
   padding: 10px 0;
 }
 
@@ -187,22 +207,24 @@ async function copyContent() {
 
 .avatar-col {
   flex-shrink: 0;
+  padding-top: 2px;
 }
 
 .avatar {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 30px;
-  height: 30px;
+  width: 32px;
+  height: 32px;
   border-radius: 50%;
   font-size: 12px;
   font-weight: 700;
   font-family: var(--cg-font-sans);
+  box-shadow: 0 1px 2px rgba(9, 9, 11, 0.06);
 }
 
 .avatar-user {
-  background: var(--cg-surface-muted, #f4f4f5);
+  background: var(--cg-surface, #ffffff);
   color: var(--cg-text-secondary, #52525b);
   border: 1px solid var(--cg-border, #e4e4e7);
 }
@@ -247,14 +269,16 @@ async function copyContent() {
 }
 
 .thought-block {
-  margin-bottom: 8px;
-  padding: 6px 10px;
+  margin-bottom: 4px;
+  padding: 8px 12px;
   border: 1px solid var(--cg-border, #e4e4e7);
-  border-radius: var(--cg-radius-sm, 6px);
+  border-left: 3px solid var(--cg-accent-brand, #10b981);
+  border-radius: var(--cg-radius, 8px);
   background: var(--cg-surface-muted, #f4f4f5);
   color: var(--cg-text-muted, #71717a);
   font-size: 12.5px;
   line-height: 1.6;
+  transition: border-color 0.15s ease, background-color 0.15s ease;
 }
 
 .thought-summary {
@@ -263,11 +287,29 @@ async function copyContent() {
   gap: 6px;
   cursor: pointer;
   list-style: none;
+  user-select: none;
   color: var(--cg-text-muted, #71717a);
 }
 
 .thought-summary::-webkit-details-marker {
   display: none;
+}
+
+.thought-chevron {
+  font-size: 12px;
+  color: var(--cg-text-muted, #71717a);
+  transition: transform 0.18s ease;
+  flex-shrink: 0;
+}
+
+.thought-block[open] .thought-chevron {
+  transform: rotate(90deg);
+}
+
+.thought-block[open] .thought-summary {
+  padding-bottom: 6px;
+  margin-bottom: 6px;
+  border-bottom: 1px dashed var(--cg-border, #e4e4e7);
 }
 
 .thought-label {
@@ -284,26 +326,27 @@ async function copyContent() {
 .thought-body {
   max-height: 320px;
   overflow: auto;
-  padding-top: 6px;
+  padding-top: 2px;
 }
 
 .bubble-body {
   max-width: 100%;
   border: 1px solid var(--cg-border, #e4e4e7);
-  border-radius: var(--cg-radius, 8px);
+  border-radius: 12px;
   background: var(--cg-surface, #ffffff);
-  padding: 10px 14px;
+  padding: 12px 16px;
   font-size: 13.5px;
-  line-height: 1.65;
+  line-height: 1.7;
   color: var(--cg-text, #09090b);
   overflow-wrap: anywhere;
+  box-shadow: 0 1px 2px rgba(9, 9, 11, 0.03);
 }
 
 .is-user .bubble-body,
 .bubble-body.is-user-body {
-  background: var(--cg-primary-soft-2, rgba(16, 185, 129, 0.08));
-  border-color: var(--cg-focus-ring, rgba(16, 185, 129, 0.2));
-  max-width: 82%;
+  background: var(--cg-accent-brand-soft, #ecfdf5);
+  border-color: rgba(16, 185, 129, 0.28);
+  max-width: 85%;
 }
 
 .plain-text {
@@ -328,9 +371,9 @@ async function copyContent() {
 
 .streaming-placeholder {
   display: inline-flex;
-  gap: 4px;
+  gap: 5px;
   align-items: center;
-  padding: 2px 0;
+  padding: 4px 2px;
 }
 
 .streaming-placeholder .dot {
@@ -365,8 +408,9 @@ async function copyContent() {
 .bubble-actions {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 10px;
   flex-wrap: wrap;
+  padding-left: 2px;
 }
 
 .copy-action {

@@ -171,7 +171,7 @@ async function saveCurrentConfig() {
       currentSkillDraft.value || null,
       currentModelDraft.value.trim() || null,
     )
-    ElMessage.success('配置已保存，下一条消息起生效')
+    ElMessage.success('会话配置已更新并同步至 Agent')
     configExpanded.value = false
   } catch (error) {
     ElMessage.error(`保存配置失败：${(error as Error).message}`)
@@ -236,19 +236,19 @@ function syncQuery(conversationId: string | null) {
 async function onCloseConversation(conversation: AgentConversationItem) {
   try {
     await ElMessageBox.confirm(
-      `关闭会话「${conversation.title || conversation.id}」后将无法继续对话，历史记录仍会保留。确认关闭？`,
-      '关闭会话',
-      { confirmButtonText: '关闭会话', cancelButtonText: '取消', type: 'warning' },
+      `确定删除会话「${conversation.title || conversation.id}」？删除后该会话的消息记录将一并清理。`,
+      '删除会话',
+      { confirmButtonText: '删除会话', cancelButtonText: '取消', type: 'warning' },
     )
   } catch {
     return
   }
   try {
     await store.closeConversation(conversation.id)
-    ElMessage.success('会话已关闭')
-    if (conversation.id === store.currentId) syncQuery(null)
+    ElMessage.success('会话已删除')
+    syncQuery(store.currentId)
   } catch (error) {
-    ElMessage.error(`关闭会话失败：${(error as Error).message}`)
+    ElMessage.error(`删除会话失败：${(error as Error).message}`)
   }
 }
 
@@ -423,7 +423,7 @@ onUnmounted(() => {
               link
               type="danger"
               class="conversation-close"
-              title="关闭会话"
+              title="删除会话"
               @click.stop="onCloseConversation(conversation)"
             >
               <el-icon><Delete /></el-icon>
@@ -512,22 +512,16 @@ onUnmounted(() => {
               </el-select>
             </div>
             <div class="config-field">
-              <label class="config-field-label">模型</label>
-              <el-input
-                :model-value="currentModelDraft"
-                placeholder="provider/model，留空则用后端默认"
-                clearable
-                :disabled="!store.agentAvailable || !current || store.isBusy"
-                class="config-field-control"
-                @update:model-value="onModelDraftChange"
-              />
-            </div>
-            <div v-if="modelCandidates.length" class="config-field">
-              <label class="config-field-label">已配置模型</label>
+              <label class="config-field-label">模型（可选已配置模型或输入 provider/model）</label>
               <el-select
-                placeholder="从已配置模型选"
-                class="config-field-control"
+                :model-value="currentModelDraft"
+                placeholder="选择或输入 provider/model，留空则用后端默认"
+                clearable
+                filterable
+                allow-create
+                default-first-option
                 :disabled="!store.agentAvailable || !current || store.isBusy"
+                class="config-field-control"
                 @update:model-value="onModelDraftChange"
               >
                 <el-option
@@ -798,11 +792,15 @@ onUnmounted(() => {
 
 .agent-layout {
   display: grid;
-  grid-template-columns: clamp(332px, 24vw, 368px) minmax(0, 1fr);
+  grid-template-columns: clamp(310px, 23vw, 356px) minmax(0, 1fr);
   gap: 0;
   flex: 1 1 auto;
   min-height: 0;
   overflow: hidden;
+  background: var(--cg-surface, #ffffff);
+  border: 1px solid var(--cg-border, #e4e4e7);
+  border-radius: var(--cg-radius-lg, 12px);
+  box-shadow: var(--cg-shadow);
   transition: grid-template-columns 260ms cubic-bezier(0.22, 1, 0.36, 1);
 }
 
@@ -1076,27 +1074,7 @@ onUnmounted(() => {
   padding: 4px 16px 20px;
 }
 
-/* 观感：气泡与输入框更舒展（只改样式，不动功能与 props/emit 契约） */
-.chat-block :deep(.bubble-body) {
-  padding: 12px 16px;
-  border-radius: var(--cg-radius-lg, 12px);
-  line-height: 1.7;
-}
 
-.chat-block :deep(.is-user .bubble-body),
-.chat-block :deep(.bubble-body.is-user-body) {
-  max-width: 88%;
-}
-
-.chat-block :deep(.panel-scroll) {
-  padding: 4px 10px 10px 4px;
-}
-
-.chat-block :deep(.chat-composer .el-textarea__inner) {
-  border-radius: var(--cg-radius, 8px);
-  padding: 10px 12px;
-  line-height: 1.6;
-}
 
 @media (max-width: 1280px) {
   .agent-layout {
