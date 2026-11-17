@@ -13,6 +13,11 @@ function queryId(query: LocationQuery) {
 
 export function useProjectStore() {
   const current = computed(() => state.projects.find((item) => item.id === state.currentId) || null)
+  const defaultWikiSpaceId = computed(() => {
+    const project = current.value
+    const space = project?.private_spaces.find((item) => item.id === project.default_wiki_space_id)
+    return space?.status === 'active' && space.scope === 'project' ? space.id : undefined
+  })
   async function load(query: LocationQuery) {
     state.projects = await listProjects()
     const requested = queryId(query) || Number(localStorage.getItem(STORAGE_KEY))
@@ -25,7 +30,8 @@ export function useProjectStore() {
     const project = state.projects.find((item) => item.id === id)
     if (!project) return
     localStorage.setItem(STORAGE_KEY, String(id))
-    await router.replace({ query: { ...router.currentRoute.value.query, project_id: String(id), space_id: project.default_wiki_space_id ? String(project.default_wiki_space_id) : undefined } })
+    const space = project.private_spaces.find((item) => item.id === project.default_wiki_space_id && item.status === 'active' && item.scope === 'project')
+    await router.replace({ query: { ...router.currentRoute.value.query, project_id: String(id), space_id: space ? String(space.id) : undefined } })
     state.currentId = id
   }
   async function refresh(router?: Router) {
@@ -36,8 +42,9 @@ export function useProjectStore() {
     else localStorage.removeItem(STORAGE_KEY)
     state.loaded = true
     if (router) {
-      await router.replace({ query: { ...router.currentRoute.value.query, project_id: selected ? String(selected.id) : undefined, space_id: selected?.default_wiki_space_id ? String(selected.default_wiki_space_id) : undefined } })
+      const space = selected?.private_spaces.find((item) => item.id === selected.default_wiki_space_id && item.status === 'active' && item.scope === 'project')
+      await router.replace({ query: { ...router.currentRoute.value.query, project_id: selected ? String(selected.id) : undefined, space_id: space ? String(space.id) : undefined } })
     }
   }
-  return { state, current, load, reload: refresh, refresh, select }
+  return { state, current, defaultWikiSpaceId, load, reload: refresh, refresh, select }
 }

@@ -41,6 +41,69 @@ def test_csv_and_json_import_are_generic_and_space_isolated(tmp_app_data):
     assert client.get(f'/api/data-pools/{csv_response.json()["id"]}?wiki_space_id={second["id"]}').status_code == 404
 
 
+def test_delete_data_pool_requires_archive_and_removes_revisions(tmp_app_data):
+    from app.db import get_engine
+    from app.models.entities import DataPool, DataPoolRevision
+    from sqlmodel import select
+
+    client = TestClient(_app(tmp_app_data))
+    first, second = _space(client, "Delete pool"), _space(client, "Other space")
+    pool = client.post("/api/data-pools", json={
+        "wiki_space_id": first["id"], "name": "temporary", "source_kind": "json", "content": '[{"x":1}]',
+    }).json()
+    pool_id = pool["id"]
+    revision_id = pool["latest_revision"]["id"]
+
+    active = client.delete(f'/api/data-pools/{pool_id}?wiki_space_id={first["id"]}')
+    assert active.status_code == 409
+    assert "先归档" in active.json()["detail"]
+    assert client.delete(f'/api/data-pools/{pool_id}?wiki_space_id={second["id"]}').status_code == 404
+    with Session(get_engine()) as session:
+        assert session.get(DataPool, pool_id) is not None
+        assert session.get(DataPoolRevision, revision_id) is not None
+
+    assert client.post(f'/api/data-pools/{pool_id}/archive?wiki_space_id={first["id"]}').status_code == 200
+    deleted = client.delete(f'/api/data-pools/{pool_id}?wiki_space_id={first["id"]}')
+    assert deleted.status_code == 200
+    assert deleted.json() == {"ok": True}
+    assert client.delete(f'/api/data-pools/{pool_id}?wiki_space_id={first["id"]}').status_code == 404
+    with Session(get_engine()) as session:
+        assert session.get(DataPool, pool_id) is None
+        assert session.exec(select(DataPoolRevision).where(DataPoolRevision.data_pool_id == pool_id)).all() == []
+
+
+def test_delete_data_pool_rejects_render_history_references(tmp_app_data):
+    from app.db import get_engine
+    from app.models.entities import DataPool, PlatformRenderRun
+
+    client = TestClient(_app(tmp_app_data))
+    space = _space(client, "Referenced pools")
+    platform = client.post("/api/platforms", json={
+        "wiki_space_id": space["id"], "name": "A", "artifact_topology": "combined",
+    }).json()
+    variant = client.post(
+        f'/api/platforms/{platform["id"]}/variants?wiki_space_id={space["id"]}', json={"name": "default"},
+    ).json()
+
+    for reference_key in ("pool_id", "revision_id"):
+        pool = client.post("/api/data-pools", json={
+            "wiki_space_id": space["id"], "name": reference_key, "source_kind": "json", "content": '[{"x":1}]',
+        }).json()
+        reference_id = pool["id"] if reference_key == "pool_id" else pool["latest_revision"]["id"]
+        with Session(get_engine()) as session:
+            session.add(PlatformRenderRun(
+                wiki_space_id=space["id"], platform_id=platform["id"], variant_id=variant["id"],
+                input_snapshot_json=json.dumps({"data_refs": [{reference_key: reference_id}]}),
+            ))
+            session.commit()
+        assert client.post(f'/api/data-pools/{pool["id"]}/archive?wiki_space_id={space["id"]}').status_code == 200
+        response = client.delete(f'/api/data-pools/{pool["id"]}?wiki_space_id={space["id"]}')
+        assert response.status_code == 409
+        assert "生成历史引用" in response.json()["detail"]
+        with Session(get_engine()) as session:
+            assert session.get(DataPool, pool["id"]) is not None
+
+
 def _semantic_case(space_id: int) -> int:
     from app.db import get_engine
     from app.models.entities import GenerationTask, Requirement, TestCase
@@ -58,7 +121,7 @@ def _semantic_case(space_id: int) -> int:
 def test_example_direct_only_sends_selected_variant_and_saves_separated_artifacts(tmp_app_data, monkeypatch):
     from app.api import platform_data
     from app.db import get_engine
-    from app.models.entities import ModelConfig, PlatformRenderRun
+    from app.models.entities import ModelConfig, PlatformArtifact, PlatformRenderRun
     from sqlmodel import select
 
     client = TestClient(_app(tmp_app_data))
@@ -79,7 +142,7 @@ def test_example_direct_only_sends_selected_variant_and_saves_separated_artifact
 
     def fake_chat(messages, **_kwargs):
         captured["messages"] = messages
-        return json.dumps({"artifacts": [{"kind": "case", "filename": "cases.csv", "media_type": "text/csv", "content": "case_id,title\nTC-001,基金申购"}, {"kind": "data", "filename": "data.csv", "media_type": "text/csv", "content": "dataset_id,value\nD-001,抽象数据"}], "warnings": []})
+        return json.dumps({"artifacts": [{"kind": "case", "filename": "cases.txt", "media_type": "text/plain", "content": "CASE PLAIN\nKEEP"}, {"kind": "data", "filename": "data.csv", "media_type": "text/csv", "content": "dataset_id,value\nD-001,抽象数据"}], "warnings": []})
 
     monkeypatch.setattr(platform_data, "_PLATFORM_CHAT_FN", fake_chat)
     case_id = _semantic_case(space["id"])
@@ -90,6 +153,14 @@ def test_example_direct_only_sends_selected_variant_and_saves_separated_artifact
     assert "STOCK_MUST_NOT_LEAK" not in context
     assert "SENSITIVE_NEVER_SENT" not in context
     assert {item["kind"] for item in response.json()["artifacts"]} == {"case", "data"}
+    artifacts = {item["kind"]: item for item in response.json()["artifacts"]}
+    assert (artifacts["case"]["media_type"], artifacts["case"]["content"]) == (
+        "text/plain", "CASE PLAIN\nKEEP",
+    )
+    assert (artifacts["data"]["media_type"], artifacts["data"]["content"]) == (
+        "text/csv", "dataset_id,value\nD-001,抽象数据",
+    )
+    assert "外层 JSON 只是传输封套" in captured["messages"][0]["content"]
     assert response.json()["status"] == "completed"
     opt_in = client.post("/api/platform-renders/example-direct", json={
         "wiki_space_id": space["id"], "platform_id": platform["id"], "variant_id": fund["id"],
@@ -100,6 +171,13 @@ def test_example_direct_only_sends_selected_variant_and_saves_separated_artifact
     assert "SENSITIVE_NEVER_SENT" in json.dumps(captured["messages"], ensure_ascii=False)
     with Session(get_engine()) as session:
         runs = session.exec(select(PlatformRenderRun).order_by(PlatformRenderRun.id)).all()
+        persisted = session.exec(
+            select(PlatformArtifact).where(PlatformArtifact.run_id == runs[0].id)
+        ).all()
+        assert {(item.media_type, item.content) for item in persisted} == {
+            ("text/plain", "CASE PLAIN\nKEEP"),
+            ("text/csv", "dataset_id,value\nD-001,抽象数据"),
+        }
         assert all("SENSITIVE_NEVER_SENT" not in run.input_snapshot_json for run in runs)
         assert json.loads(runs[0].input_snapshot_json)["include_data_values"] is False
         assert json.loads(runs[1].input_snapshot_json)["data_refs"][0]["sample_count"] == 1

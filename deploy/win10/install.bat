@@ -10,14 +10,14 @@ cd /d "%~dp0..\..\backend"
 
 where python >nul 2>nul
 if errorlevel 1 (
-    echo [错误] 未找到 python，请先安装 Python 3.12（安装时勾选 Add python.exe to PATH）。
+    echo [错误] 未找到 python，请先安装 64 位 Python 3.11（安装时勾选 Add python.exe to PATH）。
     pause
     exit /b 1
 )
 
-python -c "import sys; sys.exit(0 if sys.version_info >= (3,11) else 1)"
+python -c "import sys; sys.exit(0 if sys.version_info[:2] == (3,11) and sys.maxsize > 2**32 else 1)"
 if errorlevel 1 (
-    echo [错误] 需要 Python 3.11 或更高版本。
+    echo [错误] 本离线包仅支持 64 位 Python 3.11。
     pause
     exit /b 1
 )
