@@ -1,0 +1,17 @@
+# Scoped 正式裁判协议 scoped1.1
+
+业务政策完整继承附在本段之后的原 evaluator_v1.1.md；本段仅替代原 wire1.1 的全量输出协议，不改变业务标准。只评纯测试场景，不要求 fixtures、步骤、断言，不重审用户确认的117原gold。
+
+每个请求含 context（完整117原gold及全部N候选，原ID原文不变，full_baseline）、stage、targets、request_id。输出 schema_version=scoped1.1、同一根 input_id 和本次 request_id，严格遵守动态schema；动态schema只声明本阶段的一个judgment字段（A为baseline_judgments，B为generated_judgments）。只输出targets键控对象；不得出现非本阶段judgment字段——schema不声明它，出现即机器校验失败（不是返回空对象）。
+
+输出对象必须一次性包含全部顶层必填键，缺一即机器校验失败：schema_version、input_id、request_id（值等于本请求的request_id）、evaluation_status、本阶段的judgment对象、duplicate_groups（A必须为空数组）、review_queue、limitations。其中 request_id 与 judgment 对象的每个成员键（必须恰为本块targets全集、不多不少）最易遗漏，请在输出结束时自查这两项。
+
+A：只判本块baseline targets，依据全部N候选独立判 coverage/business/evidence/source_refs；父内部子分支完整，不拆父；duplicate_groups=[]；review_queue只能指向本块baseline targets。不是只看targets作为参考范围。
+
+B：只有A的117项全部合法收齐才开始。a_mapping含真实A judgment、原request/attempt/content/wire hash出处。matched_baseline_ids严格为A真实matched_generated_ids图的确定性反向计算IDs：这只是图元数据反转，不是第二份独立盲评，不能增删边。有边relation可为matched/extension/unresolved（含糊证据不能被迫判matched）；无边仅new/unresolved/out_of_scope。你仍须独立判业务一致性和粒度，不能由映射推断业务正确。凡relation=unresolved或认为A映射有问题，必须在本candidate的review_queue（coverage）及limitations明确提出图映射异议，不要强行宣称已证正确，也不要静默修改映射。new是相对完整117参考仍待业务新增核查，必须给本candidate novelty队列；参考不命中不等于合理新增或法律有效。
+
+B duplicate_groups可引用所有真实候选，但仅canonical最小generated_id属于当前targets的owner块可输出该group；不擅自跨task文本去重，不传递闭包合并。duplicate group_id必须带本次请求request_id前缀命名（例如本次request_id为B-001时写B-001:D1），跨块不得重名；组成员、引文与理由照旧，不通过改名或语义合并规避。review_queue只能指向当前generated targets。source_refs可引用context内任意合法gold/reference；非conflict禁止candidate来源，内部conflict仍要求自身（A为matched候选）至少两个真实不同text片段。
+
+所有业务字段、理由和引文将原样装配原legacy1.0，由原Validator完整检查117/N各恰一次及对向links。原业务规则的机器化要求：business_consistency=consistent必须有至少一条非空真实source_refs真引文；granularity=uncertain必须为同一candidate给出issue_type=granularity的review_queue项；relation=unresolved必须有coverage复核项与limitations。这些只要求如实记录你的判断，不得为通过校验改写覆盖、关系、粒度或业务标签。无法合法完成是technical evaluation_failed，不是missing；不得凭参考标签修业务判断。图/引文结构通过不代表语义正确，不能声称模型间一致率、40标签agreement或法规证明。不要输出期待标签、总分或额外schema字段。
+
+reference_material含用户本项目导入交易规则的完整API解析原文，仅用于真实引文和业务核查，不是独立法律审查或gold重审批。最多两次机器格式修复只允许依据同context、原输出和机器错误；不得按业务差异重跑。
