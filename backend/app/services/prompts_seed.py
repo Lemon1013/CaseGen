@@ -23,7 +23,7 @@ DEFAULT_PROMPTS_DIR = Path(__file__).resolve().parents[1] / "default_prompts"
 
 # Bump this only when the bundled prompt contract changes. Recognized v1 hashes
 # let existing installations upgrade without replacing a user-created prompt.
-BUNDLED_PROMPT_VERSION = 8
+BUNDLED_PROMPT_VERSION = 9
 _LEGACY_DEFAULT_HASHES: dict[str, frozenset[str]] = {
     "generate": frozenset(
         {
@@ -71,6 +71,7 @@ _LEGACY_DEFAULT_HASHES: dict[str, frozenset[str]] = {
         {
             "d3dcd2304d18ddfb1e36b23b5d846727b790e5cad07db7c3f93627fefdc5e60b",
             "6b60bc2f8ffe530b48ead870b71c83372d2fc66e215dd4979ebf467f7d0194c3",
+            "35c7f110c4ff6f52afc3b792dd2c72062d1acabcba9919d11bc32e20384da3fe",
         }
     ),
     "data_description_parse": frozenset(),
