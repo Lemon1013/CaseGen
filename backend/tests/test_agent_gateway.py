@@ -590,22 +590,58 @@ def test_knowledge_space_dirs_unknown_project_is_empty(tmp_app_data):
     assert agent_turn._knowledge_space_dirs("not-a-number") == []
 
 
-def test_update_session_model_sends_patch_with_provider_and_model(tmp_app_data):
+def test_update_session_model_sends_put_with_provider_and_model(tmp_app_data):
+    """DSH /sessions/{id} exposes DELETE/GET/PUT only; PATCH returns 404."""
+
     captured = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured["method"] = request.method
         captured["path"] = request.url.path
         captured["body"] = json.loads(request.content or b"{}")
-        return httpx.Response(200, json={"ok": True, "data": {}})
+        # Mirror the real DSH PUT response shape (model.selected).
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "data": {
+                    "sessionId": "sess-42",
+                    "model": {
+                        "selected": {
+                            "provider": "deepseek",
+                            "model": "deepseek-reasoner",
+                        }
+                    },
+                },
+            },
+        )
 
     ok = agent_gateway.gateway.update_session_model(
         "sess-42", "deepseek/deepseek-reasoner", transport=_transport(handler)
     )
     assert ok is True
-    assert captured["method"] == "PATCH"
+    assert captured["method"] == "PUT"
     assert captured["path"].endswith("/sessions/sess-42")
     assert captured["body"] == {"provider": "deepseek", "model": "deepseek-reasoner"}
+
+
+def test_update_session_model_returns_false_on_dsh_404(tmp_app_data):
+    """A 404 (the old PATCH symptom) must be reported as a failure, not success."""
+
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        return httpx.Response(
+            404,
+            json={"code": "NOT_FOUND", "error": "Endpoint not found"},
+        )
+
+    ok = agent_gateway.gateway.update_session_model(
+        "sess-42", "deepseek/deepseek-reasoner", transport=_transport(handler)
+    )
+    assert ok is False
+    assert captured["method"] == "PUT"
 
 
 def test_stream_prompt_includes_model_when_provided():
@@ -731,4 +767,94 @@ def test_ensure_session_recovers_when_workspace_id_is_404(tmp_app_data):
     assert methods == ["POST", "POST", "POST", "PUT"]
     assert calls[0][2]["workspaceId"] == "stale-ws-404"
     assert calls[2][2]["workspaceId"] == "recreated-ws"
+
+
+
+# ---------------------------------------------------------------------------
+# Multi-segment model normalization (legacy UI concatenated the local
+# /api/models row name in front of the DSH provider/model id).
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_agent_model_repairs_legacy_three_segment_value():
+    # DSH GET /api/v1/models reports provider=magpie for id group/deepseek-flash.
+    assert agent_gateway.normalize_agent_model(
+        "DEEPSEEK/group/deepseek-flash"
+    ) == "magpie/group/deepseek-flash"
+
+
+def test_normalize_agent_model_keeps_legal_values_untouched():
+    for value in (
+        "magpie/group/deepseek-flash",
+        "deepseek-official/deepseek-flash",
+        "openai/gpt-4o",
+        "",
+        "single-token",
+    ):
+        assert agent_gateway.normalize_agent_model(value) == value
+
+
+def test_normalize_agent_model_leaves_unknown_three_segment_value_alone():
+    # Hand-typed values that cannot be positively identified are never guessed.
+    assert agent_gateway.normalize_agent_model(
+        "CUSTOM/vendor/my-model"
+    ) == "CUSTOM/vendor/my-model"
+
+
+def test_normalize_agent_model_is_data_driven_from_dsh_catalog():
+    agent_gateway._DSH_MODEL_PROVIDERS.clear()
+    agent_gateway._DSH_MODEL_IDS.clear()
+    agent_gateway._index_models({
+        "models": [
+            {"id": "group/deepseek-flash", "provider": "magpie"},
+            {"id": "deepseek-flash", "provider": "deepseek-official"},
+        ]
+    })
+    # A known provider prefix is preserved even with an extra slash.
+    assert agent_gateway.normalize_agent_model(
+        "magpie/group/deepseek-flash"
+    ) == "magpie/group/deepseek-flash"
+    # An unknown prefix is resolved against the catalog, not a hardcoded list.
+    assert agent_gateway.normalize_agent_model(
+        "DEEPSEEK/group/deepseek-flash"
+    ) == "magpie/group/deepseek-flash"
+
+
+def test_create_session_splits_legacy_three_segment_model_correctly(tmp_app_data):
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/sessions"):
+            captured["body"] = json.loads(request.content or b"{}")
+            return httpx.Response(200, json={"ok": True, "data": {"sessionId": "s"}})
+        return httpx.Response(404, json={"ok": False})
+
+    agent_gateway.gateway.create_session(
+        workspace_id="ws-1", model="DEEPSEEK/group/deepseek-flash",
+        transport=_transport(handler),
+    )
+    assert captured["body"]["provider"] == "magpie"
+    assert captured["body"]["model"] == "group/deepseek-flash"
+
+
+def test_list_models_returns_raw_dsh_data_and_indexes_providers(tmp_app_data):
+    payload = {
+        "defaultModel": {"provider": "magpie", "model": "workbuddy/hy4free", "reasoningEffort": "high"},
+        "models": [
+            {"id": "group/deepseek-flash", "provider": "magpie", "name": "Flash", "isDefault": False},
+            {"id": "deepseek-flash", "provider": "deepseek-official", "name": "DS Flash", "isDefault": False},
+        ],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path.endswith("/models")
+        return httpx.Response(200, json={"ok": True, "data": payload})
+
+    data = agent_gateway.gateway.list_models(transport=_transport(handler))
+    assert data == payload
+    assert "magpie" in agent_gateway._DSH_MODEL_PROVIDERS
+    assert agent_gateway._DSH_MODEL_IDS["group/deepseek-flash"] == "magpie"
+    # And the module-level wrapper is injectable as well.
+    assert agent_gateway.list_models(transport=_transport(handler)) == payload
 

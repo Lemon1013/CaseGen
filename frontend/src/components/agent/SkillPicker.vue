@@ -6,12 +6,13 @@ import type { AgentSkillItem } from '../../api/agent'
 
 // 技能 + 模型选择器。
 // 技能来自 GET /api/agent/skills（后端扫描 .agents 下每个技能目录的 SKILL.md frontmatter，spec §3.4）；
-// 模型支持从 ModelConfig 候选中下拉选择，也支持直接自由输入 provider/model 字符串（filterable + allow-create）。
+// 模型来自 GET /api/agent/models（DSH 自己的 provider/id，不是 /api/models 的 ModelConfig），
+// 也支持直接自由输入 provider/model 字符串（filterable + allow-create）。
 
 const props = withDefaults(
   defineProps<{
     skills?: AgentSkillItem[]
-    models?: { id: number; name: string; model_name: string }[]
+    models?: { id: string; provider: string; name: string }[]
     modelValue?: string | null
     modelLoading?: boolean
     disabled?: boolean
@@ -65,10 +66,11 @@ const skillOptions = computed(() =>
   })),
 )
 
+/** value 必须是 DSH 的合法 provider/id 两段式（id 自身可含 /）。 */
 const modelOptions = computed(() =>
   props.models.map((item) => ({
-    label: `${item.name}（${item.model_name}）`,
-    value: item.name ? `${item.name}/${item.model_name}` : item.model_name,
+    label: `${item.name}（${item.provider}/${item.id}）`,
+    value: `${item.provider}/${item.id}`,
   })),
 )
 
@@ -142,11 +144,11 @@ function refresh() {
       </div>
       <div class="picker-field model-field">
         <div class="picker-label-row">
-          <label class="picker-label">模型（可选或自定义输入）</label>
+          <label class="picker-label">模型（选择或输入 DSH 的 provider/model）</label>
         </div>
         <el-select
           :model-value="modelDraft"
-          placeholder="选择已配置模型或输入 provider/model，留空用默认"
+          placeholder="选择或输入 DSH 的 provider/model，留空用 DSH 默认"
           clearable
           filterable
           allow-create

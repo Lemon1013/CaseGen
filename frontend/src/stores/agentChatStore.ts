@@ -11,6 +11,7 @@ import {
   isAgentUnavailable,
   isConversationMissing,
   listAgentConversations,
+  listAgentModels,
   listAgentSkills,
   normalizeProjectId,
   saveAgentConversationAsDraft,
@@ -18,12 +19,13 @@ import {
   updateAgentConversation,
   type AgentConversationItem,
   type AgentMessageItem,
+  type AgentModelItem,
+  type AgentModelsResponse,
   type AgentProjectId,
   type AgentSaveAsDraftResult,
   type AgentSkillItem,
   type AgentStreamPayload,
 } from '../api/agent'
-import { listModels, type ModelConfig } from '../api/models'
 import { getSession } from '../api/auth'
 import { useSseStream, type SseStreamPayload } from '../composables/useSseStream'
 
@@ -149,8 +151,11 @@ export const useAgentChatStore = defineStore('agentChat', () => {
   const skills = ref<AgentSkillItem[]>([])
   const skillsLoading = ref(false)
   const skillsError = ref('')
-  const models = ref<ModelConfig[]>([])
+  // DSH 模型目录（GET /api/agent/models），不是 /api/models 的 ModelConfig。
+  const models = ref<AgentModelItem[]>([])
   const modelsLoading = ref(false)
+  const modelsError = ref('')
+  const defaultModelLabel = ref('DSH 默认')
 
   // ---- 功能可用性（spec §7：AGENT_ENABLED=false 时 /api/agent/* 返回 410）----
   const agentAvailable = ref(true)
@@ -619,13 +624,20 @@ export const useAgentChatStore = defineStore('agentChat', () => {
     }
   }
 
-  async function loadModels() {
-    if (models.value.length) return
+  async function loadModels(force = false) {
+    if (models.value.length && !force) return
     modelsLoading.value = true
+    modelsError.value = ''
     try {
-      models.value = await listModels()
-    } catch {
+      const payload: AgentModelsResponse = await listAgentModels(projectId.value)
+      models.value = Array.isArray(payload.models) ? payload.models : []
+      const provider = payload.default_provider || ''
+      const model = payload.default_model || ''
+      defaultModelLabel.value = provider && model ? `${provider}/${model}` : 'DSH 默认'
+    } catch (error) {
+      // 不留空列表伪装成功：把错误透给 UI，用户可重试或改用手动输入。
       models.value = []
+      modelsError.value = errorMessage(error)
     } finally {
       modelsLoading.value = false
     }
@@ -937,6 +949,8 @@ export const useAgentChatStore = defineStore('agentChat', () => {
     skillsError,
     models,
     modelsLoading,
+    modelsError,
+    defaultModelLabel,
     agentAvailable,
     agentDisabledNotice,
     streamConnected,

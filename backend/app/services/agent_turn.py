@@ -599,11 +599,19 @@ def run_turn(
                         project_id=project_id,
                     )
             elif inputs.get("model") is not None:
-                agent_gateway.update_session_model(
+                # A False return means DSH refused / ignored the switch and
+                # would silently keep the previous model.  Turn that into a
+                # visible failed turn instead of running with the wrong model.
+                switched = agent_gateway.update_session_model(
                     dsh_session_id,
                     inputs.get("model"),
                     transport=transport,
                 )
+                if not switched:
+                    raise AgentGatewayError(
+                        "模型切换失败，请稍后重试或新建对话。",
+                        category="http_error",
+                    )
 
             stop_event.clear()
             watchdog_thread = threading.Thread(

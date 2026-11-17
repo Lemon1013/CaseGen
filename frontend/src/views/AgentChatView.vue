@@ -11,7 +11,6 @@ import SkillPicker from '../components/agent/SkillPicker.vue'
 import CitationList from '../components/CitationList.vue'
 import { listCitations, type TaskCitation } from '../api/tasks'
 import type { AgentConversationItem, AgentSaveAsDraftResult } from '../api/agent'
-import type { ModelConfig } from '../api/models'
 
 /**
  * Agent 对话页（spec §3.6-3）。
@@ -70,15 +69,20 @@ const spaceId = computed<number | undefined>(() => {
 const conversations = computed(() => store.conversations)
 const current = computed(() => store.currentConversation)
 
+/** SkillPicker 的模型候选：DSH 的 provider/id 两段式，value 可直接落库。 */
 const modelOptions = computed(() =>
-  store.models.map((item) => ({ id: item.id, name: item.name, model_name: item.model_name })),
+  store.models.map((item) => ({
+    id: item.id,
+    provider: item.provider,
+    name: item.name,
+  })),
 )
 
-/** 展开区模型候选：沿用 SkillPicker 的「name/model_name」口径。 */
+/** 展开区模型候选：与 SkillPicker 同口径，标注 DSH 默认项。 */
 const modelCandidates = computed(() =>
-  store.models.map((item: ModelConfig) => ({
-    label: `${item.name}（${item.model_name}）`,
-    value: item.name ? `${item.name}/${item.model_name}` : item.model_name,
+  store.models.map((item) => ({
+    label: `${item.name}（${item.provider}/${item.id}）${item.is_default ? ' · DSH 默认' : ''}`,
+    value: item.value,
   })),
 )
 
@@ -167,6 +171,8 @@ async function saveCurrentConfig() {
   if (!current.value || store.isBusy) return
   configSaving.value = true
   try {
+    // 清空时传 null：后端 PATCH 用 model_fields_set 区分「未传」与「显式 null」，
+    // null 会把 conversation.model 置空，即回到 DSH 默认模型。
     await store.updateConversationConfig(
       currentSkillDraft.value || null,
       currentModelDraft.value.trim() || null,
@@ -174,7 +180,9 @@ async function saveCurrentConfig() {
     ElMessage.success('会话配置已更新并同步至 Agent')
     configExpanded.value = false
   } catch (error) {
-    ElMessage.error(`保存配置失败：${(error as Error).message}`)
+    // 后端在 DSH 拒绝切换模型时返回 502；绝不吞掉错误或谎报成功。
+    const detail = (error as { detail?: string } | null)?.detail || (error as Error).message
+    ElMessage.error(`模型切换失败，请稍后重试或新建对话：${detail}`)
   } finally {
     configSaving.value = false
   }
@@ -333,6 +341,19 @@ onUnmounted(() => {
       title="技能列表载入失败，可稍后重试"
       :description="store.skillsError"
     />
+    <el-alert
+      v-if="store.modelsError"
+      class="page-alert"
+      type="warning"
+      show-icon
+      :closable="false"
+      title="DSH 模型列表载入失败，可手动输入 provider/model 或稍后重试"
+      :description="store.modelsError"
+    >
+      <template #default>
+        <el-button size="small" link type="primary" @click="store.loadModels(true)">重试</el-button>
+      </template>
+    </el-alert>
 
     <div class="agent-layout" :class="{ 'layout--list-collapsed': listCollapsed }">
       <el-card shadow="never" class="block list-block">
@@ -512,10 +533,10 @@ onUnmounted(() => {
               </el-select>
             </div>
             <div class="config-field">
-              <label class="config-field-label">模型（可选已配置模型或输入 provider/model）</label>
+              <label class="config-field-label">模型（选择或输入 DSH 的 provider/model）</label>
               <el-select
                 :model-value="currentModelDraft"
-                placeholder="选择或输入 provider/model，留空则用后端默认"
+                placeholder="选择或输入 DSH 的 provider/model，留空则用 DSH 默认"
                 clearable
                 filterable
                 allow-create
@@ -582,7 +603,7 @@ onUnmounted(() => {
           </div>
           <div class="info-row">
             <dt>模型</dt>
-            <dd>{{ current.model || '后端默认' }}</dd>
+            <dd>{{ current.model || 'DSH 默认（' + store.defaultModelLabel + '）' }}</dd>
           </div>
           <div class="info-row">
             <dt>DSH 会话</dt>

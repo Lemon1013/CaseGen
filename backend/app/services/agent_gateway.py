@@ -744,10 +744,102 @@ def ensure_project_workspace_dir(project_id: Union[str, int]) -> Path:
     return target
 
 
-def _split_model(model: Optional[str]) -> tuple[str, str]:
-    """Split a 'provider/model' string into (provider, model)."""
+# Conservative fallback for values written by the old UI, which prefixed a
+# DSH provider/model with the *local* /api/models row name (e.g.
+# DEEPSEEK/group/deepseek-flash).  Evidence: GET /api/v1/models returns
+# {provider: magpie, id: group/deepseek-flash}, and the local models table has
+# name=DEEPSEEK, model_name=group/deepseek-flash.  This map is deliberately
+# tiny: unknown hand-typed values are left untouched, never guessed.
+LEGACY_MODEL_PROVIDER_ALIASES: dict[str, str] = {
+    "group/deepseek-flash": "magpie",
+}
+
+# Refreshed whenever ``list_models`` succeeds, so runtime normalization is
+# data-driven from the DSH catalog instead of a hardcoded provider list.
+_DSH_MODEL_PROVIDERS: set[str] = set()
+_DSH_MODEL_IDS: dict[str, str] = {}  # model id -> provider
+_DSH_MODELS_LOCK = threading.Lock()
+
+
+def _index_models(data: Any) -> None:
+    """Refresh the provider/id index from a DSH /models payload (best effort)."""
+
+    models = data.get("models") if isinstance(data, Mapping) else None
+    if not isinstance(models, list):
+        return
+    providers: set[str] = set()
+    ids: dict[str, str] = {}
+    for item in models:
+        if not isinstance(item, Mapping):
+            continue
+        provider = str(item.get("provider") or "").strip()
+        model_id = str(item.get("id") or "").strip()
+        if provider:
+            providers.add(provider)
+        if provider and model_id:
+            ids[model_id] = provider
+    if not providers and not ids:
+        return
+    with _DSH_MODELS_LOCK:
+        if providers:
+            _DSH_MODEL_PROVIDERS.update(providers)
+        if ids:
+            _DSH_MODEL_IDS.update(ids)
+
+
+def _known_provider(provider: str) -> bool:
+    with _DSH_MODELS_LOCK:
+        return provider in _DSH_MODEL_PROVIDERS
+
+
+def _provider_for_model_id(model_id: str) -> str:
+    with _DSH_MODELS_LOCK:
+        return _DSH_MODEL_IDS.get(model_id, "")
+
+
+def normalize_agent_model(model: Optional[str]) -> str:
+    """Return a DSH-legal ``provider/model`` value for a stored model string.
+
+    The old UI built ``<local model name>/<provider-model id>`` (three
+    segments).  DSH needs ``<provider>/<model id>`` where the model id may
+    itself contain slashes.  Rules:
+
+    - a two-segment value is already provider/model and is kept verbatim
+      (e.g. ``deepseek-official/deepseek-flash``);
+    - for three or more segments, if the first segment is a known DSH provider
+      the value is already legal (e.g. ``magpie/group/deepseek-flash``);
+    - otherwise the bogus first segment is dropped and the remaining id is
+      looked up in the DSH catalog (or the conservative legacy alias map) to
+      recover the real provider;
+    - anything unrecognised is returned unchanged so hand-typed values are
+      never silently rewritten.
+    """
 
     text = (model or "").strip()
+    if not text or "/" not in text:
+        return text
+    parts = [part.strip() for part in text.split("/")]
+    if len(parts) < 3:
+        return text
+    first, rest = parts[0], "/".join(parts[1:])
+    if not first or _known_provider(first):
+        return text
+    provider = _provider_for_model_id(rest) or LEGACY_MODEL_PROVIDER_ALIASES.get(rest, "")
+    if not provider:
+        return text
+    return f"{provider}/{rest}"
+
+
+def _split_model(model: Optional[str]) -> tuple[str, str]:
+    """Split a normalized 'provider/model' string into (provider, model).
+
+    ``model`` ids may legitimately contain slashes (``group/deepseek-flash``),
+    so only the FIRST slash separates the provider.  Legacy three-segment
+    values are normalized before splitting so a stale local model name never
+    becomes a bogus DSH provider and silently falls back to the default model.
+    """
+
+    text = normalize_agent_model(model)
     if not text:
         return "", ""
     if "/" in text:
@@ -813,6 +905,23 @@ class DshAgentGateway:
             raise _error_from_response(response)
         auth_circuit.record_success()
         return _unwrap_envelope(response)
+
+    def list_models(
+        self,
+        *,
+        transport: Optional[httpx.BaseTransport] = None,
+    ) -> Any:
+        """GET /models -> DSH catalog (``defaultModel`` + ``models`` array).
+
+        Returns the raw ``data`` payload; no model list is hardcoded here.
+        A successful call also refreshes the provider/id index used by
+        ``normalize_agent_model`` so legacy three-segment values can be
+        resolved against the real catalog.
+        """
+
+        data = self._request("GET", "/models", transport=transport)
+        _index_models(data)
+        return data
 
     def create_workspace(
         self,
@@ -886,7 +995,15 @@ class DshAgentGateway:
         *,
         transport: Optional[httpx.BaseTransport] = None,
     ) -> bool:
-        """PATCH /sessions/:id {provider?, model} to switch model on an existing session."""
+        """PUT /sessions/:id {provider?, model} to switch model on an existing session.
+
+        The current DSH session plane exposes only DELETE/GET/PUT for
+        ``/sessions/{id}`` (see GET /openapi.json).  An earlier spec revision
+        documented PATCH, but a PATCH now returns 404 NOT_FOUND.  The request
+        body is unchanged; both caller paths (conversation PATCH and the
+        per-turn switch) rely on the bool result, so a failure is never
+        swallowed.
+        """
 
         text_id = str(session_id or "").strip()
         if not text_id:
@@ -897,13 +1014,19 @@ class DshAgentGateway:
             payload["provider"] = provider
         try:
             self._request(
-                "PATCH",
+                "PUT",
                 "/sessions/" + quote(text_id, safe=""),
                 json_body=payload,
                 transport=transport,
             )
         except AgentGatewayError as exc:
-            logger.warning("DSH 会话模型更新失败：%s", getattr(exc, "category", "unknown"))
+            # Only fixed primitives: no response body, URL or credential.
+            # method/status/category are enough to spot another upstream drift.
+            logger.warning(
+                "DSH 会话模型更新失败：method=PUT status=%s category=%s",
+                getattr(exc, "http_status", None),
+                getattr(exc, "category", "unknown"),
+            )
             return False
         return True
 
@@ -1258,6 +1381,15 @@ def ensure_session(
         agent_preset=agent_preset,
         transport=transport,
     )
+
+
+def list_models(
+    *,
+    transport: Optional[httpx.BaseTransport] = None,
+) -> Any:
+    """Module-level wrapper for GET /models (transport injectable in tests)."""
+
+    return gateway.list_models(transport=transport)
 
 
 def update_session_model(

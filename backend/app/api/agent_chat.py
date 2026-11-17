@@ -48,10 +48,13 @@ from app.schemas.agent import (
     AgentMessageAccepted,
     AgentMessageCreate,
     AgentMessageOut,
+    AgentModelItem,
+    AgentModelsOut,
     AgentSaveAsDraftOut,
     AgentSkillOut,
 )
 from app.services import agent_draft, agent_gateway, agent_skills, agent_turn
+from app.services.agent_gateway import AgentGatewayError
 from app.services.agent_stream import agent_stream, encode_sse
 from app.services.case_management import CaseDraftParseError
 from app.services.permissions import current_user
@@ -308,6 +311,65 @@ def _recover_orphaned_turn(session: Session, conversation: AgentConversation) ->
 
 
 
+@router.get("/models", response_model=AgentModelsOut)
+def list_agent_models(request: Request) -> AgentModelsOut:
+    """Proxy the DSH model catalog for the Agent model picker.
+
+    CaseGen /api/models configures the *legacy* LLM pipeline; Agent chat
+    runs on the DSH plane and needs DSH own provider/model ids. A failed
+    DSH call is surfaced as 502 instead of an empty list, so the UI never
+    silently offers wrong candidates.
+    """
+
+    _require_agent_enabled()
+    _require_project(request)
+    try:
+        data = agent_gateway.list_models()
+    except AgentGatewayError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="无法获取 DSH 模型列表：" + str(exc),
+        ) from exc
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=502, detail="DSH 模型列表格式无效")
+
+    raw_models = data.get("models")
+    models: list[AgentModelItem] = []
+    if isinstance(raw_models, list):
+        for item in raw_models:
+            if not isinstance(item, dict):
+                continue
+            provider = str(item.get("provider") or "").strip()
+            model_id = str(item.get("id") or "").strip()
+            if not provider or not model_id:
+                continue
+            models.append(
+                AgentModelItem(
+                    id=model_id,
+                    provider=provider,
+                    name=str(item.get("name") or model_id),
+                    is_default=bool(item.get("isDefault")),
+                    value=provider + "/" + model_id,
+                )
+            )
+
+    default = data.get("defaultModel")
+    default = default if isinstance(default, dict) else {}
+    default_provider = str(default.get("provider") or "").strip()
+    default_model = str(default.get("model") or "").strip()
+    default_effort = str(default.get("reasoningEffort") or "").strip()
+    default_value = default_provider + "/" + default_model if default_provider and default_model else ""
+    if default_value:
+        for item in models:
+            if item.value == default_value:
+                item.is_default = True
+    return AgentModelsOut(
+        models=models,
+        default_provider=default_provider,
+        default_model=default_model,
+        default_reasoning_effort=default_effort,
+    )
+
 @router.get("/conversations", response_model=list[AgentConversationOut])
 def list_conversations(
     request: Request,
@@ -387,8 +449,12 @@ def update_conversation(
     if body.skill_name is not None:
         conversation.skill_name = body.skill_name.strip() or None
     model_changed = False
-    if body.model is not None:
-        next_model = body.model.strip() or None
+    # model_fields_set distinguishes "field omitted" from an explicit JSON
+    # null.  The frontend sends null when the picker is cleared, which must
+    # reset the conversation to the DSH default model.  An empty string is
+    # treated the same way for callers that use "" instead of null.
+    if "model" in body.model_fields_set:
+        next_model = (body.model or "").strip() or None
         if next_model != conversation.model:
             model_changed = True
         conversation.model = next_model
@@ -397,9 +463,15 @@ def update_conversation(
     session.commit()
     session.refresh(conversation)
     if model_changed and str(conversation.dsh_session_id or "").strip():
-        agent_gateway.update_session_model(
+        ok = agent_gateway.update_session_model(
             str(conversation.dsh_session_id), conversation.model
         )
+        if not ok:
+            # Never report success while DSH silently kept the old model.
+            raise HTTPException(
+                status_code=502,
+                detail="模型切换失败，请稍后重试或新建对话。",
+            )
     return _conversation_out(session, conversation)
 
 

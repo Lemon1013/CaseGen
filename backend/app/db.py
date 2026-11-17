@@ -786,6 +786,60 @@ def _migrate_user_visibility_schema(engine) -> None:
                 )
             )
 
+
+def _migrate_agent_conversation_models(engine) -> None:
+    """Repair legacy three-segment Agent model values (idempotent).
+
+    The old UI built ``<local models.name>/<provider-model id>`` before
+    sending it to DSH, e.g. ``DEEPSEEK/group/deepseek-flash``.  DSH needs
+    ``magpie/group/deepseek-flash`` (GET /api/v1/models shows provider
+    magpie for id group/deepseek-flash) and silently falls back to its
+    default model for an unknown provider.
+
+    Only values whose FIRST segment exactly matches a row in the local
+    ``models`` table are considered dirty: that is the fingerprint of the
+    old concatenation bug.  Hand-typed or already-correct values (including
+    ``magpie/group/deepseek-flash`` and ``deepseek-official/deepseek-flash``)
+    are never touched.  The row is only written when the value changes, so
+    running init_db repeatedly is a no-op.
+    """
+
+    from app.services.agent_gateway import normalize_agent_model
+
+    with engine.begin() as conn:
+        conv_cols = conn.execute(
+            text("PRAGMA table_info(agent_conversations)")
+        ).fetchall()
+        if not conv_cols or "model" not in {str(row[1]) for row in conv_cols}:
+            return
+        model_cols = conn.execute(text("PRAGMA table_info(models)")).fetchall()
+        if not model_cols or "name" not in {str(row[1]) for row in model_cols}:
+            return
+        local_names = {
+            str(row[0]).strip()
+            for row in conn.execute(text("SELECT name FROM models")).fetchall()
+            if str(row[0]).strip()
+        }
+        if not local_names:
+            return
+        rows = conn.execute(
+            text("SELECT id, model FROM agent_conversations WHERE model IS NOT NULL")
+        ).fetchall()
+        for row_id, value in rows:
+            text_value = str(value or "").strip()
+            parts = text_value.split("/")
+            if len(parts) < 3 or parts[0].strip() not in local_names:
+                continue
+            corrected = normalize_agent_model(text_value)
+            if corrected == text_value:
+                continue
+            conn.execute(
+                text(
+                    "UPDATE agent_conversations SET model = :value WHERE id = :row_id"
+                ),
+                {"value": corrected, "row_id": row_id},
+            )
+
 def _migrate_external_wiki_schema(engine) -> None:
     """Create project_external_wikis table and index if not present."""
     with engine.begin() as conn:
@@ -834,6 +888,9 @@ def init_db() -> None:
     # Runs last so SQLModel.metadata.create_all has already created the
     # projects / users / agent_conversations tables on a fresh database.
     _migrate_user_visibility_schema(engine)
+    # Runs after the visibility migration so the conversation table/columns
+    # definitely exist; idempotent and offline (never calls DSH).
+    _migrate_agent_conversation_models(engine)
 
 
 def get_session():
