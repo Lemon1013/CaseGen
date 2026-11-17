@@ -134,7 +134,7 @@ def _prompt(session: Session, prompt_type: str) -> PromptTemplate:
         select(PromptTemplate).where(
             PromptTemplate.type == prompt_type,
             PromptTemplate.is_active == True,  # noqa: E712
-        ).order_by(col(PromptTemplate.id).desc())
+        ).order_by(col(PromptTemplate.updated_at).desc(), col(PromptTemplate.id).desc())
     ).first()
     if row is None:
         raise HTTPException(status_code=503, detail=f"Active prompt not found: {prompt_type}")

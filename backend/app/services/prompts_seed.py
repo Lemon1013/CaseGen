@@ -19,6 +19,10 @@ PROMPT_TYPES = (
     "data_description_parse",
 )
 
+# `generate` supports per-task template selection.  Every other type must
+# keep exactly one active row so prompt resolution is deterministic.
+MULTI_ACTIVE_PROMPT_TYPES = frozenset({"generate"})
+
 DEFAULT_PROMPTS_DIR = Path(__file__).resolve().parents[1] / "default_prompts"
 
 # Bump this only when the bundled prompt contract changes. Recognized v1 hashes
@@ -162,3 +166,30 @@ def seed_default_prompts(session: Session) -> None:
             )
         )
     session.commit()
+    normalize_single_active_prompts(session)
+
+
+def normalize_single_active_prompts(session: Session) -> None:
+    """Keep only the most recently updated active row for single-active types."""
+    prompt_types = session.exec(select(PromptTemplate.type).distinct()).all()
+    changed = False
+    for prompt_type in prompt_types:
+        if prompt_type in MULTI_ACTIVE_PROMPT_TYPES:
+            continue
+        active_rows = session.exec(
+            select(PromptTemplate)
+            .where(
+                PromptTemplate.type == prompt_type,
+                PromptTemplate.is_active == True,  # noqa: E712
+            )
+            .order_by(
+                col(PromptTemplate.updated_at).desc(),
+                col(PromptTemplate.id).desc(),
+            )
+        ).all()
+        for row in active_rows[1:]:
+            row.is_active = False
+            session.add(row)
+            changed = True
+    if changed:
+        session.commit()

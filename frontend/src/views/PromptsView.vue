@@ -105,7 +105,7 @@ async function setActive() {
   saving.value = true
   try {
     const updated = await updatePrompt(selectedId.value, { is_active: true })
-    ElMessage.success('已设为启用')
+    ElMessage.success(selected.value?.type === 'generate' ? '已设为启用' : '已设为唯一启用')
     await load()
     selectPrompt(updated)
   } catch (e) {
@@ -172,7 +172,7 @@ onMounted(load)
     <div class="page-header">
       <div>
         <h1 class="page-title">提示词管理</h1>
-        <p class="page-subtitle">维护生成、测试点、评审与 Wiki 编译相关模板；同一类型可同时启用多条，用例生成页可选择 generate 模板</p>
+        <p class="page-subtitle">维护生成、测试点、评审与 Wiki 编译相关模板；generate 可同时启用多条供任务选择，其他类型仅保留一条启用</p>
       </div>
       <div class="page-actions">
         <el-select
