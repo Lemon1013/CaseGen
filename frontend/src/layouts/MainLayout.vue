@@ -25,6 +25,7 @@ import {
   Fold,
 } from '@element-plus/icons-vue'
 import { listModels, type ModelConfig } from '../api/models'
+import { setProjectInvalidHandler } from '../api/client'
 import { useAuthStore } from '../authStore'
 import BrandMark from '../components/BrandMark.vue'
 import { useProjectStore } from '../projectStore'
@@ -190,23 +191,58 @@ watch(
 
 // ...and on a 60s fallback timer for long-lived views that never navigate.
 const modelTimer = window.setInterval(loadDefaultModel, 60_000)
+
+let projectRefreshFlight: Promise<void> | null = null
+let lastProjectRefreshAt = 0
+
+// Long-lived tabs keep the module-level project list; refresh it when the
+// window regains focus or the selector opens.
+function refreshProjects(force = false): Promise<void> {
+  if (!projects.state.loaded) return Promise.resolve()
+  if (projectRefreshFlight) return projectRefreshFlight
+  if (!force && Date.now() - lastProjectRefreshAt < 15_000) return Promise.resolve()
+  lastProjectRefreshAt = Date.now()
+  projectRefreshFlight = projects.refresh(router)
+    .catch(() => {})
+    .finally(() => {
+      projectRefreshFlight = null
+    })
+  return projectRefreshFlight
+}
+
+function onProjectSelectVisible(visible: boolean) {
+  if (visible) void refreshProjects()
+}
+
+function onWindowFocus() {
+  if (document.visibilityState === 'visible') void refreshProjects()
+}
+
+function onVisibilityChange() {
+  if (document.visibilityState === 'visible') void refreshProjects()
+}
+
+onMounted(async () => {
+  window.addEventListener('focus', onWindowFocus)
+  document.addEventListener('visibilitychange', onVisibilityChange)
+  setProjectInvalidHandler(() => refreshProjects(true))
+  await Promise.all([loadDefaultModel(), projects.load(route.query)])
+  await projects.ensureRouteProject(router)
+})
+
 onUnmounted(() => {
   window.clearInterval(modelTimer)
+  window.removeEventListener('focus', onWindowFocus)
+  document.removeEventListener('visibilitychange', onVisibilityChange)
+  setProjectInvalidHandler(null)
 })
 
 watch(
   () => route.query.project_id,
-  async (newId) => {
-    if (projects.state.loaded && projects.state.currentId && !newId) {
-      await projects.select(projects.state.currentId, router)
-    }
+  async () => {
+    if (projects.state.loaded) await projects.ensureRouteProject(router)
   },
 )
-
-onMounted(async () => {
-  await Promise.all([loadDefaultModel(), projects.load(route.query)])
-  if (projects.state.currentId && !route.query.project_id) await projects.select(projects.state.currentId, router)
-})
 </script>
 
 <template>
@@ -327,7 +363,7 @@ onMounted(async () => {
           <p v-if="pageDescription" class="topbar-desc">{{ pageDescription }}</p>
         </div>
         <div class="topbar-right">
-          <el-select v-if="projects.state.projects.length" :model-value="projects.state.currentId" class="project-select" aria-label="当前项目" @change="(id: number) => projects.select(id, router)">
+          <el-select v-if="projects.state.projects.length" :model-value="projects.state.currentId" class="project-select" aria-label="当前项目" @change="(id: number) => projects.select(id, router)" @visible-change="onProjectSelectVisible">
             <el-option v-for="project in projects.state.projects.filter((item) => item.status === 'active')" :key="project.id" :label="project.name" :value="project.id" />
           </el-select>
           <div v-if="defaultModel" class="model-chip" title="当前默认模型">
