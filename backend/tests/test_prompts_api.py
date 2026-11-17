@@ -162,6 +162,32 @@ def test_prompt_unique_index_rejects_second_active(tmp_app_data):
     assert {"gen-a", "gen-b"}.issubset({row.name for row in active_generate})
 
 
+def test_create_prompt_returns_409_on_active_conflict(tmp_app_data, monkeypatch):
+    client = TestClient(create_app())
+    for row in client.get("/api/prompts", params={"type": "review"}).json():
+        if row["is_active"]:
+            assert client.put(
+                f"/api/prompts/{row['id']}", json={"is_active": False}
+            ).status_code == 200
+
+    monkeypatch.setattr(
+        "app.api.prompts._deactivate_active_prompts",
+        lambda *args, **kwargs: None,
+    )
+    first = client.post(
+        "/api/prompts",
+        json={"name": "review-a", "type": "review", "content": "A", "is_active": True},
+    )
+    second = client.post(
+        "/api/prompts",
+        json={"name": "review-b", "type": "review", "content": "B", "is_active": True},
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 409
+    assert "already enabled" in second.json()["detail"]
+
+
 def test_default_prompts_seeded(tmp_app_data):
     client = TestClient(create_app())
     items = client.get("/api/prompts").json()
