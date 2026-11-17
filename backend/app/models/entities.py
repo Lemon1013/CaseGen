@@ -859,6 +859,24 @@ class AuthSession(SQLModel, table=True):
     user_agent: Optional[str] = None
     ip: Optional[str] = None
 
+
+class SystemSetting(SQLModel, table=True):
+    """Small key/value store for runtime-editable application settings.
+
+    Most configuration stays in ``app.config`` and is read from environment
+    variables at startup.  A few switches (currently only public
+    registration) must be changeable by an administrator without restarting
+    the process, so they are persisted here and fall back to the configured
+    default when no row exists yet.
+    """
+
+    __tablename__ = "app_settings"
+
+    key: str = Field(primary_key=True)
+    value: str
+    updated_at: datetime = Field(default_factory=_utcnow, sa_column_kwargs={"onupdate": _utcnow})
+
+
 def _uuid_hex() -> str:
     # String primary keys keep agent rows addressable across restarts and avoid
     # the SQLite integer-id reuse hazard that task_stream.discard guards against.

@@ -18,6 +18,12 @@ const router = createRouter({
       meta: { title: '初始化管理员' },
     },
     {
+      path: '/register',
+      name: 'register',
+      component: () => import('../views/RegisterView.vue'),
+      meta: { title: '注册' },
+    },
+    {
       path: '/',
       component: MainLayout,
       meta: { requiresAuth: true },
@@ -27,6 +33,12 @@ const router = createRouter({
           name: 'workbench',
           component: () => import('../views/WorkbenchView.vue'),
           meta: { title: '用例生成', description: '填写需求，创建任务并生成测试用例草稿' },
+        },
+        {
+          path: 'account/security',
+          name: 'account-security',
+          component: () => import('../views/AccountSecurityView.vue'),
+          meta: { title: '账号安全', description: '修改登录密码，保护账号与项目数据安全', skipProjectGate: true },
         },
         {
           path: 'tasks',
@@ -166,7 +178,7 @@ router.beforeEach(async (to) => {
   if (to.meta.adminOnly && !auth.isAdmin) {
     return { name: 'workbench' }
   }
-  if ((to.name === 'login' || to.name === 'setup') && auth.isAuthenticated) {
+  if ((to.name === 'login' || to.name === 'setup' || to.name === 'register') && auth.isAuthenticated) {
     return { name: 'workbench' }
   }
   return true

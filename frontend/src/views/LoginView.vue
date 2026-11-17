@@ -1,14 +1,19 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import { ElMessage } from 'element-plus'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '../authStore'
 
 const auth = useAuthStore()
 const router = useRouter()
+const route = useRoute()
 const username = ref('')
 const password = ref('')
 const loading = ref(false)
+const passwordChanged = computed(() => {
+  const changed = route.query.changed
+  return (Array.isArray(changed) ? changed[0] : changed) === '1'
+})
 
 async function retryService() {
   await auth.retryRestore()
@@ -38,6 +43,14 @@ async function submit() {
       <h1>登录</h1>
       <p class="auth-hint">登录后管理测试用例、任务和 Wiki 知识库</p>
       <el-alert
+        v-if="passwordChanged"
+        type="success"
+        :closable="false"
+        show-icon
+        title="密码已修改，请使用新密码登录"
+        style="margin-bottom: 18px"
+      />
+      <el-alert
         v-if="auth.restoreUnavailable"
         type="error"
         :closable="false"
@@ -58,6 +71,9 @@ async function submit() {
         </el-form-item>
         <el-button class="auth-submit" type="primary" :loading="loading" @click="submit">登录</el-button>
       </el-form>
+      <div v-if="auth.registrationEnabled && !auth.setupRequired" class="auth-footer">
+        还没有账号？<router-link :to="{ name: 'register' }">注册账号</router-link>
+      </div>
     </el-card>
   </main>
 </template>
@@ -69,4 +85,7 @@ async function submit() {
 h1 { margin: 18px 0 6px; font-size: 28px; }
 .auth-hint { margin: 0 0 22px; color: var(--cg-text-muted); font-size: 13px; }
 .auth-submit { width: 100%; margin-top: 8px; }
+.auth-footer { margin-top: 16px; text-align: center; color: var(--cg-text-muted); font-size: 13px; }
+.auth-footer a { color: var(--cg-primary); font-weight: 600; text-decoration: none; }
+.auth-footer a:hover { text-decoration: underline; }
 </style>

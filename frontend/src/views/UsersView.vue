@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { getRegistrationSetting, updateRegistrationSetting } from '../api/auth'
 import {
   createUser,
   listUsers,
@@ -12,6 +13,11 @@ import {
 const loading = ref(false)
 const saving = ref(false)
 const users = ref<UserItem[]>([])
+const registrationLoading = ref(false)
+const registrationSaving = ref(false)
+const registrationEnabled = ref(false)
+const registrationLoaded = ref(false)
+const registrationError = ref('')
 
 const createDialog = ref(false)
 const createForm = reactive({
@@ -38,6 +44,44 @@ async function load() {
   } finally {
     loading.value = false
   }
+}
+
+async function loadRegistrationSetting() {
+  registrationLoading.value = true
+  registrationError.value = ''
+  try {
+    const setting = await getRegistrationSetting()
+    registrationEnabled.value = setting.enabled
+    registrationLoaded.value = true
+  } catch (e) {
+    registrationLoaded.value = false
+    registrationError.value = '注册开关加载失败，请点击“刷新”重试。'
+    ElMessage.error(`加载注册开关失败：${(e as Error).message}`)
+  } finally {
+    registrationLoading.value = false
+  }
+}
+
+async function onRegistrationToggle(value: string | number | boolean) {
+  if (!registrationLoaded.value) return
+  const enabled = value === true
+  const previous = registrationEnabled.value
+  registrationEnabled.value = enabled
+  registrationSaving.value = true
+  try {
+    const setting = await updateRegistrationSetting(enabled)
+    registrationEnabled.value = setting.enabled
+    ElMessage.success(setting.enabled ? '已开启自助注册' : '已关闭自助注册')
+  } catch (e) {
+    registrationEnabled.value = previous
+    ElMessage.error(`更新失败：${(e as Error).message}`)
+  } finally {
+    registrationSaving.value = false
+  }
+}
+
+async function refreshAll() {
+  await Promise.all([load(), loadRegistrationSetting()])
 }
 
 function openCreate() {
@@ -140,7 +184,9 @@ async function submitReset() {
   }
 }
 
-onMounted(load)
+onMounted(() => {
+  void refreshAll()
+})
 </script>
 
 <template>
@@ -151,10 +197,27 @@ onMounted(load)
         <p class="page-subtitle">创建本地账号、调整角色与状态，或重置登录口令。</p>
       </div>
       <div class="actions">
-        <el-button @click="load">刷新</el-button>
+        <el-button @click="refreshAll">刷新</el-button>
         <el-button type="primary" @click="openCreate">新建用户</el-button>
       </div>
     </div>
+
+    <el-card shadow="never" class="registration-card">
+      <div class="registration-row">
+        <div>
+          <div class="registration-label">允许自助注册</div>
+          <p class="registration-hint">关闭后登录页不再显示注册入口。</p>
+          <p v-if="registrationError" class="registration-error">{{ registrationError }}</p>
+        </div>
+        <el-switch
+          :model-value="registrationEnabled"
+          :loading="registrationSaving"
+          :disabled="registrationLoading || registrationSaving || !registrationLoaded"
+          aria-label="允许自助注册"
+          @change="onRegistrationToggle"
+        />
+      </div>
+    </el-card>
 
     <el-card shadow="never">
       <el-table v-loading="loading" :data="users" row-key="id">
@@ -246,5 +309,35 @@ onMounted(load)
 .actions {
   display: flex;
   gap: 10px;
+}
+
+.registration-card {
+  margin-bottom: 16px;
+}
+
+.registration-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.registration-label {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--cg-text);
+}
+
+.registration-hint {
+  margin: 4px 0 0;
+  color: var(--cg-text-muted);
+  font-size: 13px;
+}
+
+.registration-error {
+  margin: 6px 0 0;
+  color: var(--cg-danger);
+  font-size: 12.5px;
 }
 </style>

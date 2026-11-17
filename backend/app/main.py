@@ -86,6 +86,7 @@ def create_app() -> FastAPI:
         "/api/health",
         "/api/auth/bootstrap",
         "/api/auth/setup",
+        "/api/auth/register",
         "/api/auth/login",
         "/api/auth/logout",
         "/api/auth/session",

@@ -87,6 +87,16 @@ function toggleNav() {
   localStorage.setItem('casegen:nav-collapsed', navCollapsed.value ? '1' : '0')
 }
 
+function onUserCommand(command: unknown) {
+  if (command === 'security') {
+    void router.push({ name: 'account-security' })
+    return
+  }
+  if (command === 'logout') {
+    void auth.signOut()
+  }
+}
+
 function visible<T extends { adminOnly?: boolean }>(items: T[]): T[] {
   return auth.isAdmin ? items : items.filter((item) => !item.adminOnly)
 }
@@ -335,11 +345,19 @@ onMounted(async () => {
             <span class="model-label">默认模型</span>
             <span class="model-name">{{ defaultModel.name }} · {{ defaultModel.model_name }}</span>
           </div>
-          <div v-if="auth.user" class="user-chip">
-            <el-icon><UserFilled /></el-icon>
-            <span>{{ auth.user.display_name || auth.user.username }}</span>
-          </div>
-          <el-button class="logout-button" text :icon="SwitchButton" @click="auth.signOut">退出</el-button>
+          <el-dropdown v-if="auth.user" trigger="click" @command="onUserCommand">
+            <button type="button" class="user-chip" aria-label="用户菜单">
+              <el-icon><UserFilled /></el-icon>
+              <span class="user-name">{{ auth.user.display_name || auth.user.username }}</span>
+              <el-icon class="user-caret"><ArrowDown /></el-icon>
+            </button>
+            <template #dropdown>
+              <el-dropdown-menu>
+                <el-dropdown-item command="security" :icon="UserFilled">账号安全</el-dropdown-item>
+                <el-dropdown-item command="logout" :icon="SwitchButton" divided>退出登录</el-dropdown-item>
+              </el-dropdown-menu>
+            </template>
+          </el-dropdown>
         </div>
       </header>
 
@@ -746,13 +764,32 @@ onMounted(async () => {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  padding: 5px 8px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
   color: var(--cg-text-muted);
+  font: inherit;
   font-size: 12px;
   white-space: nowrap;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
 }
 
-.logout-button {
-  color: var(--cg-text-muted);
+.user-chip:hover,
+.user-chip:focus-visible {
+  background: var(--cg-surface-muted);
+  color: var(--cg-text);
+}
+
+.user-name {
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.user-caret {
+  opacity: 0.7;
 }
 
 .main-content {
@@ -799,6 +836,10 @@ onMounted(async () => {
 
   .model-chip {
     max-width: 200px;
+  }
+
+  .user-name {
+    max-width: 90px;
   }
 }
 </style>

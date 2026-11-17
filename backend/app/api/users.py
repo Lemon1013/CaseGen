@@ -15,11 +15,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from app.db import get_session
-from app.models.entities import AuthSession, User
+from app.models.entities import User
 from app.schemas.users import UserCreate, UserOut, UserPasswordReset, UserUpdate
 from app.services.auth import (
     hash_password,
     normalize_username,
+    revoke_user_sessions,
     validate_password,
 )
 from app.services.permissions import require_admin
@@ -36,18 +37,6 @@ def _get(session: Session, user_id: int) -> User:
     if row is None:
         raise HTTPException(status_code=404, detail="User not found")
     return row
-
-
-def _revoke_sessions(session: Session, user_id: int) -> None:
-    """Immediately invalidate every session of a disabled/edited account."""
-
-    rows = session.exec(
-        select(AuthSession).where(AuthSession.user_id == user_id)
-    ).all()
-    for row in rows:
-        session.delete(row)
-    if rows:
-        session.flush()
 
 
 def _ensure_active_admin_survives(
@@ -134,7 +123,7 @@ def update_user(
     # A disabled account must lose its live sessions right away; the global
     # authentication middleware also refuses inactive users on the next hop.
     if data.get("is_active") is False:
-        _revoke_sessions(session, user_id)
+        revoke_user_sessions(session, user_id)
     row.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
     session.add(row)
     session.commit()
@@ -158,7 +147,7 @@ def reset_user_password(
     row.password_hash = hash_password(password)
     row.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
     # Resetting credentials invalidates any session issued with the old hash.
-    _revoke_sessions(session, user_id)
+    revoke_user_sessions(session, user_id)
     session.add(row)
     session.commit()
     session.refresh(row)

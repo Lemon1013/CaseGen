@@ -53,6 +53,11 @@ AUTH_COOKIE_NAME = os.getenv("CASEGEN_AUTH_COOKIE_NAME", "casegen_session")
 AUTH_CSRF_COOKIE_NAME = os.getenv("CASEGEN_AUTH_CSRF_COOKIE_NAME", "casegen_csrf")
 AUTH_SESSION_DAYS = max(1, int(os.getenv("CASEGEN_AUTH_SESSION_DAYS", "7")))
 AUTH_MAX_SESSIONS_PER_USER = max(1, int(os.getenv("CASEGEN_AUTH_MAX_SESSIONS", "8")))
+# Public self-service registration defaults to enabled; administrators can
+# still switch it off at runtime through /api/auth/registration-setting.
+ALLOW_REGISTRATION = os.getenv("CASEGEN_ALLOW_REGISTRATION", "true").strip().lower() in {
+    "1", "true", "yes", "on"
+}
 _cookie_secure_raw = os.getenv("CASEGEN_AUTH_COOKIE_SECURE", "auto").strip().lower()
 AUTH_COOKIE_SECURE: bool | None = (
     None
