@@ -1,7 +1,10 @@
 from datetime import datetime
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from app.db import get_engine
@@ -57,6 +60,8 @@ def test_single_active_for_non_generate_prompt_types(tmp_app_data):
 
 def test_normalize_single_active_prompts_keeps_latest(tmp_app_data):
     TestClient(create_app())
+    with get_engine().begin() as conn:
+        conn.execute(text("DROP INDEX IF EXISTS uq_prompt_templates_single_active"))
     with Session(get_engine()) as session:
         for row in session.exec(
             select(PromptTemplate).where(PromptTemplate.type == "review")
@@ -103,6 +108,42 @@ def test_normalize_single_active_prompts_keeps_latest(tmp_app_data):
 
     assert [row.id for row in review_active] == [newer.id]
     assert {gen_a.id, gen_b.id}.issubset({row.id for row in generate_active})
+
+
+def test_prompt_unique_index_rejects_second_active(tmp_app_data):
+    TestClient(create_app())
+    with Session(get_engine()) as session:
+        for row in session.exec(
+            select(PromptTemplate).where(PromptTemplate.type == "review")
+        ).all():
+            row.is_active = False
+            session.add(row)
+        session.add(
+            PromptTemplate(name="review-a", type="review", content="A", version=1, is_active=True)
+        )
+        session.add(
+            PromptTemplate(name="review-b", type="review", content="B", version=2, is_active=True)
+        )
+        with pytest.raises(IntegrityError):
+            session.commit()
+        session.rollback()
+
+    with Session(get_engine()) as session:
+        session.add(
+            PromptTemplate(name="gen-a", type="generate", content="A", version=1, is_active=True)
+        )
+        session.add(
+            PromptTemplate(name="gen-b", type="generate", content="B", version=2, is_active=True)
+        )
+        session.commit()
+        active_generate = session.exec(
+            select(PromptTemplate).where(
+                PromptTemplate.type == "generate",
+                PromptTemplate.is_active == True,  # noqa: E712
+            )
+        ).all()
+
+    assert {"gen-a", "gen-b"}.issubset({row.name for row in active_generate})
 
 
 def test_default_prompts_seeded(tmp_app_data):

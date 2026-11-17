@@ -155,6 +155,10 @@ def seed_default_prompts(session: Session) -> None:
         for row in legacy_active:
             row.is_active = False
             session.add(row)
+        if legacy_active:
+            # Deactivate the old default before inserting the replacement;
+            # the partial unique index is checked per statement.
+            session.flush()
 
         session.add(
             PromptTemplate(
