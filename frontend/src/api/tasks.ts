@@ -284,8 +284,9 @@ export function getTask(id: number, projectId?: number | null) {
   return api<TaskItem>(`/api/tasks/${id}${_projectQuery(projectId)}`)
 }
 
-export function taskStreamUrl(id: number) {
-  return `/api/tasks/${id}/stream`
+/** SSE 地址：EventSource 不吃 client.ts 的自动 project_id 注入，必须手工拼 query。 */
+export function taskStreamUrl(id: number, projectId: number) {
+  return `/api/tasks/${id}/stream${_projectQuery(projectId)}`
 }
 
 export function deleteTask(id: number) {
