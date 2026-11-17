@@ -1,0 +1,526 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Agent 会话功能介绍 · CaseGen</title>
+<style>
+:root{
+  --bg:#0b1220; --panel:#12203a; --line:rgba(148,178,204,.16);
+  --mint:#10b981; --mint2:#34d399; --ink:#eaf2f8; --sub:#aec1d3; --mut:#7d93a9;
+  --amber:#f5b544; --red:#ef6b6b; --blue:#63b3f5;
+}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{background:#070d17;color:var(--ink);overflow:hidden;
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans CJK SC","Source Han Sans SC",sans-serif;
+  -webkit-font-smoothing:antialiased}
+#stage{position:fixed;inset:0 0 56px 0;display:flex;align-items:center;justify-content:center;overflow:hidden}
+#deck{width:1280px;height:720px;position:relative;transform-origin:center center;flex:none}
+.slide{position:absolute;inset:0;display:none;flex-direction:column;padding:50px 62px 54px;
+  border-radius:18px;overflow:hidden;
+  background:radial-gradient(900px 520px at 88% -8%,rgba(16,185,129,.13),transparent 62%),
+             radial-gradient(700px 460px at -6% 108%,rgba(38,92,160,.16),transparent 60%),
+             linear-gradient(160deg,#0b1220 0%,#0c1526 55%,#0a1220 100%)}
+.slide::before{content:"";position:absolute;inset:0;pointer-events:none;
+  background-image:linear-gradient(rgba(255,255,255,.022) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.022) 1px,transparent 1px);
+  background-size:44px 44px;
+  -webkit-mask-image:linear-gradient(180deg,rgba(0,0,0,.6),transparent 78%);
+  mask-image:linear-gradient(180deg,rgba(0,0,0,.6),transparent 78%)}
+.slide.active{display:flex;animation:fade .15s ease-out}
+@keyframes fade{from{opacity:.55}to{opacity:1}}
+.slide>*{position:relative;z-index:1}
+.s-head{flex:none;margin-bottom:20px}
+.eyebrow{display:inline-flex;align-items:center;gap:9px;font-size:12px;letter-spacing:.16em;color:var(--mint2);font-weight:800}
+.eyebrow::before{content:"";width:22px;height:2px;background:var(--mint);border-radius:2px}
+h1.title{font-size:36px;line-height:1.26;margin:11px 0 0;font-weight:800;letter-spacing:-.01em}
+h1.title .hl{color:var(--mint2)}
+.subtitle{font-size:14.5px;color:var(--sub);margin-top:9px;line-height:1.65}
+.s-body{flex:1;min-height:0;display:flex;flex-direction:column;gap:14px}
+.s-foot{flex:none;display:flex;align-items:center;justify-content:space-between;gap:20px;margin-top:12px;padding-top:10px;border-top:1px solid var(--line)}
+.demo-note{font-size:10.5px;color:var(--mut);line-height:1.45}
+.pg{font-size:10.5px;color:var(--mut);white-space:nowrap;letter-spacing:.06em}
+.card{background:linear-gradient(180deg,rgba(23,40,62,.86),rgba(15,26,43,.86));border:1px solid var(--line);border-radius:14px;padding:16px 18px}
+.card h3{margin:0 0 9px;font-size:15.5px;font-weight:780;color:var(--ink)}
+.card h3 .n{color:var(--mint2);margin-right:8px;font-variant-numeric:tabular-nums}
+.card p{margin:0;font-size:13px;line-height:1.7;color:var(--sub)}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+.grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+.grow{flex:1;min-height:0}
+ul.bul{margin:0;padding:0;list-style:none;display:flex;flex-direction:column;gap:8px}
+ul.bul li{position:relative;padding-left:17px;font-size:12.8px;line-height:1.6;color:var(--sub)}
+ul.bul li::before{content:"";position:absolute;left:1px;top:8px;width:6px;height:6px;border-radius:50%;background:var(--mint);box-shadow:0 0 0 3px rgba(16,185,129,.14)}
+ul.bul li b{color:var(--ink);font-weight:700}
+code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.9em;color:#9fe6c8;background:rgba(16,185,129,.09);border:1px solid rgba(16,185,129,.18);padding:1px 5px;border-radius:5px;white-space:nowrap}
+.kpi{background:linear-gradient(180deg,rgba(16,185,129,.12),rgba(16,185,129,.02));border:1px solid rgba(16,185,129,.3);border-radius:13px;padding:14px 16px}
+.kpi .v{font-size:29px;font-weight:850;color:var(--mint2);line-height:1;font-variant-numeric:tabular-nums;letter-spacing:-.02em}
+.kpi .v small{font-size:14px;font-weight:700;margin-left:3px;color:var(--sub)}
+.kpi .k{font-size:11.8px;color:var(--sub);margin-top:8px;line-height:1.5}
+.pill{display:inline-block;font-size:11px;padding:4px 10px;border-radius:999px;border:1px solid rgba(16,185,129,.35);background:rgba(16,185,129,.1);color:var(--mint2);font-weight:650}
+.pill.amber{border-color:rgba(245,181,68,.4);background:rgba(245,181,68,.1);color:var(--amber)}
+.pill.gray{border-color:var(--line);background:rgba(255,255,255,.03);color:var(--sub)}
+.pillrow{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.flow{display:flex;align-items:stretch}
+.node{flex:1;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:13px 10px;text-align:center;display:flex;flex-direction:column;justify-content:center;gap:5px;min-height:88px}
+.node .nt{font-size:13.5px;font-weight:760;color:var(--ink);line-height:1.35}
+.node .nd{font-size:10.8px;color:var(--mut);line-height:1.45}
+.node.hi{border-color:rgba(16,185,129,.5);background:linear-gradient(180deg,rgba(16,185,129,.15),rgba(16,185,129,.04))}
+.node.hi .nt{color:var(--mint2)}
+.arrow{flex:none;width:36px;align-self:center;display:flex;align-items:center;justify-content:center}
+.arrow i{display:block;width:100%;height:2px;background:linear-gradient(90deg,rgba(16,185,129,.25),var(--mint));position:relative}
+.arrow i::after{content:"";position:absolute;right:-1px;top:-4px;border-left:8px solid var(--mint);border-top:5px solid transparent;border-bottom:5px solid transparent}
+.step{display:flex;gap:12px;align-items:flex-start}
+.step .num{flex:none;width:32px;height:32px;border-radius:9px;background:rgba(16,185,129,.14);border:1px solid rgba(16,185,129,.4);color:var(--mint2);font-weight:800;display:flex;align-items:center;justify-content:center;font-size:14px}
+.step .tx b{display:block;font-size:13.2px;color:var(--ink);margin-bottom:3px;line-height:1.4}
+.step .tx span{font-size:11.8px;color:var(--sub);line-height:1.55}
+.alert{display:block;white-space:normal;word-break:normal;line-height:1.75;text-align:left;background:rgba(245,181,68,.08);border:1px solid rgba(245,181,68,.3);border-left:3px solid var(--amber);border-radius:10px;padding:9px 13px;font-size:12px;color:#f0d8a8}
+.alert.mint{background:rgba(16,185,129,.08);border-color:rgba(16,185,129,.3);border-left-color:var(--mint);color:#b6ead2}
+.alert.wide{display:block;white-space:normal;word-break:normal;line-height:1.75;text-align:left}
+.alert.wide b{white-space:normal}
+.alert b{color:var(--amber)}
+.alert.mint b{color:var(--mint2)}
+.shots{display:grid;gap:13px}
+.shots.two{grid-template-columns:1fr 1fr}
+.shot{margin:0;background:rgba(9,17,29,.72);border:1px solid var(--line);border-radius:12px;padding:8px;display:flex;flex-direction:column;gap:7px;overflow:hidden;box-shadow:0 10px 28px rgba(0,0,0,.35)}
+.shot img{width:100%;display:block;object-fit:contain;object-position:center;background:#0c1524;border:1px solid rgba(255,255,255,.06);border-radius:7px}
+.shot.tall img{height:292px}
+.shot.compact img{height:143px}
+.shot figcaption{font-size:11px;color:var(--sub);line-height:1.5;padding:0 3px 2px}
+.shot figcaption b{color:var(--mint2);font-weight:700}
+.toc{display:grid;grid-template-columns:1fr 1fr;gap:9px 20px}
+.toc-item{display:flex;align-items:center;gap:12px;text-align:left;background:rgba(255,255,255,.025);border:1px solid var(--line);border-radius:10px;padding:10px 13px;color:var(--ink);font-size:13px;font-weight:650;cursor:pointer;font-family:inherit;transition:background .15s,border-color .15s}
+.toc-item:hover{background:rgba(16,185,129,.1);border-color:rgba(16,185,129,.42)}
+.toc-item .no{flex:none;width:25px;height:25px;border-radius:7px;background:rgba(16,185,129,.12);color:var(--mint2);display:flex;align-items:center;justify-content:center;font-size:11.5px;font-weight:800}
+.toc-item .ar{margin-left:auto;color:var(--mut);font-size:11px;font-weight:400}
+.road{display:grid;grid-template-columns:repeat(2,1fr);gap:14px;flex:1;min-height:0}
+.road .r{display:flex;flex-direction:column;gap:9px}
+.road .rh{padding:11px 13px;border-radius:11px;background:linear-gradient(180deg,rgba(16,185,129,.14),rgba(16,185,129,.03));border:1px solid rgba(16,185,129,.3)}
+.road .rh .idx{font-size:10.5px;color:var(--mint2);letter-spacing:.12em;font-weight:800}
+.road .rh h3{margin:5px 0 0;font-size:15px;font-weight:780;line-height:1.4}
+.seg{background:rgba(255,255,255,.025);border:1px solid var(--line);border-radius:10px;padding:9px 11px;flex:1}
+.seg .lbl{font-size:10px;font-weight:800;letter-spacing:.1em;margin-bottom:5px}
+.seg.now .lbl{color:var(--mut)} .seg.goal .lbl{color:var(--mint2)} .seg.val .lbl{color:var(--blue)}
+.seg p{margin:0;font-size:11.8px;line-height:1.6;color:var(--sub)}
+.cover .big{font-size:58px;font-weight:850;line-height:1.16;letter-spacing:-.025em}
+.cover .big span{color:var(--mint2)}
+.cover .rule{width:76px;height:4px;background:var(--mint);border-radius:4px;margin-top:24px}
+.cover .lead{font-size:17px;color:var(--sub);margin-top:22px;line-height:1.75}
+.cover .meta{display:flex;gap:9px;flex-wrap:wrap;margin-top:30px}
+.cover .keys{margin-top:26px;font-size:12px;color:var(--mut);line-height:2}
+kbd{display:inline-block;padding:2px 8px;border:1px solid var(--line);border-bottom-width:2px;border-radius:6px;background:rgba(255,255,255,.04);font-size:11px;color:var(--sub);font-family:inherit;margin:0 2px}
+.end .big{font-size:44px;font-weight:820;line-height:1.35;letter-spacing:-.02em}
+.end .big span{color:var(--mint2)}
+#controls{position:fixed;left:0;right:0;bottom:0;height:56px;background:rgba(8,14,24,.95);border-top:1px solid var(--line);display:flex;align-items:center;gap:8px;padding:0 16px;z-index:20}
+#prog{position:absolute;top:0;left:0;right:0;height:2px;background:rgba(255,255,255,.06)}
+#prog-fill{height:100%;width:0;background:linear-gradient(90deg,var(--mint),var(--mint2));transition:width .2s ease}
+.btn{background:rgba(255,255,255,.05);border:1px solid var(--line);color:var(--sub);border-radius:8px;padding:6px 11px;font-size:11.5px;font-family:inherit;cursor:pointer;white-space:nowrap}
+.btn:hover{background:rgba(16,185,129,.14);color:var(--ink);border-color:rgba(16,185,129,.4)}
+.btn.primary{background:rgba(16,185,129,.16);border-color:rgba(16,185,129,.45);color:var(--mint2)}
+#page-num{font-size:12px;color:var(--ink);font-weight:700;font-variant-numeric:tabular-nums;min-width:104px;text-align:center}
+.spacer{flex:1}
+#notes-panel{position:fixed;right:16px;bottom:66px;width:400px;max-height:44vh;overflow:auto;background:rgba(10,20,34,.97);border:1px solid rgba(16,185,129,.35);border-radius:12px;padding:13px 15px;z-index:25;display:none;font-size:12px;line-height:1.7;color:var(--sub);box-shadow:0 18px 50px rgba(0,0,0,.55)}
+body.notes-on #notes-panel{display:block}
+.np-title{font-size:10.5px;font-weight:800;letter-spacing:.1em;color:var(--mint2);margin-bottom:7px}
+.notes{display:none}
+#toast{position:fixed;left:50%;transform:translateX(-50%);bottom:68px;background:rgba(16,185,129,.14);border:1px solid rgba(16,185,129,.45);color:var(--mint2);padding:9px 16px;border-radius:10px;font-size:12px;z-index:30;display:none}
+@media print{
+  @page{size:33.867cm 19.05cm;margin:0}
+  html,body{width:33.867cm;height:auto;overflow:visible;background:#0b1220}
+  *{-webkit-print-color-adjust:exact !important;print-color-adjust:exact !important}
+  #stage{position:static;display:block;overflow:visible}
+  #deck{transform:none !important;width:33.867cm;height:auto}
+  .slide{display:flex !important;position:relative;inset:auto;width:33.867cm;height:19.05cm;border-radius:0;page-break-after:always;break-after:page;animation:none}
+  .slide:last-child{page-break-after:auto;break-after:auto}
+  #controls,#notes-panel,#toast{display:none !important}
+}
+</style>
+</head>
+<body>
+<div id="stage"><div id="deck">
+<section class="slide cover" data-title="封面">
+  <div class="s-head" style="margin-bottom:0"><span class="eyebrow">CASEGEN · AGENT CHAT</span></div>
+  <div class="s-body" style="justify-content:center;gap:0">
+    <div class="big">Agent 会话功能<br><span>功能介绍</span></div>
+    <div class="rule"></div>
+    <div class="lead">Agent 会话功能：底层运行时对接、专家技能、思考与多轮工具调用、权限限制。</div>
+    <div class="meta">
+      <span class="pill gray">按 N 查看演讲者备注</span>
+      <span class="pill gray">按 P 导出 PDF</span>
+    </div>
+    <div class="keys">操作：<kbd>←</kbd><kbd>→</kbd> / <kbd>空格</kbd> / <kbd>PageUp</kbd><kbd>PageDown</kbd> 翻页 · <kbd>Home</kbd><kbd>End</kbd> 首末页 · <kbd>N</kbd> 演讲者备注 · <kbd>F</kbd> 全屏 · <kbd>P</kbd> 打印 / 导出 PDF<br>也可点击页面左右区域或底部按钮翻页；目录条目可点击跳转；地址栏输入 #页码 可直达并在刷新后保持。</div>
+  </div>
+  <div class="s-foot"><div class="demo-note">截图来自验证环境（后端 8001 / Vite 5173、headless Chrome 1440×1000），会话与知识库内容为演示数据，非生产业务数据。</div><div class="pg"><span class="pg-num"></span></div></div>
+  <div class="notes"><p>演示数据声明：本演示文稿中的页面截图来自验证环境，会话与知识库内容为演示数据，非生产业务数据。</p></div>
+</section>
+<section class="slide" data-title="功能总览">
+  <div class="s-head"><span class="eyebrow">01 / OVERVIEW</span>
+    <h1 class="title">三大重点能力，<span class="hl">一套 Agent 会话工作台</span></h1>
+    <div class="subtitle">从底层对接到权限控制，围绕「让 Agent 参与用例工作」组织能力。</div></div>
+  <div class="s-body">
+    <div class="grid3">
+      <div class="kpi"><div class="v">①<small>专家技能</small></div><div class="k">按专家角色工作，<br>技能按需加载</div></div>
+      <div class="kpi"><div class="v">②<small>思考与工具</small></div><div class="k">思考可见可控，<br>多轮工具调用由 Agent 完成</div></div>
+      <div class="kpi"><div class="v">③<small>权限限制</small></div><div class="k">会话、目录、工具、<br>访问四层收口</div></div>
+    </div>
+    <div class="grid3 grow">
+      <div class="card"><h3><span class="n">A</span>对话体验</h3><p>自然语言多轮对话；思考过程独立折叠展示，最终答案干净呈现；刷新后仍可恢复。</p></div>
+      <div class="card"><h3><span class="n">B</span>用例闭环</h3><p>结构化用例卡片、一键转存草稿并原子入库；技能按需加载，不常驻上下文。</p></div>
+      <div class="card"><h3><span class="n">C</span>安全边界</h3><p>会话级目录隔离、错误白名单脱敏、工具白名单收口，权限降到最小。</p></div>
+    </div>
+  </div>
+  <div class="s-foot"><div class="demo-note">截图来自验证环境（后端 8001 / Vite 5173、headless Chrome 1440×1000），会话与知识库内容为演示数据，非生产业务数据。</div><div class="pg"><span class="pg-num"></span></div></div>
+  <div class="notes"><p>一页讲清三大重点能力：专家技能、思考与多轮工具调用、权限限制；底层运行时对接见架构页。口播聚焦功能本身，不展开工程过程。</p></div>
+</section>
+<section class="slide" data-title="目录">
+  <div class="s-head"><span class="eyebrow">02 / AGENDA</span>
+    <h1 class="title">三大重点能力各有独立章节，<span class="hl">按目录顺序展开</span></h1>
+    <div class="subtitle">点击任意条目可直接跳转；也可用 ← / → 顺序翻页。</div></div>
+  <div class="s-body"><div class="toc grow" style="align-content:start">
+    <button class="toc-item" data-goto="2"><span class="no">01</span><span>功能总览</span><span class="ar">P2</span></button><button class="toc-item" data-goto="4"><span class="no">02</span><span>背景与目标</span><span class="ar">P4</span></button><button class="toc-item" data-goto="5"><span class="no">03</span><span>总体架构</span><span class="ar">P5</span></button><button class="toc-item" data-goto="6"><span class="no">04</span><span>重点① 支持专家技能</span><span class="ar">P6</span></button><button class="toc-item" data-goto="7"><span class="no">05</span><span>重点② 思考与多轮工具调用</span><span class="ar">P7–8</span></button><button class="toc-item" data-goto="9"><span class="no">06</span><span>重点③ 权限限制</span><span class="ar">P9</span></button><button class="toc-item" data-goto="10"><span class="no">07</span><span>页面功能巡览（截图）</span><span class="ar">P10</span></button><button class="toc-item" data-goto="11"><span class="no">08</span><span>用户管理与角色可见性</span><span class="ar">P11</span></button><button class="toc-item" data-goto="12"><span class="no">09</span><span>会话隔离与项目可见性</span><span class="ar">P12</span></button><button class="toc-item" data-goto="13"><span class="no">10</span><span>后续规划</span><span class="ar">P13</span></button><button class="toc-item" data-goto="14"><span class="no">11</span><span>结束页</span><span class="ar">P14</span></button>
+  </div></div>
+  <div class="s-foot"><div class="demo-note">截图来自验证环境（后端 8001 / Vite 5173、headless Chrome 1440×1000），会话与知识库内容为演示数据，非生产业务数据。</div><div class="pg"><span class="pg-num"></span></div></div>
+  <div class="notes"><p>目录页即导航页，点击条目可直接跳到对应功能章节。</p></div>
+</section>
+<section class="slide" data-title="背景与目标">
+  <div class="s-head"><span class="eyebrow">03 / BACKGROUND</span>
+    <h1 class="title">把 Agent 引入用例工作，<span class="hl">让过程可见、权限可控</span></h1>
+    <div class="subtitle">从人工拆解走向可对话、可追溯、可约束的协作方式。</div></div>
+  <div class="s-body">
+    <div class="grid2 grow">
+      <div class="card"><h3><span class="n">为什么做</span>背景</h3><ul class="bul">
+        <li>用例生成靠人工拆解与提示词工程，希望引入<b>可调用工具、可多轮推理</b>的 Agent 协作。</li>
+        <li>已有 DSH Agent 运行时，期望<b>复用而非自建编排</b>，避免重复造轮子。</li>
+        <li>模型 API Key 等敏感信息存于本地，需要让 Agent 工作空间与业务数据<b>物理隔离</b>。</li>
+        <li>希望思考过程对用户可见、可控，同时<b>不暴露工具参数与结果</b>。</li>
+      </ul></div>
+      <div class="card"><h3><span class="n">这个能力带来什么</span>功能价值</h3><ul class="bul">
+        <li><b>自然语言多轮对话</b>：围绕用例持续追问与迭代，不必反复拼接提示词。</li>
+        <li><b>按专家角色工作</b>：选择技能后，Agent 按该角色的方法与输出契约展开。</li>
+        <li><b>思考过程可见</b>：思考独立折叠展示，正文与过程分离，刷新后仍在。</li>
+        <li><b>权限可控</b>：会话权限压降、独立工作目录、工具白名单与错误脱敏。</li>
+      </ul></div>
+    </div>
+  </div>
+  <div class="s-foot"><div class="demo-note">截图来自验证环境（后端 8001 / Vite 5173、headless Chrome 1440×1000），会话与知识库内容为演示数据，非生产业务数据。</div><div class="pg"><span class="pg-num"></span></div></div>
+  <div class="notes"><p>从使用者视角讲价值：能对话、能选专家、能看到思考、能约束权限。</p></div>
+</section>
+<section class="slide" data-title="总体架构">
+  <div class="s-head"><span class="eyebrow">04 / ARCHITECTURE</span>
+    <h1 class="title">后端是<span class="hl">唯一 DSH 调用方</span>，浏览器零直连</h1>
+    <div class="subtitle">分层清晰：鉴权与编排在 CaseGen，Agent 运行时在 DSH，两者只通过回环 webapi 通信。</div></div>
+  <div class="s-body">
+    <div class="flow">
+      <div class="node"><div class="nt">浏览器</div><div class="nd">cookie session + CSRF<br>SSE 订阅 / 2s 轮询兜底</div></div>
+      <span class="arrow"><i></i></span>
+      <div class="node hi"><div class="nt">CaseGen FastAPI</div><div class="nd">8000 · 鉴权 / 会话归属<br>项目作用域校验</div></div>
+      <span class="arrow"><i></i></span>
+      <div class="node"><div class="nt">AgentGateway</div><div class="nd">协议适配 / 事件收口<br>SSE 行解析</div></div>
+      <span class="arrow"><i></i></span>
+      <div class="node"><div class="nt">DSH webapi</div><div class="nd">127.0.0.1:31800 /api/v1<br>仅绑回环，不出本机</div></div>
+      <span class="arrow"><i></i></span>
+      <div class="node hi"><div class="nt">Agent 进程</div><div class="nd">多轮工具调用<br>独立工作目录</div></div>
+    </div>
+    <div class="grid3 grow">
+      <div class="card"><h3>事件收口</h3><p>只把干净正文与思考流送到前端；工具参数与结果留在网关内，不进入页面。</p></div>
+      <div class="card"><h3>前端可恢复流</h3><p>首帧必为全量 snapshot，刷新或重连即重发 snapshot 恢复现场；事件带 id 序号，GET 详情为权威轮询兜底。</p></div>
+      <div class="card"><h3>安全边界</h3><p>浏览器永不直连 31800；会话归属项目校验；响应头 no-store / nosniff / X-Accel-Buffering: no；非活跃状态返回 409。</p></div>
+    </div>
+  </div>
+  <div class="s-foot"><div class="demo-note">截图来自验证环境（后端 8001 / Vite 5173、headless Chrome 1440×1000），会话与知识库内容为演示数据，非生产业务数据。</div><div class="pg"><span class="pg-num"></span></div></div>
+  <div class="notes"><p>架构重点是「浏览器零直连」与「DSH 只绑回环」，以及只把干净正文与思考流送到前端。</p></div>
+</section>
+<section class="slide" data-title="重点① 支持专家技能">
+  <div class="s-head"><span class="eyebrow">05 / 重点① 支持专家技能</span>
+    <h1 class="title">技能<span class="hl">随仓库版本管理</span>，按需加载而非每轮全量注入</h1>
+    <div class="subtitle">用 DSH skill 机制加载完整内容，避免 PromptTemplate 每轮全量占用上下文。</div></div>
+  <div class="s-body">
+    <div class="grid3">
+      <div class="kpi"><div class="v">2<small>个内置</small></div><div class="k">api-testing-expert（303 行）<br>webapp-testing-expert（167 行）</div></div>
+      <div class="kpi"><div class="v">按需<small>加载</small></div><div class="k">SKILL.md 随 Git 分发 / PR 评审<br>不常驻每轮上下文</div></div>
+      <div class="kpi"><div class="v">1<small>份契约</small></div><div class="k">json fenced block<br>DraftPointGroup[] 同构结构</div></div>
+    </div>
+    <div class="grid2 grow">
+      <div class="card"><h3><span class="n">载体与约束</span></h3><ul class="bul">
+        <li>仓库内 <code>.agents/skills/&lt;name&gt;/SKILL.md</code>，随版本管理、分发与 PR 评审。</li>
+        <li>frontmatter <b>name 必须 kebab-case、description 必填</b>，否则被 isSkillName 静默跳过。</li>
+        <li><code>GET /api/agent/skills</code> 由 CaseGen 后端直接扫描技能目录。</li>
+        <li>技能根解析 findProjectRoot 向上找 .git；配置 AGENT_SKILLS_DIR / AGENT_PRESET。</li>
+        <li>每轮 prompt 前缀纯文本「本次对话请以 &lt;技能描述&gt; 技能为准开展工作。」（提示词体系无变量插值，禁止引入模板变量）。</li>
+      </ul></div>
+      <div class="card"><h3><span class="n">输出契约</span>到草稿闭环</h3><ul class="bul">
+        <li>用例以 <b>json fenced block</b> 输出 DraftPointGroup[]：case_key / title / priority / type / verification_goal / preconditions / test_data / steps / raw_md。</li>
+        <li>专用 preset persona 规定<b>两步法</b>：先拆测试点、用户确认后再出用例，并要求结构化 JSON 副本。</li>
+        <li>save-as-draft：解析最近 assistant 消息的 fenced JSON → pydantic 校验 → 虚拟 Requirement + shell GenerationTask + CaseDraft。</li>
+        <li>复用 import_cases_from_draft 原子落 TestCase；<b>格式非法 422 整体失败、可重试</b>。</li>
+      </ul></div>
+    </div>
+  </div>
+  <div class="s-foot"><div class="demo-note">截图来自验证环境（后端 8001 / Vite 5173、headless Chrome 1440×1000），会话与知识库内容为演示数据，非生产业务数据。</div><div class="pg"><span class="pg-num"></span></div></div>
+  <div class="notes"><p>专家技能的价值在于随仓库走：版本管理、PR 评审、可审计；注入方式保持纯文本前缀，按需加载不常驻上下文。</p></div>
+</section>
+<section class="slide" data-title="重点② 思考与多轮工具调用（机制）">
+  <div class="s-head"><span class="eyebrow">06 / 重点② 思考与多轮工具调用 · 1/2</span>
+    <h1 class="title">思考过程<span class="hl">可见、可控、与正文分离</span>，工具参数与结果仍不外泄</h1>
+    <div class="subtitle">reasoning 独立透传 + 落库 + 前端折叠展示。</div></div>
+  <div class="s-body">
+    <div class="grid2 grow">
+      <div class="card"><h3><span class="n">采集与轮次处理</span></h3><ul class="bul">
+        <li>reasoning 帧兼容 {delta,seq} 与 {text}，统一 yield <code>kind='reasoning'</code>；每个 tool_call 生成边界事件。</li>
+        <li>tool_result 只计数丢弃、usage 只计数；<b>工具参数与结果绝不外泄</b>。</li>
+        <li>delta 只收集不立即发布；遇边界 ⇒ flush_reasoning + commentary 并入思考 + reset_answer 清空正文预览 + 发匿名化 notice。</li>
+        <li>终态只把最后一段 delta 作为 content；flush 阈值 0.15s / 2000 字符。</li>
+        <li>持久化 AgentMessage.reasoning 列；历史与流式分离，刷新靠 snapshot 恢复。</li>
+      </ul></div>
+      <div class="card"><h3><span class="n">多轮工具调用</span>功能表现</h3><ul class="bul">
+        <li><b>Agent 在 DSH 侧内部循环完成多轮工具调用</b>；CaseGen 后端不自带 planner / 最大轮次。</li>
+        <li>CaseGen 只消费<b>单次 prompt-stream 事件流</b>，透出匿名化边界（「正在查阅资料…」）与思考流。</li>
+        <li>真实一次 SSE 序列：snapshot → reasoning → notice×12 → delta → completed（思考 10053 字 / 正文 2630 字）。</li>
+        <li>工具名 / 参数 / 结果不展示；DSH 侧 <code>GET /sessions/:id/history</code> 为全量审计通道。</li>
+        <li>前端 details.thought-block：生成中展开、历史收起「已深度思考」、内部滚动，MarkdownView 渲染。</li>
+      </ul></div>
+    </div>
+    <div class="pillrow"><span class="pill">思考内容落库并折叠展示</span><span class="pill gray">工具参数 / 结果仍不落库、不外泄</span><span class="pill gray">不是后端自带 N 轮循环</span><span class="pill gray">刷新后仍可恢复</span></div>
+  </div>
+  <div class="s-foot"><div class="demo-note">截图来自验证环境（后端 8001 / Vite 5173、headless Chrome 1440×1000），会话与知识库内容为演示数据，非生产业务数据。</div><div class="pg"><span class="pg-num"></span></div></div>
+  <div class="notes"><p>讲功能表现：思考独立透传、落库、折叠展示；多轮工具调用由 DSH 侧 Agent 完成，页面只看到匿名化边界与思考流。</p></div>
+</section>
+<section class="slide" data-title="重点② 思考展示（截图对比）">
+  <div class="s-head"><span class="eyebrow">06 / 重点② 思考与多轮工具调用 · 2/2</span>
+    <h1 class="title">流式展开看过程，<span class="hl">完成后收起只留答案</span></h1>
+    <div class="subtitle">两张验证环境截图对照：生成中与完成后的同一套折叠交互。</div></div>
+  <div class="s-body">
+    <div class="shots two">
+      <figure class="shot tall"><img src="assets/agent-chat-thought-live-streaming.png" alt="生成中：思考流式展开"><figcaption><b>图 1 · 生成中</b>：思考过程流式展开、正文保持干净；状态条显示「实时流已连接」与红色「中止本轮」。</figcaption></figure>
+      <figure class="shot tall"><img src="assets/agent-chat-thought-live-final-collapsed.png" alt="完成后：思考收起、答案独立"><figcaption><b>图 2 · 完成后</b>：思考默认收起为「已深度思考」，最终答案独立呈现，并附引用溯源。</figcaption></figure>
+    </div>
+    <div class="pillrow"><span class="pill">可展开追溯</span><span class="pill">内部滚动 max-height 320px</span><span class="pill">刷新后仍可恢复</span><span class="pill gray">MarkdownView(html:false) 防 XSS</span><span class="pill gray">思考与正文分离存储</span></div>
+  </div>
+  <div class="s-foot"><div class="demo-note">截图来自验证环境（后端 8001 / Vite 5173、headless Chrome 1440×1000），会话与知识库内容为演示数据，非生产业务数据。</div><div class="pg"><span class="pg-num"></span></div></div>
+  <div class="notes"><p>截图来自验证环境（后端 8001 / Vite 5173、headless Chrome 1440×1000），会话与知识库内容为演示数据，非生产业务数据。左图过程可见，右图答案干净。</p></div>
+</section>
+<section class="slide" data-title="重点③ 权限限制">
+  <div class="s-head"><span class="eyebrow">07 / 重点③ 权限限制</span>
+    <h1 class="title">四层收口把权限降到最小，<span class="hl">过程数据不越界</span></h1>
+    <div class="subtitle">会话权限、目录隔离、工具白名单、访问与错误脱敏，逐层收口。</div></div>
+  <div class="s-body">
+    <div class="grid2 grow">
+      <div class="card"><h3><span class="n">1</span>会话权限</h3><p>DSH 会话默认 danger-full-access，创建后立刻 <code>PUT /permission</code> 压降为 <b>workspace-write</b>；压降失败即 ensure_session 整体失败，绝不带着高权限继续。</p></div>
+      <div class="card"><h3><span class="n">2</span>工作目录隔离</h3><p>每会话独立 <code>&lt;AGENT_WORKSPACE_ROOT&gt;/&lt;conversation_id&gt;/</code>，路径前缀守卫防目录穿越；已移出 data/，与存明文模型 API Key 的 data/meta <b>完全隔离</b>，数据库文件绝不会成为 agent cwd。</p></div>
+      <div class="card"><h3><span class="n">3</span>工具白名单</h3><p>六工具 <code>read / read_image / glob / grep / todo_write / skill</code>；两层防线 <code>tools.restrict</code> + 执行期 <code>guard</code>；preset 内 write:false / edit:false，抑制 agent-team 成员资格；persona 明令不执行命令、不联网、不改动知识空间文档。</p></div>
+      <div class="card"><h3><span class="n">4</span>访问与错误脱敏</h3><p>cookie session + 同源 / CSRF；会话归属项目校验；<code>AGENT_ENABLED=false</code> 时 /api/agent/* 返回 410、前端菜单软降级。错误只导出白名单原语，<b>不插值原始响应 / URL / 凭据</b>。并发：AGENT_MAX_CONCURRENT=4 + 会话级互斥，当前单进程。</p></div>
+    </div>
+    <div class="alert mint"><b>功能要点：</b>工具白名单由专用 DSH preset 提供；思考内容按用户认可落库并折叠展示，工具参数与结果仍不落库、不外泄。</div>
+  </div>
+  <div class="s-foot"><div class="demo-note">截图来自验证环境（后端 8001 / Vite 5173、headless Chrome 1440×1000），会话与知识库内容为演示数据，非生产业务数据。</div><div class="pg"><span class="pg-num"></span></div></div>
+  <div class="notes"><p>四层收口：会话权限压降、独立工作目录、工具白名单、访问与错误脱敏；思考可见但工具参数与结果不外泄。</p></div>
+</section>
+<section class="slide" data-title="页面功能巡览（截图）">
+  <div class="s-head" style="margin-bottom:14px"><span class="eyebrow">08 / UI WALKTHROUGH</span>
+    <h1 class="title" style="font-size:31px">三栏工作台 + 思考折叠 + 结构化用例，<span class="hl">双分辨率无溢出</span></h1></div>
+  <div class="s-body" style="gap:10px">
+    <div class="shots grow" style="grid-template-columns:repeat(3,1fr);grid-template-rows:1fr 1fr;align-content:start">
+      <figure class="shot compact"><img src="assets/agent-chat-sidebars-default.png" alt="三栏总览"><figcaption><b>三栏总览</b>：主导航 228px / 会话列表 / 对话区，两个独立折叠开关。</figcaption></figure>
+      <figure class="shot compact"><img src="assets/task-16-skill-picker-dropdown-lead-verify.png" alt="专家技能选择器"><figcaption><b>专家技能选择器</b>：新建对话可选技能与模型，下拉浮层限宽修复超宽。</figcaption></figure>
+      <figure class="shot compact"><img src="assets/agent-chat-thought-demo-expanded.png" alt="思考可展开追溯"><figcaption><b>思考可展开追溯</b>：展开后内部滚动，与最终答案分区呈现。</figcaption></figure>
+      <figure class="shot compact"><img src="assets/agent-chat-list-toggle-icon-expanded-1280.png" alt="1280 响应式"><figcaption><b>1280 响应式</b>：1280 / 1440 无溢出，900 单列，通顶高度链。</figcaption></figure>
+      <figure class="shot compact"><img src="assets/agent-chat-bottom.png" alt="长回复与输入舱"><figcaption><b>长回复与输入舱</b>：Markdown 长文、悬浮输入舱、文档投喂。</figcaption></figure>
+      <div class="card" style="padding:11px 13px"><h3 style="font-size:13px;margin-bottom:7px">其它已落地细节</h3><ul class="bul" style="gap:5px"><li style="font-size:11.5px">头部胶囊 / 会话信息与溯源抽屉 / 修改配置（下一条消息起生效）</li><li style="font-size:11.5px">CaseResultCard 结构化卡片、复制、JSON 剥离</li><li style="font-size:11.5px">Ctrl/⌘+Enter 发送、32000 字上限、文档导入</li><li style="font-size:11.5px">刷新恢复：?conversation= + snapshot + 2s 轮询兜底</li></ul></div>
+    </div>
+  </div>
+  <div class="s-foot"><div class="demo-note">截图来自验证环境（后端 8001 / Vite 5173、headless Chrome 1440×1000），会话与知识库内容为演示数据，非生产业务数据。</div><div class="pg"><span class="pg-num"></span></div></div>
+  <div class="notes"><p>截图来自验证环境（后端 8001 / Vite 5173、headless Chrome 1440×1000），会话与知识库内容为演示数据，非生产业务数据；截图均完整呈现、不裁切。</p></div>
+</section>
+<section class="slide" data-title="用户管理与角色可见性">
+  <div class="s-head"><span class="eyebrow">09 / DELIVERED</span>
+    <h1 class="title">多用户管理<span class="hl">已交付</span>：两级角色，配置面按角色收敛</h1>
+    <div class="subtitle">在既有本地账号 / Cookie 会话体系上扩展，不重建认证。</div></div>
+  <div class="s-body">
+    <div class="grid3 grow">
+      <div class="card"><h3><span class="n">01</span>两级角色 + 用户管理</h3><p>管理员 / 普通用户；<code>/api/users</code> 与「用户管理」页支持创建、停用、改角色、重置口令。首个管理员仍走 <code>/setup</code>。</p></div>
+      <div class="card"><h3><span class="n">02</span>配置面按角色收敛</h3><p>数据池、平台适配、WIKI 知识库、空间管理、模型配置对普通用户隐藏：<b>菜单隐藏 + 路由守卫</b> 双保险，配置写操作补 admin 门禁。</p></div>
+      <div class="card"><h3><span class="n">03</span>提示词全员共享</h3><p>提示词管理对全部用户可见、可编辑，<b>不做用户隔离</b>；生成流程依赖的后端查询能力保留，不加门禁。</p></div>
+    </div>
+    <div class="grid4">
+      <div class="kpi"><div class="v">2<small>类</small></div><div class="k">管理员 / 普通用户两级角色</div></div>
+      <div class="kpi"><div class="v">5<small>类</small></div><div class="k">配置页对普通用户收敛</div></div>
+      <div class="kpi"><div class="v">1<small>套</small></div><div class="k">统一权限层，五处门禁复用</div></div>
+      <div class="kpi"><div class="v">0<small>改动</small></div><div class="k">提示词与生成查询链路</div></div>
+    </div>
+    <div class="pillrow"><span class="pill">已交付</span><span class="pill amber">菜单 + 路由双保险</span><span class="pill gray">查询能力保留</span></div>
+    <div class="alert mint">原规划 <b>PLAN 01「增加多用户管理，用户会话隔离」</b> 已在 P11–12 完整落地：账号与角色体系、配置面按角色收敛、对话按用户私密隔离。</div>
+  </div>
+  <div class="s-foot"><div class="demo-note">截图来自验证环境（后端 8001 / Vite 5173、headless Chrome 1440×1000），会话与知识库内容为演示数据，非生产业务数据。</div><div class="pg"><span class="pg-num"></span></div></div>
+  <div class="notes"><p>这一页对应原规划 PLAN 01，现已落地。口播聚焦两级角色与「只隐藏菜单与页面、后端查询能力保留」的定稿取舍，强调提示词全员可见可编辑。</p></div>
+</section>
+<section class="slide" data-title="会话隔离与项目可见性">
+  <div class="s-head"><span class="eyebrow">10 / DELIVERED</span>
+    <h1 class="title">对话按用户私密隔离，<span class="hl">项目可见性由管理员掌控</span></h1>
+    <div class="subtitle">两层隔离维度：用户维度的对话私密，项目维度的可见性开关。</div></div>
+  <div class="s-body">
+    <div class="grid2 grow">
+      <div class="card"><h3><span class="n">A</span>Agent 对话 · 用户维度私密</h3><ul class="bul">
+        <li>会话写入 <code>user_id</code>，列表 / 详情 / 消息 / 流式 / 删除全链路按归属过滤。</li>
+        <li><b>管理员也看不到他人对话</b>；不存在、跨项目、非本人三种 404 统一措辞，不泄露存在性。</li>
+        <li>存量对话幂等回填初始管理员；不清空模型、不误归他人。</li>
+      </ul></div>
+      <div class="card"><h3><span class="n">B</span>业务数据 · 沿用 Project 隔离</h3><ul class="bul">
+        <li>需求 / 任务 / 用例 / Wiki 继续按现有项目隔离，<b>不额外加 owner_user_id</b>。</li>
+        <li>管理员可设置项目「是否对全员可见」<code>is_public</code>：关闭后普通用户下拉列表不再出现。</li>
+        <li>项目数据路径统一 404 兜底，放行项目列表与提示词等全局端点，选不到即无入口。</li>
+      </ul></div>
+    </div>
+    <div class="flow">
+      <div class="node hi"><div class="nt">默认全员可见</div><div class="nd">存量数据回填 is_public=1，升级零打断</div></div>
+      <div class="arrow"><i></i></div>
+      <div class="node"><div class="nt">管理员关闭开关</div><div class="nd">/spaces 项目表格一键切换，下拉即时同步</div></div>
+      <div class="arrow"><i></i></div>
+      <div class="node"><div class="nt">普通用户不可见</div><div class="nd">列表消失 + 项目数据路径 404，不返回 403</div></div>
+    </div>
+    <div class="pillrow"><span class="pill">对话私密</span><span class="pill amber">is_public 开关</span><span class="pill gray">404 中性语义</span><span class="pill gray">存量幂等迁移</span></div>
+    <div class="alert mint">顺带修复：存量脏模型值幂等迁移纠正、切换模型失败不再静默、清空模型可回默认、登出清理 4 个 localStorage key 与项目单例，避免跨用户残留。</div>
+  </div>
+  <div class="s-foot"><div class="demo-note">截图来自验证环境（后端 8001 / Vite 5173、headless Chrome 1440×1000），会话与知识库内容为演示数据，非生产业务数据。</div><div class="pg"><span class="pg-num"></span></div></div>
+  <div class="notes"><p>这一页讲两层隔离：对话按用户私密、业务数据沿用项目隔离并由 is_public 控制可见性。口播强调「选不到自然没有入口」的中性 404 语义，以及存量数据回填不打断升级。</p></div>
+</section>
+<section class="slide" data-title="后续规划">
+  <div class="s-head" style="margin-bottom:16px"><span class="eyebrow">11 / ROADMAP</span>
+    <h1 class="title">下一步：<span class="hl">两个方向</span></h1>
+    <div class="subtitle">按「现状 → 目标 → 价值 / 关键工作」展开两个后续方向。</div></div>
+  <div class="s-body" style="gap:12px">
+    <div class="road">
+      <div class="r">
+        <div class="rh"><div class="idx">PLAN 01</div><h3>增加 agent 对话生成用例可全流程 至 归档</h3></div>
+        <div class="seg now"><div class="lbl">现状</div><p>已打通「对话产出 → JSON 契约校验 → 转存用例草稿 → 人工确认 → 入库」。</p></div>
+        <div class="seg goal"><div class="lbl">目标</div><p>继续打通评审 / 定稿 / 归档全链路。</p></div>
+        <div class="seg val"><div class="lbl">价值 / 关键工作</div><p>让对话产出成为可治理资产；关键工作是评审状态机、定稿版本留痕、归档索引与权限。</p></div>
+      </div><div class="r">
+        <div class="rh"><div class="idx">PLAN 02</div><h3>根据已有资料文档搭建非功能用例生成 benchmark</h3></div>
+        <div class="seg now"><div class="lbl">现状</div><p>已有需求文档、规则资料与历史用例可作为评测素材，但尚未形成统一的基准集与评分口径。</p></div>
+        <div class="seg goal"><div class="lbl">目标</div><p>基于已有资料搭建可复跑的非功能用例生成 benchmark，固化输入集、评分维度与验收基线。</p></div>
+        <div class="seg val"><div class="lbl">价值 / 关键工作</div><p>让生成质量可度量、可对比；关键工作是基准集构建、评分口径定义与回归跑批。</p></div>
+      </div>
+    </div>
+  </div>
+  <div class="s-foot"><div class="demo-note">截图来自验证环境（后端 8001 / Vite 5173、headless Chrome 1440×1000），会话与知识库内容为演示数据，非生产业务数据。</div><div class="pg"><span class="pg-num"></span></div></div>
+  <div class="notes"><p>本页讲两个后续方向：对话用例全流程归档、非功能用例生成 benchmark；对话产出已打通到入库，评审 / 定稿 / 归档仍是下一步。</p></div>
+</section>
+<section class="slide end" data-title="结束页">
+  <div class="s-head" style="margin-bottom:0"><span class="eyebrow">12 / CLOSING</span></div>
+  <div class="s-body" style="justify-content:center;gap:0">
+    <div class="big">谢谢 · <span>欢迎讨论</span></div>
+    <div class="rule" style="width:76px;height:4px;background:var(--mint);border-radius:4px;margin-top:22px"></div>
+    <div class="lead" style="font-size:17px;color:var(--sub);margin-top:22px;line-height:1.8">底层运行时对接 · 专家技能 · 思考与多轮工具调用 · 权限限制 · 用户管理与角色权限</div>
+    <div class="pillrow" style="margin-top:28px"><span class="pill gray">按 N 查看演讲者备注</span><span class="pill gray">按 P 导出 PDF</span></div>
+  </div>
+  <div class="s-foot"><div class="demo-note">截图来自验证环境（后端 8001 / Vite 5173、headless Chrome 1440×1000），会话与知识库内容为演示数据，非生产业务数据。</div><div class="pg"><span class="pg-num"></span></div></div>
+  <div class="notes"><p>演示数据声明：截图来自验证环境，会话与知识库内容为演示数据，非生产业务数据。</p></div>
+</section>
+</div></div>
+<div id="controls">
+  <div id="prog"><div id="prog-fill"></div></div>
+  <button class="btn" id="btn-first" title="首页 (Home)">&#9198;</button>
+  <button class="btn" id="btn-prev" title="上一页 (←)">&#8249; 上一页</button>
+  <button class="btn primary" id="btn-next" title="下一页 (→)">下一页 &#8250;</button>
+  <button class="btn" id="btn-last" title="末页 (End)">&#9197;</button>
+  <span id="page-num">第 1 / 共 14 页</span>
+  <div class="spacer"></div>
+  <button class="btn" id="btn-toc" title="回到目录">目录</button>
+  <button class="btn" id="btn-notes">备注 (N)</button>
+  <button class="btn" id="btn-fs">全屏 (F)</button>
+  <button class="btn" id="btn-print">打印 / PDF (P)</button>
+</div>
+<div id="notes-panel"></div>
+<div id="toast"></div>
+<script>
+(function(){
+  var slides=Array.prototype.slice.call(document.querySelectorAll('.slide'));
+  var total=slides.length,cur=0,notesOn=false;
+  var deck=document.getElementById('deck');
+  var notesPanel=document.getElementById('notes-panel');
+  var pageNum=document.getElementById('page-num');
+  var progFill=document.getElementById('prog-fill');
+  var toast=document.getElementById('toast'),toastTimer=null;
+  function scaleDeck(){
+    var vw=window.innerWidth,vh=window.innerHeight;
+    var s=Math.min((vw-48)/1280,(vh-76)/720);
+    if(!(s>0))s=0.1;
+    deck.style.transform='scale('+s+')';
+  }
+  function notesOf(i){
+    var n=slides[i].querySelector('.notes');
+    return n?n.innerHTML:'（本页无演讲者备注）';
+  }
+  function show(i,updateHash){
+    if(i<0)i=0; if(i>total-1)i=total-1;
+    slides[cur].classList.remove('active');
+    cur=i; slides[cur].classList.add('active');
+    pageNum.textContent='第 '+(cur+1)+' / 共 '+total+' 页';
+    progFill.style.width=((cur+1)/total*100)+'%';
+    notesPanel.innerHTML='<div class="np-title">演讲者备注 · 第 '+(cur+1)+' 页</div>'+notesOf(cur);
+    if(updateHash!==false){
+      try{history.replaceState(null,'','#'+(cur+1));}catch(e){location.hash=String(cur+1);}
+    }
+  }
+  function fromHash(){
+    var h=(location.hash||'').replace('#','');
+    var n=parseInt(h,10);
+    if(isNaN(n)||n<1||n>total)return 0;
+    return n-1;
+  }
+  function toggleNotes(){
+    notesOn=!notesOn;
+    document.body.className=notesOn?'notes-on':'';
+    document.getElementById('btn-notes').textContent=notesOn?'备注 ON (N)':'备注 (N)';
+  }
+  function fullscreen(){
+    var el=document.documentElement;
+    if(!document.fullscreenElement){if(el.requestFullscreen)el.requestFullscreen();}
+    else if(document.exitFullscreen)document.exitFullscreen();
+  }
+  function toastMsg(t){
+    toast.textContent=t;toast.style.display='block';
+    if(toastTimer)clearTimeout(toastTimer);
+    toastTimer=setTimeout(function(){toast.style.display='none';},4500);
+  }
+  document.addEventListener('keydown',function(e){
+    var k=e.key;
+    if(k==='ArrowRight'||k===' '||k==='PageDown'){e.preventDefault();show(cur+1);}
+    else if(k==='ArrowLeft'||k==='PageUp'){e.preventDefault();show(cur-1);}
+    else if(k==='Home'){e.preventDefault();show(0);}
+    else if(k==='End'){e.preventDefault();show(total-1);}
+    else if(k==='n'||k==='N'){e.preventDefault();toggleNotes();}
+    else if(k==='f'||k==='F'){e.preventDefault();fullscreen();}
+    else if(k==='p'||k==='P'){e.preventDefault();window.print();}
+  });
+  document.addEventListener('click',function(e){
+    if(e.target&&e.target.closest&&e.target.closest('button,a,[data-goto],.notes,#controls,#notes-panel,#toast'))return;
+    var x=e.clientX/window.innerWidth;
+    if(x<0.26)show(cur-1); else if(x>0.74)show(cur+1);
+  });
+  Array.prototype.forEach.call(document.querySelectorAll('[data-goto]'),function(el){
+    el.addEventListener('click',function(ev){ev.stopPropagation();show(parseInt(el.getAttribute('data-goto'),10)-1);});
+  });
+  document.getElementById('btn-first').addEventListener('click',function(){show(0);});
+  document.getElementById('btn-prev').addEventListener('click',function(){show(cur-1);});
+  document.getElementById('btn-next').addEventListener('click',function(){show(cur+1);});
+  document.getElementById('btn-last').addEventListener('click',function(){show(total-1);});
+  document.getElementById('btn-toc').addEventListener('click',function(){show(2);});
+  document.getElementById('btn-notes').addEventListener('click',toggleNotes);
+  document.getElementById('btn-fs').addEventListener('click',fullscreen);
+  document.getElementById('btn-print').addEventListener('click',function(){
+    toastMsg('在打印对话框中选择「另存为 PDF」；纸张横向并勾选「背景图形」。');
+    window.print();
+  });
+  window.addEventListener('resize',scaleDeck);
+  window.addEventListener('hashchange',function(){show(fromHash(),false);});
+  Array.prototype.forEach.call(slides,function(s,i){
+    var pn=s.querySelector('.pg-num');
+    if(pn)pn.textContent='第 '+(i+1)+' / 共 '+total+' 页';
+  });
+  scaleDeck();
+  show(fromHash(),false);
+})();
+</script>
+</body>
+</html>
