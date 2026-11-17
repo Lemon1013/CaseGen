@@ -15,6 +15,15 @@ function asString(value: unknown, fallback = ''): string {
   return typeof value === 'string' ? value : fallback
 }
 
+function isGroupPayload(value: unknown): boolean {
+  return isRecord(value) && Array.isArray(value.cases)
+}
+
+function isCasePayload(value: unknown): boolean {
+  if (!isRecord(value)) return false
+  return ['case_key', 'steps', 'title', 'raw_md'].some((key) => key in value)
+}
+
 function normalizeCase(raw: unknown, index: number): DraftCaseItem | null {
   if (!isRecord(raw)) return null
   const rawSteps = Array.isArray(raw.steps) ? raw.steps : []
@@ -32,7 +41,7 @@ function normalizeCase(raw: unknown, index: number): DraftCaseItem | null {
   return {
     case_key: asString(raw.case_key, `TC-${String(index + 1).padStart(3, '0')}`),
     title: asString(raw.title),
-    priority: asString(raw.priority, 'P2'),
+    priority: asString(raw.priority, 'P1'),
     type: asString(raw.type),
     verification_goal: asString(raw.verification_goal),
     preconditions: asString(raw.preconditions),
@@ -56,10 +65,10 @@ function normalizeGroup(raw: unknown, index: number): DraftPointGroup | null {
   return {
     test_point_id: Number.isInteger(testPointId) ? testPointId : null,
     stable_key: asString(raw.stable_key, `agent-point-${index + 1}`),
-    title: asString(raw.title),
+    title: asString(raw.title, '默认测试点分组'),
     verification_goal: asString(raw.verification_goal),
     dimension: asString(raw.dimension),
-    priority: asString(raw.priority, 'P2'),
+    priority: asString(raw.priority, 'P1'),
     citation_ids: Array.isArray(raw.citation_ids)
       ? raw.citation_ids.map((id) => Number(id)).filter((id) => Number.isInteger(id))
       : [],
@@ -67,10 +76,14 @@ function normalizeGroup(raw: unknown, index: number): DraftPointGroup | null {
   }
 }
 
-/** 解析一段正文里的全部 json fenced block，返回可渲染的 DraftPointGroup[]；无有效结构返回 null。 */
+/**
+ * 解析一段正文里的全部 json fenced block，返回可渲染的 DraftPointGroup[]；无有效结构返回 null。
+ * 同时兼容测试点分组数组（DraftPointGroup[]）与扁平用例数组（DraftCaseItem[]），与后端 agent_draft.py 完全对齐。
+ */
 export function parseAgentCaseGroups(content: string): DraftPointGroup[] | null {
   if (!content) return null
   const groups: DraftPointGroup[] = []
+  const looseCases: DraftCaseItem[] = []
   let matched = false
   for (const block of content.matchAll(JSON_FENCE_PATTERN)) {
     const body = block[1]?.trim()
@@ -91,11 +104,28 @@ export function parseAgentCaseGroups(content: string): DraftPointGroup[] | null 
     if (!candidates) continue
     matched = true
     candidates.forEach((raw, index) => {
-      const group = normalizeGroup(raw, groups.length + index)
-      if (group) groups.push(group)
+      if (isGroupPayload(raw)) {
+        const group = normalizeGroup(raw, groups.length + index)
+        if (group) groups.push(group)
+      } else if (isCasePayload(raw)) {
+        const singleCase = normalizeCase(raw, looseCases.length)
+        if (singleCase) looseCases.push(singleCase)
+      }
     })
   }
   if (!matched) return null
+  if (looseCases.length) {
+    groups.push({
+      test_point_id: null,
+      stable_key: `agent-point-${groups.length + 1}`,
+      title: '对话生成用例',
+      verification_goal: '验证当前对话需求覆盖的核心与边界场景',
+      dimension: '综合验证',
+      priority: looseCases[0]?.priority || 'P1',
+      citation_ids: [],
+      cases: looseCases,
+    })
+  }
   return groups.length ? groups : null
 }
 
@@ -106,9 +136,9 @@ export function hasAgentCaseJson(content: string): boolean {
 
 /** 移除消息里可解析为用例契约的 ```json 代码块（含流式中尚未闭合的尾部），仅用于展示；原始 content 仍用于转存。 */
 export function stripAgentCaseJson(content: string): string {
-  if (!content) return ""
+  if (!content) return ''
   const pattern = /```json\s*([\s\S]*?)```/gi
-  let result = ""
+  let result = ''
   let lastIndex = 0
   let match: RegExpExecArray | null
   while ((match = pattern.exec(content))) {

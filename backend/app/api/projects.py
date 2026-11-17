@@ -6,7 +6,6 @@ from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from app.db import get_session
-from app import config
 from app.models.entities import (
     DataPool,
     Document,
@@ -25,6 +24,7 @@ from app.models.entities import (
     WikiSpace,
 )
 from app.schemas.projects import ProjectBindingIn, ProjectCreate, ProjectOut, ProjectSpaceOut, ProjectUpdate
+from app.services.permissions import current_user, is_admin, require_admin
 from app.services.wiki_spaces import normalize_space_slug, slug_from_name
 from app.services.wiki_spaces import DEFAULT_SPACE_SLUG, ensure_space_dirs, space_root
 
@@ -32,11 +32,7 @@ router = APIRouter(prefix="/api/projects", tags=["projects"])
 
 
 def _require_admin(request: Request) -> None:
-    if not config.AUTH_ENABLED:
-        return
-    user = getattr(request.state, "user", None)
-    if user is None or getattr(user, "role", "") != "admin":
-        raise HTTPException(status_code=403, detail="Project management requires an administrator")
+    require_admin(request, detail="Project management requires an administrator")
 
 
 def _require_project(request: Request, project_id: int) -> None:
@@ -112,8 +108,15 @@ def _project_has_data(session: Session, project_id: int, space_ids: list[int]) -
 
 
 @router.get("", response_model=list[ProjectOut])
-def list_projects(session: Session = Depends(get_session)):
-    return [_out(session, row) for row in session.exec(select(Project).order_by(Project.status, Project.name)).all()]
+def list_projects(request: Request, session: Session = Depends(get_session)):
+    # Ordinary users only see projects an administrator marked as visible;
+    # administrators need the full list to configure the switch.  When auth
+    # is disabled (legacy test compatibility) everyone sees everything.
+    query = select(Project)
+    if not is_admin(request) and current_user(request) is not None:
+        query = query.where(Project.is_public == True)  # noqa: E712
+    rows = session.exec(query.order_by(Project.status, Project.name)).all()
+    return [_out(session, row) for row in rows]
 
 
 @router.post("", response_model=ProjectOut, status_code=status.HTTP_201_CREATED)
@@ -163,6 +166,8 @@ def update_project(project_id: int, body: ProjectUpdate, request: Request, sessi
         value = getattr(body, name)
         if value is not None:
             setattr(row, name, value.strip())
+    if body.is_public is not None:
+        row.is_public = bool(body.is_public)
     if row.status not in {"active", "archived"}:
         raise HTTPException(422, "Unsupported project status")
     row.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)

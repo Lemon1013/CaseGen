@@ -8,6 +8,7 @@ from typing import Any, Callable
 import httpx
 
 from app.config import LLM_DEFAULT_TIMEOUT_SEC
+from app.services.llm_http import select_environment_proxy
 
 # Transient gateway / upstream failures worth retrying
 _RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
@@ -279,6 +280,38 @@ def _parse_stream_response(
     return content, usage
 
 
+def _create_client(
+    url: str,
+    *,
+    timeout: httpx.Timeout | float,
+    transport: httpx.BaseTransport | None,
+) -> httpx.Client:
+    """Build a sync client without httpx's NO_PROXY-to-mount conversion.
+
+    httpx 0.28 turns NO_PROXY entries into URL patterns; IPv6 CIDRs such as
+    ``fd7a:115c:a1e0::/48`` then fail normalization. An explicit transport
+    keeps proxy selection in ``select_environment_proxy`` while ``trust_env``
+    still applies TLS environment settings.
+    """
+    owned_transport: httpx.BaseTransport | None = None
+    try:
+        if transport is None:
+            # Each call targets one absolute request URL.
+            owned_transport = httpx.HTTPTransport(
+                proxy=select_environment_proxy(url), trust_env=True
+            )
+            transport = owned_transport
+        return httpx.Client(timeout=timeout, transport=transport, trust_env=True)
+    except (httpx.InvalidURL, httpx.HTTPError, ImportError, ValueError, OSError):
+        if owned_transport is not None:
+            try:
+                owned_transport.close()
+            except Exception:  # pragma: no cover - cleanup must not mask the error
+                pass
+        # Constructor errors can embed proxy URLs with credentials.
+        raise LLMError(f"LLM client setup failed ({url})") from None
+
+
 def chat_completion(
     *,
     base_url: str,
@@ -355,7 +388,8 @@ def chat_completion(
 
     parse_fn = _parse_responses_payload if is_responses else _parse_chat_response
 
-    with httpx.Client(
+    with _create_client(
+        url,
         timeout=timeout or LLM_DEFAULT_TIMEOUT_SEC,
         transport=transport,
     ) as client:

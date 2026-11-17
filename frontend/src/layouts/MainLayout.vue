@@ -25,6 +25,7 @@ import {
   Fold,
 } from '@element-plus/icons-vue'
 import { listModels, type ModelConfig } from '../api/models'
+import { setProjectInvalidHandler } from '../api/client'
 import { useAuthStore } from '../authStore'
 import BrandMark from '../components/BrandMark.vue'
 import { useProjectStore } from '../projectStore'
@@ -43,36 +44,39 @@ const projectQuery = computed(() => {
   return { project_id: String(project.id), ...(spaceId ? { space_id: String(spaceId) } : {}) }
 })
 
-const wikiPaths = ['/wiki', '/documents', '/wiki/reviews', '/wiki-spaces']
-const platformPaths = ['/platform-management', '/platform-case-generate', '/platform-cases', '/platform-upload', '/platform-adapters']
-
 const useCaseItems = [
   { path: '/', label: '用例生成', icon: Tickets },
   { path: '/tasks', label: '生成任务', icon: List },
   { path: '/agent', label: 'Agent 对话', icon: ChatDotRound },
   { path: '/cases', label: '用例管理', icon: Collection },
-  { path: '/data-pools', label: '数据池', icon: DataAnalysis },
+  { path: '/data-pools', label: '数据池', icon: DataAnalysis, adminOnly: true },
 ]
 
 const platformItems = [
-  { path: '/platform-management', label: '平台管理', icon: Connection },
-  { path: '/platform-case-generate', label: '生成平台用例', icon: SetUp },
-  { path: '/platform-cases', label: '平台用例管理', icon: Collection },
-  { path: '/platform-upload', label: '上传至测试平台', icon: Upload },
+  { path: '/platform-management', label: '平台管理', icon: Connection, adminOnly: true },
+  { path: '/platform-case-generate', label: '生成平台用例', icon: SetUp, adminOnly: true },
+  { path: '/platform-cases', label: '平台用例管理', icon: Collection, adminOnly: true },
+  { path: '/platform-upload', label: '上传至测试平台', icon: Upload, adminOnly: true },
 ]
 
 const systemItems = [
-  { path: '/spaces', label: '空间管理', icon: Grid },
+  { path: '/spaces', label: '空间管理', icon: Grid, adminOnly: true },
   { path: '/prompts', label: '提示词管理', icon: EditPen },
-  { path: '/models', label: '模型配置', icon: Cpu },
+  { path: '/models', label: '模型配置', icon: Cpu, adminOnly: true },
+  { path: '/users', label: '用户管理', icon: UserFilled, adminOnly: true },
 ]
 
 const wikiItems = [
-  { path: '/wiki', label: '知识浏览', icon: Reading },
-  { path: '/documents', label: '文档摄入', icon: Document },
-  { path: '/wiki/reviews', label: '变更审核', icon: CircleCheck },
-  { path: '/wiki-spaces', label: '知识库管理', icon: FolderOpened },
+  { path: '/wiki', label: '知识浏览', icon: Reading, adminOnly: true },
+  { path: '/documents', label: '文档摄入', icon: Document, adminOnly: true },
+  { path: '/wiki/reviews', label: '变更审核', icon: CircleCheck, adminOnly: true },
+  { path: '/wiki-spaces', label: '知识库管理', icon: FolderOpened, adminOnly: true },
 ]
+
+const wikiPaths = wikiItems.map((item) => item.path)
+const platformPaths = [...platformItems.map((item) => item.path), '/platform-adapters']
+const activeWikiPaths = computed(() => (showWikiGroup.value ? wikiPaths : []))
+const activePlatformPaths = computed(() => (showPlatformGroup.value ? platformPaths : []))
 
 const wikiExpanded = ref(false)
 const platformExpanded = ref(false)
@@ -84,7 +88,33 @@ function toggleNav() {
   localStorage.setItem('casegen:nav-collapsed', navCollapsed.value ? '1' : '0')
 }
 
-const allMenuItems = computed(() => [...useCaseItems, ...platformItems, ...wikiItems, ...systemItems])
+function onUserCommand(command: unknown) {
+  if (command === 'security') {
+    void router.push({ name: 'account-security' })
+    return
+  }
+  if (command === 'logout') {
+    void auth.signOut()
+  }
+}
+
+function visible<T extends { adminOnly?: boolean }>(items: T[]): T[] {
+  return auth.isAdmin ? items : items.filter((item) => !item.adminOnly)
+}
+
+const visibleUseCaseItems = computed(() => visible(useCaseItems))
+const visiblePlatformItems = computed(() => visible(platformItems))
+const visibleWikiItems = computed(() => visible(wikiItems))
+const visibleSystemItems = computed(() => visible(systemItems))
+const showPlatformGroup = computed(() => visiblePlatformItems.value.length > 0)
+const showWikiGroup = computed(() => visibleWikiItems.value.length > 0)
+
+const allMenuItems = computed(() => [
+  ...visibleUseCaseItems.value,
+  ...visiblePlatformItems.value,
+  ...visibleWikiItems.value,
+  ...visibleSystemItems.value,
+])
 
 const pageTitle = computed(() => {
   const meta = route.meta || {}
@@ -107,8 +137,8 @@ function isActive(path: string): boolean {
   return route.path === path || route.path.startsWith(path + '/')
 }
 
-const isWikiActive = computed(() => wikiPaths.some((path) => isActive(path)))
-const isPlatformActive = computed(() => platformPaths.some((path) => isActive(path)))
+const isWikiActive = computed(() => activeWikiPaths.value.some((path) => isActive(path)))
+const isPlatformActive = computed(() => activePlatformPaths.value.some((path) => isActive(path)))
 
 function toggleWiki() {
   wikiExpanded.value = !wikiExpanded.value
@@ -171,23 +201,58 @@ watch(
 
 // ...and on a 60s fallback timer for long-lived views that never navigate.
 const modelTimer = window.setInterval(loadDefaultModel, 60_000)
+
+let projectRefreshFlight: Promise<void> | null = null
+let lastProjectRefreshAt = 0
+
+// Long-lived tabs keep the module-level project list; refresh it when the
+// window regains focus or the selector opens.
+function refreshProjects(force = false): Promise<void> {
+  if (!projects.state.loaded) return Promise.resolve()
+  if (projectRefreshFlight) return projectRefreshFlight
+  if (!force && Date.now() - lastProjectRefreshAt < 15_000) return Promise.resolve()
+  lastProjectRefreshAt = Date.now()
+  projectRefreshFlight = projects.refresh(router)
+    .catch(() => {})
+    .finally(() => {
+      projectRefreshFlight = null
+    })
+  return projectRefreshFlight
+}
+
+function onProjectSelectVisible(visible: boolean) {
+  if (visible) void refreshProjects()
+}
+
+function onWindowFocus() {
+  if (document.visibilityState === 'visible') void refreshProjects()
+}
+
+function onVisibilityChange() {
+  if (document.visibilityState === 'visible') void refreshProjects()
+}
+
+onMounted(async () => {
+  window.addEventListener('focus', onWindowFocus)
+  document.addEventListener('visibilitychange', onVisibilityChange)
+  setProjectInvalidHandler(() => refreshProjects(true))
+  await Promise.all([loadDefaultModel(), projects.load(route.query)])
+  await projects.ensureRouteProject(router)
+})
+
 onUnmounted(() => {
   window.clearInterval(modelTimer)
+  window.removeEventListener('focus', onWindowFocus)
+  document.removeEventListener('visibilitychange', onVisibilityChange)
+  setProjectInvalidHandler(null)
 })
 
 watch(
   () => route.query.project_id,
-  async (newId) => {
-    if (projects.state.loaded && projects.state.currentId && !newId) {
-      await projects.select(projects.state.currentId, router)
-    }
+  async () => {
+    if (projects.state.loaded) await projects.ensureRouteProject(router)
   },
 )
-
-onMounted(async () => {
-  await Promise.all([loadDefaultModel(), projects.load(route.query)])
-  if (projects.state.currentId && !route.query.project_id) await projects.select(projects.state.currentId, router)
-})
 </script>
 
 <template>
@@ -205,7 +270,7 @@ onMounted(async () => {
         <section class="nav-group">
           <div class="nav-group-title">用例中心</div>
           <router-link
-            v-for="item in useCaseItems"
+            v-for="item in visibleUseCaseItems"
             :key="item.path"
             :to="{ path: item.path, query: projectQuery }"
             class="nav-item"
@@ -219,16 +284,16 @@ onMounted(async () => {
           </router-link>
         </section>
 
-        <section class="nav-group wiki-group">
+        <section v-if="showPlatformGroup" class="nav-group wiki-group">
           <button type="button" class="nav-group-toggle" :class="{ active: isPlatformActive }" :aria-expanded="platformExpanded" aria-controls="platform-submenu" title="平台适配" @click="onPlatformGroupClick">
             <el-icon class="nav-icon" :size="18"><Connection /></el-icon><span>平台适配</span><el-icon class="nav-chevron" :size="14"><ArrowDown v-if="platformExpanded"/><ArrowRight v-else/></el-icon>
           </button>
           <div v-show="platformExpanded" id="platform-submenu" class="nav-submenu">
-            <router-link v-for="item in platformItems" :key="item.path" :to="{ path: item.path, query: projectQuery }" class="nav-item nav-subitem" :class="{active:isActive(item.path)}"><el-icon class="nav-icon" :size="17"><component :is="item.icon"/></el-icon><span>{{item.label}}</span></router-link>
+            <router-link v-for="item in visiblePlatformItems" :key="item.path" :to="{ path: item.path, query: projectQuery }" class="nav-item nav-subitem" :class="{active:isActive(item.path)}"><el-icon class="nav-icon" :size="17"><component :is="item.icon"/></el-icon><span>{{item.label}}</span></router-link>
           </div>
         </section>
 
-        <section class="nav-group wiki-group">
+        <section v-if="showWikiGroup" class="nav-group wiki-group">
           <button
             type="button"
             class="nav-group-toggle"
@@ -247,7 +312,7 @@ onMounted(async () => {
           </button>
           <div v-show="wikiExpanded" id="wiki-submenu" class="nav-submenu">
             <router-link
-              v-for="item in wikiItems"
+              v-for="item in visibleWikiItems"
               :key="item.path"
               :to="{ path: item.path, query: projectQuery }"
               class="nav-item nav-subitem"
@@ -264,7 +329,7 @@ onMounted(async () => {
         <section class="nav-group">
           <div class="nav-group-title">系统配置</div>
           <router-link
-            v-for="item in systemItems"
+            v-for="item in visibleSystemItems"
             :key="item.path"
             :to="{ path: item.path, query: projectQuery }"
             class="nav-item"
@@ -308,7 +373,7 @@ onMounted(async () => {
           <p v-if="pageDescription" class="topbar-desc">{{ pageDescription }}</p>
         </div>
         <div class="topbar-right">
-          <el-select v-if="projects.state.projects.length" :model-value="projects.state.currentId" class="project-select" aria-label="当前项目" @change="(id: number) => projects.select(id, router)">
+          <el-select v-if="projects.state.projects.length" :model-value="projects.state.currentId" class="project-select" aria-label="当前项目" @change="(id: number) => projects.select(id, router)" @visible-change="onProjectSelectVisible">
             <el-option v-for="project in projects.state.projects.filter((item) => item.status === 'active')" :key="project.id" :label="project.name" :value="project.id" />
           </el-select>
           <div v-if="defaultModel" class="model-chip" title="当前默认模型">
@@ -316,16 +381,24 @@ onMounted(async () => {
             <span class="model-label">默认模型</span>
             <span class="model-name">{{ defaultModel.name }} · {{ defaultModel.model_name }}</span>
           </div>
-          <div v-if="auth.user" class="user-chip">
-            <el-icon><UserFilled /></el-icon>
-            <span>{{ auth.user.display_name || auth.user.username }}</span>
-          </div>
-          <el-button class="logout-button" text :icon="SwitchButton" @click="auth.signOut">退出</el-button>
+          <el-dropdown v-if="auth.user" trigger="click" @command="onUserCommand">
+            <button type="button" class="user-chip" aria-label="用户菜单">
+              <el-icon><UserFilled /></el-icon>
+              <span class="user-name">{{ auth.user.display_name || auth.user.username }}</span>
+              <el-icon class="user-caret"><ArrowDown /></el-icon>
+            </button>
+            <template #dropdown>
+              <el-dropdown-menu>
+                <el-dropdown-item command="security" :icon="UserFilled">账号安全</el-dropdown-item>
+                <el-dropdown-item command="logout" :icon="SwitchButton" divided>退出登录</el-dropdown-item>
+              </el-dropdown-menu>
+            </template>
+          </el-dropdown>
         </div>
       </header>
 
       <el-main class="main-content">
-        <router-view v-if="projects.state.loaded && (!projects.state.currentId || route.query.project_id)" :key="projects.state.currentId || 'no-project'" />
+        <router-view v-if="(route.meta.skipProjectGate || projects.state.loaded) && (route.meta.skipProjectGate || !projects.state.currentId || route.query.project_id)" :key="projects.state.currentId || 'no-project'" />
       </el-main>
     </el-container>
   </el-container>
@@ -727,13 +800,32 @@ onMounted(async () => {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  padding: 5px 8px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
   color: var(--cg-text-muted);
+  font: inherit;
   font-size: 12px;
   white-space: nowrap;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
 }
 
-.logout-button {
-  color: var(--cg-text-muted);
+.user-chip:hover,
+.user-chip:focus-visible {
+  background: var(--cg-surface-muted);
+  color: var(--cg-text);
+}
+
+.user-name {
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.user-caret {
+  opacity: 0.7;
 }
 
 .main-content {
@@ -780,6 +872,10 @@ onMounted(async () => {
 
   .model-chip {
     max-width: 200px;
+  }
+
+  .user-name {
+    max-width: 90px;
   }
 }
 </style>

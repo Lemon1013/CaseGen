@@ -1,12 +1,22 @@
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 import { useRouter } from 'vue-router'
-import { getAuthBootstrap, login, logout, setupAccount, type AuthUser } from './api/auth'
-import { bumpAuthEpoch, getAuthEpoch } from './api/client'
+import {
+  changePassword as changePasswordRequest,
+  getAuthBootstrap,
+  login,
+  logout,
+  register as registerAccount,
+  setupAccount,
+  type AuthUser,
+  type RegisterPayload,
+} from './api/auth'
+import { ApiError, bumpAuthEpoch, getAuthEpoch } from './api/client'
+import { resetProjectStoreState } from './projectStore'
 
 function safeRedirect(value: unknown): string {
   if (typeof value !== 'string' || !value.startsWith('/') || value.startsWith('//')) return '/'
-  if (value.startsWith('/login') || value.startsWith('/setup')) return '/'
+  if (value.startsWith('/login') || value.startsWith('/setup') || value.startsWith('/register')) return '/'
   return value
 }
 
@@ -14,6 +24,7 @@ export const useAuthStore = defineStore('auth', () => {
   const router = useRouter()
   const user = ref<AuthUser | null>(null)
   const setupRequired = ref(false)
+  const registrationEnabled = ref(false)
   const restored = ref(false)
   const restorePending = ref(false)
   const restoreError = ref<string | null>(null)
@@ -23,6 +34,20 @@ export const useAuthStore = defineStore('auth', () => {
   let unauthorizedFlight: Promise<void> | null = null
 
   const isAuthenticated = computed(() => user.value !== null)
+  const isAdmin = computed(() => user.value?.role === 'admin')
+
+  // Clear every bit of the previous account's client-side scope so a later
+  // login cannot inherit its project_id (client.ts injects it into every
+  // /api request) or its UI state.
+  function clearAccountScope() {
+    for (const key of [
+      'casegen:last-project-id',
+      'casegen:last-wiki-space-id',
+      'casegen:nav-collapsed',
+      'casegen:agent-list-collapsed',
+    ]) localStorage.removeItem(key)
+    resetProjectStoreState()
+  }
 
   function invalidateRestore() {
     restoreGeneration += 1
@@ -44,11 +69,13 @@ export const useAuthStore = defineStore('auth', () => {
       .then((payload) => {
         if (!isCurrent()) return
         setupRequired.value = payload.setup_required
+        registrationEnabled.value = payload.setup_required ? false : payload.registration_enabled === true
         user.value = payload.user
       })
       .catch(() => {
         if (!isCurrent()) return
         user.value = null
+        registrationEnabled.value = false
         restoreError.value = '无法连接到 CaseGen 服务，请检查后端是否已启动。'
         restoreUnavailable.value = true
       })
@@ -90,12 +117,44 @@ export const useAuthStore = defineStore('auth', () => {
     await router.replace(safeRedirect(router.currentRoute.value.query.redirect))
   }
 
+  async function register(payload: RegisterPayload) {
+    invalidateRestore()
+    bumpAuthEpoch()
+    const result = await registerAccount(payload)
+    user.value = result.user
+    setupRequired.value = false
+    restored.value = true
+    await router.replace({ name: 'workbench' })
+  }
+
+  async function changePassword(currentPassword: string, newPassword: string) {
+    try {
+      await changePasswordRequest({
+        current_password: currentPassword,
+        new_password: newPassword,
+      })
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) {
+        await handleUnauthorized()
+        return
+      }
+      throw err
+    }
+    invalidateRestore()
+    bumpAuthEpoch()
+    clearAccountScope()
+    user.value = null
+    restored.value = false
+    await router.replace({ name: 'login', query: { changed: '1' } })
+  }
+
   async function signOut() {
     invalidateRestore()
     bumpAuthEpoch()
     try {
       await logout()
     } finally {
+      clearAccountScope()
       user.value = null
       restored.value = true
       await router.replace({ name: 'login' })
@@ -108,6 +167,7 @@ export const useAuthStore = defineStore('auth', () => {
     unauthorizedFlight = (async () => {
       invalidateRestore()
       bumpAuthEpoch()
+      clearAccountScope()
       user.value = null
       restored.value = true
       const routeName = router.currentRoute.value.name
@@ -124,15 +184,19 @@ export const useAuthStore = defineStore('auth', () => {
   return {
     user,
     setupRequired,
+    registrationEnabled,
     restored,
     restorePending,
     restoreError,
     restoreUnavailable,
     isAuthenticated,
+    isAdmin,
     restoreSession,
     retryRestore,
     signIn,
     setup,
+    register,
+    changePassword,
     signOut,
     handleUnauthorized,
   }

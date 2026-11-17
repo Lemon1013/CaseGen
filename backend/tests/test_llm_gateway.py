@@ -445,3 +445,82 @@ def test_responses_api_streaming_success():
     assert usage["total_tokens"] == 15
     assert deltas == ["Chunk 1 ", "Chunk 2"]
 
+
+_IPV6_CIDR_NO_PROXY = (
+    "localhost,127.0.0.1,::1,.ts.net,100.64.0.0/10,fd7a:115c:a1e0::/48"
+)
+
+
+def _set_environment_proxies(monkeypatch, no_proxy: str) -> None:
+    monkeypatch.setenv("NO_PROXY", no_proxy)
+    monkeypatch.setenv("no_proxy", no_proxy)
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:7897")
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:7897")
+    monkeypatch.setenv("ALL_PROXY", "socks5://127.0.0.1:7897")
+
+
+def _chat_response(url: str, content: str = "hello") -> httpx.Response:
+    return httpx.Response(
+        200,
+        json={
+            "choices": [{"message": {"content": content}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        },
+        request=httpx.Request("POST", url),
+    )
+
+
+def test_chat_completion_accepts_ipv6_cidr_no_proxy(monkeypatch):
+    _set_environment_proxies(monkeypatch, _IPV6_CIDR_NO_PROXY)
+    requested: list[str] = []
+
+    def fake_post(self, url, **kwargs):
+        requested.append(str(url))
+        return _chat_response(str(url), "proxied")
+
+    monkeypatch.setattr(httpx.Client, "post", fake_post)
+
+    content, usage = chat_completion(
+        base_url="https://api.example.com/v1",
+        api_key="sk-test",
+        model="gpt-test",
+        messages=[{"role": "user", "content": "hello"}],
+    )
+
+    assert content == "proxied"
+    assert usage == {"prompt_tokens": 1, "completion_tokens": 1}
+    assert requested == ["https://api.example.com/v1/chat/completions"]
+
+
+def test_chat_completion_selects_proxy_per_target_url(monkeypatch):
+    _set_environment_proxies(monkeypatch, _IPV6_CIDR_NO_PROXY)
+    recorded_proxies: list[str | None] = []
+
+    class RecordingTransport(httpx.BaseTransport):
+        def __init__(self, *, proxy=None, trust_env=True):
+            recorded_proxies.append(proxy)
+
+        def handle_request(self, request):
+            raise AssertionError("HTTP request should not reach the transport")
+
+    monkeypatch.setattr(httpx, "HTTPTransport", RecordingTransport)
+
+    def fake_post(self, url, **kwargs):
+        return _chat_response(str(url))
+
+    monkeypatch.setattr(httpx.Client, "post", fake_post)
+
+    for base_url, expected_proxy in (
+        ("https://model.ts.net/v1", None),
+        ("https://api.example.com/v1", "http://127.0.0.1:7897"),
+    ):
+        chat_completion(
+            base_url=base_url,
+            api_key="sk-test",
+            model="gpt-test",
+            messages=[{"role": "user", "content": "hello"}],
+        )
+        assert recorded_proxies[-1] == expected_proxy
+
+    assert len(recorded_proxies) == 2
+

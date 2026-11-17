@@ -14,6 +14,7 @@ class ProjectUpdate(BaseModel):
     name: Optional[str] = Field(default=None, min_length=1, max_length=120)
     description: Optional[str] = Field(default=None, max_length=2000)
     status: Optional[str] = None
+    is_public: Optional[bool] = None
 
 
 class ProjectBindingIn(BaseModel):
@@ -41,6 +42,7 @@ class ProjectOut(BaseModel):
     slug: str
     description: str
     status: str
+    is_public: bool = True
     default_wiki_space_id: Optional[int] = None
     private_spaces: list[ProjectSpaceOut] = Field(default_factory=list)
     shared_spaces: list[ProjectSpaceOut] = Field(default_factory=list)

@@ -19,6 +19,7 @@ from sqlmodel import Session, select
 from app import config
 from app.config import RETRIEVE_SOURCE_TOP_K, RETRIEVE_TOP_K, RETRIEVE_WIKI_TOP_K
 from app.db import get_session
+from app.services.permissions import require_admin, require_admin_purge
 from app.models.entities import (
     IngestJob,
     SourceChunk,
@@ -90,19 +91,15 @@ _OS_RENAME = os.rename
 
 
 def _require_admin(request: Request) -> None:
-    # The test suite disables auth for legacy endpoints.  In production, the
-    # middleware always supplies request.state.user before this boundary.
-    if not config.AUTH_ENABLED:
-        raise HTTPException(status_code=503, detail="Administrator purge is unavailable while authentication is disabled")
-    user = getattr(request.state, "user", None)
-    if user is None or not bool(getattr(user, "is_active", False)) or getattr(user, "role", "") != "admin":
-        raise HTTPException(status_code=403, detail="Administrator access required")
+    # Purge is irreversible: keep the stronger 503 guard while auth is off,
+    # then apply the shared administrator boundary.
+    require_admin_purge(request)
 
 
 def _require_shared_admin(request: Request, session: Session, space_id: int) -> None:
     space = session.get(WikiSpace, space_id)
     if space is not None and space.scope == "shared" and config.AUTH_ENABLED:
-        _require_admin(request)
+        require_admin(request, detail="Administrator access required")
 
 
 def _lexical_path(value: Path) -> Path:

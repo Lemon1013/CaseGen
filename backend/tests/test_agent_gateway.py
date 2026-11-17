@@ -588,3 +588,273 @@ def test_knowledge_space_dirs_unknown_project_is_empty(tmp_app_data):
     init_db()
     assert agent_turn._knowledge_space_dirs("999999") == []
     assert agent_turn._knowledge_space_dirs("not-a-number") == []
+
+
+def test_update_session_model_sends_put_with_provider_and_model(tmp_app_data):
+    """DSH /sessions/{id} exposes DELETE/GET/PUT only; PATCH returns 404."""
+
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content or b"{}")
+        # Mirror the real DSH PUT response shape (model.selected).
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "data": {
+                    "sessionId": "sess-42",
+                    "model": {
+                        "selected": {
+                            "provider": "deepseek",
+                            "model": "deepseek-reasoner",
+                        }
+                    },
+                },
+            },
+        )
+
+    ok = agent_gateway.gateway.update_session_model(
+        "sess-42", "deepseek/deepseek-reasoner", transport=_transport(handler)
+    )
+    assert ok is True
+    assert captured["method"] == "PUT"
+    assert captured["path"].endswith("/sessions/sess-42")
+    assert captured["body"] == {"provider": "deepseek", "model": "deepseek-reasoner"}
+
+
+def test_update_session_model_returns_false_on_dsh_404(tmp_app_data):
+    """A 404 (the old PATCH symptom) must be reported as a failure, not success."""
+
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        return httpx.Response(
+            404,
+            json={"code": "NOT_FOUND", "error": "Endpoint not found"},
+        )
+
+    ok = agent_gateway.gateway.update_session_model(
+        "sess-42", "deepseek/deepseek-reasoner", transport=_transport(handler)
+    )
+    assert ok is False
+    assert captured["method"] == "PUT"
+
+
+def test_stream_prompt_includes_model_when_provided():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content or b"{}")
+        body = _assemble([
+            ("delta", json.dumps({"delta": "ok"})),
+            ("done", "[DONE]"),
+        ])
+        return _sse_response(body)
+
+    events = list(
+        agent_gateway.gateway.stream_prompt(
+            "sess-1",
+            "hello",
+            model="openai/gpt-4o",
+            transport=_transport(handler),
+        )
+    )
+    assert events[-1].kind == "completed"
+    assert captured["body"]["provider"] == "openai"
+    assert captured["body"]["model"] == "gpt-4o"
+
+def test_project_workspace_dir_format_and_traversal(tmp_app_data):
+    from app.services.agent_gateway import (
+        project_workspace_dir,
+        ensure_project_workspace_dir,
+        AgentGatewayError,
+    )
+
+    p1 = project_workspace_dir("1")
+    assert p1.name == "project-1"
+    assert project_workspace_dir(1).name == "project-1"
+    assert project_workspace_dir("project-1").name == "project-1"
+
+    with pytest.raises(AgentGatewayError) as caught_traversal:
+        project_workspace_dir("../evil")
+    assert caught_traversal.value.category == "configuration"
+
+    with pytest.raises(AgentGatewayError) as caught_empty:
+        project_workspace_dir("")
+    assert caught_empty.value.category == "bad_response"
+
+    created = ensure_project_workspace_dir("42")
+    assert created.is_dir()
+    assert created.name == "project-42"
+
+
+def test_named_lock_pool_mutex_and_eviction():
+    from app.services.agent_gateway import NamedLockPool
+
+    pool = NamedLockPool()
+    assert pool.size() == 0
+
+    with pool.hold("proj-1"):
+        assert pool.size() == 1
+        with pool.hold("proj-2"):
+            assert pool.size() == 2
+
+    assert pool.size() == 0
+
+
+def test_ensure_session_with_project_id_provisions_project_workspace(tmp_app_data):
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content or b"{}")
+        calls.append((request.method, request.url.path, payload))
+        path = request.url.path
+        if request.method == "POST" and path.endswith("/workspaces"):
+            return httpx.Response(200, json={"ok": True, "data": {"id": "ws-proj-1"}})
+        if request.method == "POST" and path.endswith("/sessions"):
+            return httpx.Response(200, json={"ok": True, "data": {"sessionId": "sess-proj-1"}})
+        if request.method == "PUT" and path.endswith("/permission"):
+            return httpx.Response(200, json={"ok": True, "data": {}})
+        return httpx.Response(404, json={"ok": False})
+
+    handle = agent_gateway.gateway.ensure_session(
+        conversation_id="conv-test",
+        project_id=1,
+        title="测试项目对话",
+        transport=_transport(handler),
+    )
+
+    assert handle.session_id == "sess-proj-1"
+    assert handle.workspace_id == "ws-proj-1"
+    assert handle.cwd.endswith("project-1")
+    assert calls[0][2]["path"].endswith("project-1")
+    assert calls[0][2]["title"] == "casegen-project-1"
+
+
+def test_ensure_session_recovers_when_workspace_id_is_404(tmp_app_data):
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        payload = json.loads(request.content or b"{}")
+        calls.append((request.method, path, payload))
+        if request.method == "POST" and path.endswith("/sessions"):
+            if payload.get("workspaceId") == "stale-ws-404":
+                return httpx.Response(404, json={"ok": False, "error": "Workspace not found"})
+            return httpx.Response(200, json={"ok": True, "data": {"sessionId": "recovered-sess"}})
+        if request.method == "POST" and path.endswith("/workspaces"):
+            return httpx.Response(200, json={"ok": True, "data": {"id": "recreated-ws"}})
+        if request.method == "PUT" and path.endswith("/permission"):
+            return httpx.Response(200, json={"ok": True, "data": {}})
+        return httpx.Response(404, json={"ok": False})
+
+    handle = agent_gateway.gateway.ensure_session(
+        conversation_id="conv-recover",
+        project_id=99,
+        workspace_id="stale-ws-404",
+        transport=_transport(handler),
+    )
+
+    assert handle.session_id == "recovered-sess"
+    assert handle.workspace_id == "recreated-ws"
+    assert handle.cwd.endswith("project-99")
+    # Verify sequence: tried POST /sessions -> got 404 -> fallback POST /workspaces -> POST /sessions -> PUT /permission
+    methods = [c[0] for c in calls]
+    assert methods == ["POST", "POST", "POST", "PUT"]
+    assert calls[0][2]["workspaceId"] == "stale-ws-404"
+    assert calls[2][2]["workspaceId"] == "recreated-ws"
+
+
+
+# ---------------------------------------------------------------------------
+# Multi-segment model normalization (legacy UI concatenated the local
+# /api/models row name in front of the DSH provider/model id).
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_agent_model_repairs_legacy_three_segment_value():
+    # DSH GET /api/v1/models reports provider=magpie for id group/deepseek-flash.
+    assert agent_gateway.normalize_agent_model(
+        "DEEPSEEK/group/deepseek-flash"
+    ) == "magpie/group/deepseek-flash"
+
+
+def test_normalize_agent_model_keeps_legal_values_untouched():
+    for value in (
+        "magpie/group/deepseek-flash",
+        "deepseek-official/deepseek-flash",
+        "openai/gpt-4o",
+        "",
+        "single-token",
+    ):
+        assert agent_gateway.normalize_agent_model(value) == value
+
+
+def test_normalize_agent_model_leaves_unknown_three_segment_value_alone():
+    # Hand-typed values that cannot be positively identified are never guessed.
+    assert agent_gateway.normalize_agent_model(
+        "CUSTOM/vendor/my-model"
+    ) == "CUSTOM/vendor/my-model"
+
+
+def test_normalize_agent_model_is_data_driven_from_dsh_catalog():
+    agent_gateway._DSH_MODEL_PROVIDERS.clear()
+    agent_gateway._DSH_MODEL_IDS.clear()
+    agent_gateway._index_models({
+        "models": [
+            {"id": "group/deepseek-flash", "provider": "magpie"},
+            {"id": "deepseek-flash", "provider": "deepseek-official"},
+        ]
+    })
+    # A known provider prefix is preserved even with an extra slash.
+    assert agent_gateway.normalize_agent_model(
+        "magpie/group/deepseek-flash"
+    ) == "magpie/group/deepseek-flash"
+    # An unknown prefix is resolved against the catalog, not a hardcoded list.
+    assert agent_gateway.normalize_agent_model(
+        "DEEPSEEK/group/deepseek-flash"
+    ) == "magpie/group/deepseek-flash"
+
+
+def test_create_session_splits_legacy_three_segment_model_correctly(tmp_app_data):
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/sessions"):
+            captured["body"] = json.loads(request.content or b"{}")
+            return httpx.Response(200, json={"ok": True, "data": {"sessionId": "s"}})
+        return httpx.Response(404, json={"ok": False})
+
+    agent_gateway.gateway.create_session(
+        workspace_id="ws-1", model="DEEPSEEK/group/deepseek-flash",
+        transport=_transport(handler),
+    )
+    assert captured["body"]["provider"] == "magpie"
+    assert captured["body"]["model"] == "group/deepseek-flash"
+
+
+def test_list_models_returns_raw_dsh_data_and_indexes_providers(tmp_app_data):
+    payload = {
+        "defaultModel": {"provider": "magpie", "model": "workbuddy/hy4free", "reasoningEffort": "high"},
+        "models": [
+            {"id": "group/deepseek-flash", "provider": "magpie", "name": "Flash", "isDefault": False},
+            {"id": "deepseek-flash", "provider": "deepseek-official", "name": "DS Flash", "isDefault": False},
+        ],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path.endswith("/models")
+        return httpx.Response(200, json={"ok": True, "data": payload})
+
+    data = agent_gateway.gateway.list_models(transport=_transport(handler))
+    assert data == payload
+    assert "magpie" in agent_gateway._DSH_MODEL_PROVIDERS
+    assert agent_gateway._DSH_MODEL_IDS["group/deepseek-flash"] == "magpie"
+    # And the module-level wrapper is injectable as well.
+    assert agent_gateway.list_models(transport=_transport(handler)) == payload
+

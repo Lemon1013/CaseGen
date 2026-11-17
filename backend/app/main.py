@@ -21,14 +21,20 @@ from app.api.platform_data import router as platform_data_router
 from app.api.projects import router as projects_router
 from app.api.external_wikis import router as external_wikis_router
 from app.api.agent_chat import router as agent_chat_router
+from app.api.users import router as users_router
 from app import config
 from app.config import ensure_data_dirs
 from app.db import get_engine, init_db
 from app.services.auth import get_user_for_token
+from app.services.permissions import current_user, is_admin, snapshot_user
 from app.services.prompts_seed import seed_default_prompts
 from app.services.wiki_jobs import recover_ingest_jobs
 from app.services.task_jobs import recover_generation_jobs
-from app.services.projects import is_project_scoped_path, validate_request_project_scope
+from app.services.projects import (
+    is_project_scoped_path,
+    is_project_visibility_path,
+    validate_request_project_scope,
+)
 
 
 def _mount_frontend_dist(app: FastAPI) -> None:
@@ -80,6 +86,7 @@ def create_app() -> FastAPI:
         "/api/health",
         "/api/auth/bootstrap",
         "/api/auth/setup",
+        "/api/auth/register",
         "/api/auth/login",
         "/api/auth/logout",
         "/api/auth/session",
@@ -116,9 +123,15 @@ def create_app() -> FastAPI:
                         auth_session,
                         request.cookies.get(config.AUTH_COOKIE_NAME),
                     )
-                if user is None:
+                    # Freeze the identity WHILE the session is still open.
+                    # The ORM User becomes detached (and its attributes expire)
+                    # as soon as this `with` block closes; keeping it on the
+                    # request would make any later getattr(user, ...) attempt
+                    # a lazy refresh and raise DetachedInstanceError -> 500.
+                    identity = snapshot_user(user) if user is not None else None
+                if identity is None:
                     return JSONResponse({"detail": "Not authenticated"}, status_code=401)
-                request.state.user = user
+                request.state.user = identity
 
             if config.AUTH_ENABLED and unsafe:
                 origin = request.headers.get("origin")
@@ -143,6 +156,32 @@ def create_app() -> FastAPI:
                 return JSONResponse({"detail": "project_id is required"}, status_code=422)
             if project_raw is not None and not project_raw.isdigit():
                 return JSONResponse({"detail": "project_id must be a positive integer"}, status_code=422)
+            # Visibility fallback: a project hidden from ordinary users must
+            # be unreachable on project DATA paths such as /api/tasks and
+            # /api/cases, even though the scope check below deliberately skips
+            # the /api/projects/ prefix.  It applies only to real project-data
+            # paths: client.ts injects project_id into every /api request, so
+            # a global guard would also 404 GET /api/projects (the list the
+            # user needs in order to switch away) and GET /api/prompts (which
+            # must stay visible and editable for everyone).  The 404 wording
+            # matches the existing scope guard so a hidden project is
+            # indistinguishable from one that does not exist.
+            if (
+                project_raw
+                and project_raw.isdigit()
+                and config.AUTH_ENABLED
+                and current_user(request) is not None
+                and not is_admin(request)
+                and is_project_visibility_path(path)
+            ):
+                from app.models.entities import Project
+
+                with Session(get_engine()) as visibility_session:
+                    project = visibility_session.get(Project, int(project_raw))
+                    if project is not None and not bool(project.is_public):
+                        return JSONResponse(
+                            {"detail": "Resource not found in project"}, status_code=404
+                        )
             if project_raw and project_raw.isdigit() and is_project_scoped_path(path) and not path.startswith("/api/projects/"):
                 query_spaces = [
                     int(value)
@@ -187,6 +226,7 @@ def create_app() -> FastAPI:
     app.include_router(platform_data_router)
     app.include_router(projects_router)
     app.include_router(external_wikis_router)
+    app.include_router(users_router)
     # Agent plane (line A).  Registered last so its /api/agent prefix can never
     # shadow an existing route, and before the SPA catch-all mount.
     app.include_router(agent_chat_router)

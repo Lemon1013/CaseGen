@@ -771,12 +771,14 @@ function openLiveStream(id: number) {
   if (!isLiveGeneration.value || id !== taskId.value || liveStreamSource || liveStreamReconnectTimer != null) {
     return
   }
+  const streamProjectId = task.value?.project_id ?? projectId.value
+  if (!streamProjectId) return
   if (liveStreamTaskId !== id) {
     liveStreamTaskId = id
     liveStreamReconnectAttempts = 0
   }
   liveStreamConnecting.value = true
-  const source = new EventSource(taskStreamUrl(id))
+  const source = new EventSource(taskStreamUrl(id, streamProjectId))
   liveStreamSource = source
 
   source.onopen = () => {

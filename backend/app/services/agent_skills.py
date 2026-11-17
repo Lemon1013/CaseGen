@@ -157,4 +157,4 @@ def skill_prompt_prefix(name: str) -> str:
     skill = find_skill(name)
     if skill is None:
         return ""
-    return f"本次对话请以 {skill.description} 技能为准开展工作。\n\n"
+    return f"本次对话请以 {skill.name}（{skill.description}）技能为准开展工作。\n\n"

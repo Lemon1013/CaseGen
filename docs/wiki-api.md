@@ -100,10 +100,30 @@ Review 详情的 `source_evidence` 使用 `{document_id, chunk_ids, clauses}`；
 
 建议顺序：先 `GET revisions` 确认目标 → 执行 rollback → 再 `GET page`、`GET revisions` 和 `POST retrieve` 验证。回滚是立即发布操作，当前没有额外 Review 阶段；无效页面、历史版本或目标参数分别返回 404/422。
 
-## 5. 常见错误与安全边界
+## 5. 本地账号与公开注册
+
+认证使用 HttpOnly Cookie 会话（`admin` / `user` 两类角色）。除 `GET` 等安全方法外，浏览器请求仍需携带同源 `Origin` 或 `Referer`；注册和改密接口同样受全局 CSRF 边界保护。
+
+| 方法 | 路径 | 权限 | 用途 |
+|---|---|---|---|
+| `GET` | `/api/auth/bootstrap` | 匿名 | 返回 `setup_required`、当前用户和 `registration_enabled` |
+| `POST` | `/api/auth/register` | 匿名 | 自助注册并自动登录 |
+| `POST` | `/api/auth/change-password` | 登录用户 | 校验当前密码后修改自己的密码 |
+| `GET` | `/api/auth/registration-setting` | 管理员 | 读取公开注册开关 |
+| `PUT` | `/api/auth/registration-setting` | 管理员 | 修改公开注册开关 |
+
+`GET /api/auth/bootstrap` 的 `registration_enabled` 在 `setup_required=true` 时固定为 `false`；初始化完成后返回运行时开关。开关默认来自 `CASEGEN_ALLOW_REGISTRATION`（默认 `true`），管理员修改后写入 SQLite 的 `app_settings` 表并立即生效，无需重启。
+
+`POST /api/auth/register` 请求体只接受 `username`、`display_name` 和 `password`；新账号固定为 `role=user`、`is_active=true`，请求中夹带的 `role` 等字段不会生效。用户名经规范化后必须为 3–32 位、以字母开头且仅含小写字母、数字、`.`、`_`、`-`；密码至少 10 位。成功返回 `201` 和与登录相同的 `{user, expires_at}`，并写入会话 Cookie 与 CSRF Cookie。业务错误：注册开关关闭返回 `403`（`公开注册已关闭`），系统尚无用户返回 `409`（`请先完成初始化`），用户名重复返回 `409`（`用户名已存在`），用户名或密码格式不合法返回 `422`。
+
+`POST /api/auth/change-password` 请求体为 `{current_password, new_password}`。当前密码错误返回 `400`；新密码不足 10 位、过长或与当前密码相同返回 `422`；未登录由全局中间件返回 `401`。成功后返回 `200`（`密码已修改，请重新登录`），删除该用户的全部 `AuthSession` 并清理响应中的会话/CSRF Cookie，因此当前会话和其他设备上的会话都必须重新登录。本系统不提供邮箱验证或找回密码；忘记密码仍由管理员通过用户管理接口重置。
+
+`GET/PUT /api/auth/registration-setting` 仅管理员可访问，响应和请求体均为 `{"enabled": bool}`；普通用户返回 `403`。
+
+## 6. 常见错误与安全边界
 
 `GET /api/tasks/{task_id}/citations` 对旧任务保持兼容。每条引用增加 `available`、`legacy` 和 `legacy_reason`：目标 Wiki 页面或 SourceChunk 仍存在时 `available=true`；目标无法关联时返回 `legacy=true`，前端展示任务保存的历史摘录，不会把失效路径伪装成可打开链接。
 
 `404` 表示文档、Job、页面、审核项、revision 或原文块不存在；`409` 表示重复处理、并发状态不允许或 merge 候选不能自动批准；`422` 表示候选/历史内容不符合 Wiki Schema、回滚参数不完整或提供了未知字段；上传扩展名/大小错误通常返回 `400`。
 
-当前 API 没有用户认证和角色权限控制，应用还允许跨域 `*`。不要把后端端口直接暴露到不受信网络；应由内网、防火墙或已认证的反向代理保护 Review、模型配置和上传接口。
+当前 API 已有本地账号 + HttpOnly Cookie 会话认证（`admin` / `user` 两类角色）、全局认证中间件，以及 Origin/Referer 同源校验与 X-CSRF-Token 双提交校验；CORS 为 `allow_credentials=True` 加显式 `CORS_ORIGINS` 白名单（配置中的 `*` 通配符会被忽略），并非允许任意跨域。但仍属于单机/内网信任环境：配置类管理端点（用户管理、模型配置写操作、项目增删改、共享 Wiki 管理）已有管理员门禁，业务链路中的写入端点按设计对登录用户保持可用，由项目作用域与前端菜单可见性约束；模型 `api_key` 以明文存于本地库。不要把后端端口直接暴露到不受信网络；应由内网、防火墙或已认证的反向代理保护 Review、模型配置和上传接口。

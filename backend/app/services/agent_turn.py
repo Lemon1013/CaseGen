@@ -25,6 +25,7 @@ import logging
 import threading
 import time
 from datetime import datetime, timezone
+from contextlib import nullcontext
 from typing import Any, Optional
 
 import httpx
@@ -240,28 +241,58 @@ def _load_turn_inputs(conversation_id: str) -> Optional[dict[str, Any]]:
             .where(AgentMessage.role == "user")
             .order_by(col(AgentMessage.created_at).desc(), col(AgentMessage.id).desc())
         ).first()
+
+        project_workspace_id = None
+        project_workspace_dir = ""
+        if conversation.project_id:
+            try:
+                pid = int(conversation.project_id)
+                project = session.get(Project, pid)
+                if project is not None:
+                    project_workspace_id = project.dsh_workspace_id
+                    project_workspace_dir = project.workspace_dir
+            except (ValueError, TypeError):
+                pass
+
         return {
             "title": conversation.title or "",
             "model": conversation.model,
             "skill_name": conversation.skill_name,
             "dsh_session_id": conversation.dsh_session_id,
-            "dsh_workspace_id": conversation.dsh_workspace_id,
+            "dsh_workspace_id": project_workspace_id or conversation.dsh_workspace_id,
+            "workspace_dir": project_workspace_dir or conversation.workspace_dir,
             "project_id": conversation.project_id or "",
             "prompt": (last_user.content if last_user is not None else "") or "",
         }
 
 
 def _persist_session_ids(
-    conversation_id: str, session_id: str, workspace_id: str, workspace_dir: str
+    conversation_id: str,
+    session_id: str,
+    workspace_id: str,
+    workspace_dir: str,
+    project_id: Optional[str] = None,
 ) -> None:
     with Session(get_engine()) as session:
         conversation = session.get(AgentConversation, str(conversation_id))
-        if conversation is None:
-            return
-        conversation.dsh_session_id = str(session_id)
-        conversation.dsh_workspace_id = str(workspace_id or "")
-        conversation.workspace_dir = str(workspace_dir or "")
-        session.add(conversation)
+        if conversation is not None:
+            conversation.dsh_session_id = str(session_id)
+            conversation.dsh_workspace_id = str(workspace_id or "")
+            conversation.workspace_dir = str(workspace_dir or "")
+            session.add(conversation)
+
+        target_pid = project_id or (conversation.project_id if conversation else None)
+        if target_pid:
+            try:
+                pid = int(target_pid)
+                project = session.get(Project, pid)
+                if project is not None:
+                    project.dsh_workspace_id = str(workspace_id or "")
+                    project.workspace_dir = str(workspace_dir or "")
+                    session.add(project)
+            except (ValueError, TypeError):
+                pass
+
         session.commit()
 
 
@@ -325,24 +356,35 @@ def _knowledge_space_dirs(project_id: str) -> list[str]:
         return []
     try:
         with Session(get_engine()) as session:
+            project = session.get(Project, pid)
             try:
                 space_ids = project_space_ids(session, pid)
             except Exception:
                 # Project deleted / inactive must not break the chat turn.
-                return []
-            project = session.get(Project, pid)
-            preferred = (
-                int(project.default_wiki_space_id)
-                if project is not None and project.default_wiki_space_id is not None
-                else None
-            )
-            ordered = ([preferred] if preferred in space_ids else []) + [
-                sid for sid in space_ids if sid != preferred
-            ]
+                space_ids = []
+
+            ordered_sids: list[int] = []
+            if project is not None and project.default_wiki_space_id is not None:
+                try:
+                    pref_id = int(project.default_wiki_space_id)
+                    pref_space = session.get(WikiSpace, pref_id)
+                    if pref_space is not None and getattr(pref_space, "status", "active") == "active":
+                        ordered_sids.append(pref_id)
+                except (TypeError, ValueError):
+                    pass
+
+            for sid in space_ids:
+                try:
+                    s_id = int(sid)
+                    if s_id not in ordered_sids:
+                        ordered_sids.append(s_id)
+                except (TypeError, ValueError):
+                    pass
+
             dirs: list[str] = []
-            for sid in ordered:
+            for sid in ordered_sids:
                 space = session.get(WikiSpace, int(sid))
-                if space is None:
+                if space is None or getattr(space, "status", "active") != "active":
                     continue
                 try:
                     root = ensure_space_dirs(space)
@@ -518,22 +560,58 @@ def run_turn(
             agent_stream.status(conversation_id, status=_BUSY_STATUS, message=_STATUS_STREAMING)
             dsh_session_id = str(inputs.get("dsh_session_id") or "").strip()
             if not dsh_session_id:
-                provisioned = agent_gateway.ensure_session(
-                    conversation_id=conversation_id,
-                    title=inputs.get("title") or "",
-                    model=inputs.get("model"),
-                    workspace_id=inputs.get("dsh_workspace_id"),
-                    agent_preset=getattr(config, "AGENT_PRESET", "") or None,
+                project_id = inputs.get("project_id")
+                lock_ctx = (
+                    agent_gateway.project_locks.hold(str(project_id))
+                    if project_id
+                    else nullcontext()
+                )
+                with lock_ctx:
+                    ws_id = inputs.get("dsh_workspace_id")
+                    ws_dir = inputs.get("workspace_dir")
+                    if project_id and not ws_id:
+                        with Session(get_engine()) as s:
+                            try:
+                                p = s.get(Project, int(project_id))
+                                if p and p.dsh_workspace_id:
+                                    ws_id = p.dsh_workspace_id
+                                    ws_dir = p.workspace_dir
+                            except Exception:
+                                pass
+
+                    provisioned = agent_gateway.ensure_session(
+                        conversation_id=conversation_id,
+                        project_id=project_id,
+                        workspace_dir=ws_dir,
+                        title=inputs.get("title") or "",
+                        model=inputs.get("model"),
+                        workspace_id=ws_id,
+                        agent_preset=getattr(config, "AGENT_PRESET", "") or None,
+                        transport=transport,
+                    )
+                    dsh_session_id = provisioned.session_id
+                    active_handle.touch()
+                    _persist_session_ids(
+                        conversation_id,
+                        provisioned.session_id,
+                        provisioned.workspace_id,
+                        provisioned.cwd,
+                        project_id=project_id,
+                    )
+            elif inputs.get("model") is not None:
+                # A False return means DSH refused / ignored the switch and
+                # would silently keep the previous model.  Turn that into a
+                # visible failed turn instead of running with the wrong model.
+                switched = agent_gateway.update_session_model(
+                    dsh_session_id,
+                    inputs.get("model"),
                     transport=transport,
                 )
-                dsh_session_id = provisioned.session_id
-                active_handle.touch()
-                _persist_session_ids(
-                    conversation_id,
-                    provisioned.session_id,
-                    provisioned.workspace_id,
-                    provisioned.cwd,
-                )
+                if not switched:
+                    raise AgentGatewayError(
+                        "模型切换失败，请稍后重试或新建对话。",
+                        category="http_error",
+                    )
 
             stop_event.clear()
             watchdog_thread = threading.Thread(
@@ -552,6 +630,7 @@ def run_turn(
             for event in agent_gateway.stream_prompt(
                 dsh_session_id,
                 prompt,
+                model=inputs.get("model"),
                 should_stop=active_handle.should_stop,
                 stats=stats,
                 transport=transport,

@@ -153,6 +153,50 @@ def is_project_scoped_path(path: str) -> bool:
     return any(path == prefix or path.startswith(prefix + "/") for prefix in _PROJECT_SCOPED_PREFIXES)
 
 
+# Paths that actually carry project-scoped business data.  The visibility
+# guard only applies here: client.ts injects a project_id into *every* /api
+# request, so a global guard would also block /api/projects (the list a user
+# needs to switch away from a hidden project), /api/prompts (globally visible
+# and editable), and the auth/user/model management planes.
+_VISIBILITY_SCOPED_PREFIXES = (
+    # Detail/sub-resource paths are project data too; the bare list
+    # (/api/projects) is excluded by is_project_visibility_path below.
+    "/api/projects/",
+    "/api/documents",
+    "/api/wiki-spaces",
+    "/api/ingest-jobs",
+    "/api/wiki/",
+    "/api/source-chunks",
+    "/api/requirements",
+    "/api/tasks",
+    "/api/cases",
+    "/api/data-pools",
+    "/api/platforms",
+    "/api/platform-cases",
+    "/api/platform-semantic-cases",
+    "/api/platform-renders",
+    "/api/agent",
+)
+
+
+def is_project_visibility_path(path: str) -> bool:
+    """Whether a hidden project must be rejected with 404 on this path.
+
+    Deliberately excludes the bare ``/api/projects`` list (it filters
+    is_public itself and is the escape hatch when the cached project becomes
+    hidden) and all global endpoints: /api/prompts, /api/auth/*, /api/users,
+    /api/models.  ``/api/projects/{id}`` detail stays guarded so a hidden
+    project cannot be opened directly by id.
+    """
+
+    if path == "/api/projects" or path == "/api/projects/":
+        return False
+    return any(
+        path == prefix or path.startswith(prefix if prefix.endswith("/") else prefix + "/")
+        for prefix in _VISIBILITY_SCOPED_PREFIXES
+    )
+
+
 def require_request_project(request: Request, target_project_id: int) -> int:
     """Require the authenticated request context to match a body/path target."""
 

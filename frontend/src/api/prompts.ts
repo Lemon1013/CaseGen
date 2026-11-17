@@ -2,6 +2,7 @@ import { api } from './client'
 
 export type PromptType =
   | 'generate'
+  | 'test_points'
   | 'review'
   | 'optimize'
   | 'wiki_analyze'
@@ -58,6 +59,7 @@ export function deletePrompt(id: number) {
 
 export const PROMPT_TYPE_OPTIONS: { value: PromptType; label: string }[] = [
   { value: 'generate', label: '生成 (generate)' },
+  { value: 'test_points', label: '测试点生成 (test_points)' },
   { value: 'review', label: '评审 (review)' },
   { value: 'optimize', label: '优化 (optimize)' },
   { value: 'wiki_analyze', label: 'Wiki 分析 (wiki_analyze)' },

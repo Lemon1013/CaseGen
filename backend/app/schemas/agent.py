@@ -101,6 +101,23 @@ class AgentSkillOut(BaseModel):
     path: str = ""
 
 
+class AgentModelItem(BaseModel):
+    """One DSH model; ``value`` is the legal ``provider/id`` string."""
+
+    id: str
+    provider: str
+    name: str = ""
+    is_default: bool = False
+    value: str = ""
+
+
+class AgentModelsOut(BaseModel):
+    models: List[AgentModelItem] = Field(default_factory=list)
+    default_provider: str = ""
+    default_model: str = ""
+    default_reasoning_effort: str = ""
+
+
 class AgentDraftCaseStepIn(BaseModel):
     """One step of an agent-produced case (mirrors DraftCaseStepOut)."""
 

@@ -59,7 +59,14 @@ class Project(SQLModel, table=True):
     slug: str = Field(index=True, unique=True)
     description: str = ""
     status: str = Field(default="active", index=True)
+    # When false, ordinary users cannot select this project in the UI and the
+    # middleware rejects any project-scoped request that targets it (404).
+    # Administrators always see every project.  Defaults to visible so an
+    # upgrade never hides existing data.
+    is_public: bool = Field(default=True, index=True)
     default_wiki_space_id: Optional[int] = Field(default=None, index=True)
+    dsh_workspace_id: Optional[str] = None
+    workspace_dir: str = ""
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow, sa_column_kwargs={"onupdate": _utcnow})
 
@@ -817,7 +824,14 @@ class TestCaseOperationLog(SQLModel, table=True):
 
 
 class User(SQLModel, table=True):
-    """Local CaseGen account; this release supports one initial admin."""
+    """Local CaseGen account.
+
+    The first account is created through `/api/auth/setup` and is always an
+    admin; subsequent accounts are managed through `/api/users`.  ``role`` is
+    deliberately kept as a plain string column: the accepted values are
+    ``'admin'`` and ``'user'`` (see ``app.services.permissions.ROLES``), and a
+    DB enum would require a schema migration for no functional benefit.
+    """
 
     __tablename__ = "users"
 
@@ -825,7 +839,7 @@ class User(SQLModel, table=True):
     username: str = Field(index=True, unique=True)
     display_name: str = ""
     password_hash: str
-    role: str = "admin"
+    role: str = "admin"  # 'admin' | 'user'
     is_active: bool = True
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow, sa_column_kwargs={"onupdate": _utcnow})
@@ -844,6 +858,24 @@ class AuthSession(SQLModel, table=True):
     created_at: datetime = Field(default_factory=_utcnow)
     user_agent: Optional[str] = None
     ip: Optional[str] = None
+
+
+class SystemSetting(SQLModel, table=True):
+    """Small key/value store for runtime-editable application settings.
+
+    Most configuration stays in ``app.config`` and is read from environment
+    variables at startup.  A few switches (currently only public
+    registration) must be changeable by an administrator without restarting
+    the process, so they are persisted here and fall back to the configured
+    default when no row exists yet.
+    """
+
+    __tablename__ = "app_settings"
+
+    key: str = Field(primary_key=True)
+    value: str
+    updated_at: datetime = Field(default_factory=_utcnow, sa_column_kwargs={"onupdate": _utcnow})
+
 
 def _uuid_hex() -> str:
     # String primary keys keep agent rows addressable across restarts and avoid
@@ -865,6 +897,10 @@ class AgentConversation(SQLModel, table=True):
 
     id: str = Field(default_factory=_uuid_hex, primary_key=True)
     project_id: str = Field(index=True)
+    # Conversations are private to the signed-in user; even administrators
+    # cannot read another user's chat.  Nullable for legacy rows and for the
+    # AUTH_ENABLED=False compatibility mode used by the pipeline tests.
+    user_id: Optional[int] = Field(default=None, foreign_key="users.id", index=True)
     title: str = ""
     dsh_session_id: Optional[str] = None
     # DSH sessions have no ``cwd`` field: the working directory comes from a

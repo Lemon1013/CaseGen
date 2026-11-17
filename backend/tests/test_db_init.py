@@ -5,7 +5,7 @@ import pytest
 from sqlalchemy import text
 from sqlmodel import Session, select
 
-from app.db import get_engine, init_db
+from app.db import _migrate_prompt_single_active, get_engine, init_db
 from app.db import reset_engine
 from app.models import entities
 from app.models.entities import ModelConfig, Requirement
@@ -109,6 +109,18 @@ def test_init_db_creates_expected_tables(tmp_app_data):
         "task_events",
     }
     assert expected.issubset(table_names)
+    # Visibility/ownership columns added by the migration must exist on a
+    # freshly initialized database (init_db runs on every create_app).
+    with engine.connect() as conn:
+        project_cols = {
+            str(row[1]) for row in conn.execute(text("PRAGMA table_info(projects)"))
+        }
+        conversation_cols = {
+            str(row[1])
+            for row in conn.execute(text("PRAGMA table_info(agent_conversations)"))
+        }
+    assert "is_public" in project_cols
+    assert "user_id" in conversation_cols
 
 
 def test_model_config_roundtrip(tmp_app_data):
@@ -277,3 +289,57 @@ def test_case_migration_blocks_empty_or_blank_legacy_case_key_before_ddl(
     assert stored_case_key == legacy_case_key
     assert "uq_test_cases_source_identity" not in index_names
     assert "uq_test_cases_requirement_case_key_normalized" not in index_names
+
+
+def test_prompt_single_active_index_exists(tmp_app_data):
+    init_db()
+    with get_engine().connect() as conn:
+        index_sql = conn.execute(
+            text(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type = 'index' AND name = 'uq_prompt_templates_single_active'"
+            )
+        ).scalar_one()
+    assert "WHERE is_active = 1" in index_sql
+    assert "type <> 'generate'" in index_sql
+
+
+def test_prompt_single_active_migration_normalizes_duplicates(tmp_app_data):
+    init_db()
+    engine = get_engine()
+    with engine.begin() as conn:
+        conn.execute(text("DROP INDEX IF EXISTS uq_prompt_templates_single_active"))
+        conn.execute(
+            text(
+                "INSERT INTO prompt_templates "
+                "(name, type, content, version, is_active, created_at, updated_at) "
+                "VALUES ('review-old', 'review', 'old', 1, 1, CURRENT_TIMESTAMP, "
+                "'2020-01-01 00:00:00')"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO prompt_templates "
+                "(name, type, content, version, is_active, created_at, updated_at) "
+                "VALUES ('review-new', 'review', 'new', 2, 1, CURRENT_TIMESTAMP, "
+                "'2021-01-01 00:00:00')"
+            )
+        )
+
+    _migrate_prompt_single_active(engine, create_index=True)
+
+    with engine.connect() as conn:
+        active = conn.execute(
+            text(
+                "SELECT name FROM prompt_templates "
+                "WHERE type = 'review' AND is_active = 1"
+            )
+        ).fetchall()
+        index_sql = conn.execute(
+            text(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type = 'index' AND name = 'uq_prompt_templates_single_active'"
+            )
+        ).scalar_one()
+    assert active == [("review-new",)]
+    assert "WHERE is_active = 1" in index_sql

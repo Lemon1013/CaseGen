@@ -633,7 +633,10 @@ def _migrate_project_schema(engine, *, backfill: bool = False) -> None:
             CREATE TABLE IF NOT EXISTS projects (
                 id INTEGER PRIMARY KEY, name VARCHAR NOT NULL, slug VARCHAR NOT NULL,
                 description VARCHAR NOT NULL DEFAULT '', status VARCHAR NOT NULL DEFAULT 'active',
-                default_wiki_space_id INTEGER, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                default_wiki_space_id INTEGER,
+                dsh_workspace_id VARCHAR,
+                workspace_dir VARCHAR NOT NULL DEFAULT '',
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
         """))
@@ -641,6 +644,10 @@ def _migrate_project_schema(engine, *, backfill: bool = False) -> None:
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_projects_status ON projects(status)"))
 
         additions = {
+            "projects": {
+                "dsh_workspace_id": "VARCHAR",
+                "workspace_dir": "VARCHAR NOT NULL DEFAULT ''",
+            },
             "wiki_spaces": {
                 "scope": "VARCHAR NOT NULL DEFAULT 'project'",
                 "project_id": "INTEGER",
@@ -782,6 +789,134 @@ def _migrate_project_schema(engine, *, backfill: bool = False) -> None:
         conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_wiki_spaces_shared_namespace ON wiki_spaces(namespace) WHERE scope = 'shared'"))
 
 
+def _migrate_user_visibility_schema(engine) -> None:
+    """Add project visibility and agent-conversation ownership columns.
+
+    Follows the existing idempotent ``PRAGMA table_info`` + ``ALTER TABLE``
+    pattern.  Every statement is safe to run on every ``create_app`` call:
+
+    - ``projects.is_public`` defaults to 1 so existing projects stay visible;
+    - ``agent_conversations.user_id`` is nullable, and only rows that are
+      still NULL are ever backfilled.  New conversations always carry an
+      explicit owner, so a repeated run can never reassign another user's
+      chat to the bootstrap administrator.
+    """
+
+    with engine.begin() as conn:
+        project_cols = conn.execute(text("PRAGMA table_info(projects)")).fetchall()
+        if project_cols:
+            project_names = {str(row[1]) for row in project_cols}
+            if "is_public" not in project_names:
+                conn.execute(
+                    text(
+                        "ALTER TABLE projects ADD COLUMN is_public BOOLEAN NOT NULL DEFAULT 1"
+                    )
+                )
+            # Covers legacy rows written before the column existed as well as
+            # any hand-edited NULLs; idempotent and never hides data.
+            conn.execute(
+                text("UPDATE projects SET is_public = 1 WHERE is_public IS NULL")
+            )
+            conn.execute(
+                text("CREATE INDEX IF NOT EXISTS ix_projects_is_public ON projects(is_public)")
+            )
+
+        conv_cols = conn.execute(
+            text("PRAGMA table_info(agent_conversations)")
+        ).fetchall()
+        if conv_cols:
+            conv_names = {str(row[1]) for row in conv_cols}
+            if "user_id" not in conv_names:
+                conn.execute(
+                    text(
+                        "ALTER TABLE agent_conversations ADD COLUMN user_id INTEGER"
+                    )
+                )
+            # Bootstrap admin owns pre-existing (ownerless) conversations:
+            # the earliest administrator, or the earliest account if no admin
+            # role exists yet.  Only NULL rows are touched, so a repeated run
+            # can never reassign a conversation that already has an owner.
+            user_cols = conn.execute(text("PRAGMA table_info(users)")).fetchall()
+            admin_id = None
+            if user_cols:
+                admin_id = conn.execute(
+                    text(
+                        "SELECT id FROM users WHERE role = 'admin' ORDER BY id ASC LIMIT 1"
+                    )
+                ).scalar()
+                if admin_id is None:
+                    admin_id = conn.execute(
+                        text("SELECT id FROM users ORDER BY id ASC LIMIT 1")
+                    ).scalar()
+            if admin_id is not None:
+                conn.execute(
+                    text(
+                        "UPDATE agent_conversations SET user_id = :admin_id "
+                        "WHERE user_id IS NULL"
+                    ),
+                    {"admin_id": int(admin_id)},
+                )
+            conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_agent_conversations_user_id "
+                    "ON agent_conversations(user_id)"
+                )
+            )
+
+
+def _migrate_agent_conversation_models(engine) -> None:
+    """Repair legacy three-segment Agent model values (idempotent).
+
+    The old UI built ``<local models.name>/<provider-model id>`` before
+    sending it to DSH, e.g. ``DEEPSEEK/group/deepseek-flash``.  DSH needs
+    ``magpie/group/deepseek-flash`` (GET /api/v1/models shows provider
+    magpie for id group/deepseek-flash) and silently falls back to its
+    default model for an unknown provider.
+
+    Only values whose FIRST segment exactly matches a row in the local
+    ``models`` table are considered dirty: that is the fingerprint of the
+    old concatenation bug.  Hand-typed or already-correct values (including
+    ``magpie/group/deepseek-flash`` and ``deepseek-official/deepseek-flash``)
+    are never touched.  The row is only written when the value changes, so
+    running init_db repeatedly is a no-op.
+    """
+
+    from app.services.agent_gateway import normalize_agent_model
+
+    with engine.begin() as conn:
+        conv_cols = conn.execute(
+            text("PRAGMA table_info(agent_conversations)")
+        ).fetchall()
+        if not conv_cols or "model" not in {str(row[1]) for row in conv_cols}:
+            return
+        model_cols = conn.execute(text("PRAGMA table_info(models)")).fetchall()
+        if not model_cols or "name" not in {str(row[1]) for row in model_cols}:
+            return
+        local_names = {
+            str(row[0]).strip()
+            for row in conn.execute(text("SELECT name FROM models")).fetchall()
+            if str(row[0]).strip()
+        }
+        if not local_names:
+            return
+        rows = conn.execute(
+            text("SELECT id, model FROM agent_conversations WHERE model IS NOT NULL")
+        ).fetchall()
+        for row_id, value in rows:
+            text_value = str(value or "").strip()
+            parts = text_value.split("/")
+            if len(parts) < 3 or parts[0].strip() not in local_names:
+                continue
+            corrected = normalize_agent_model(text_value)
+            if corrected == text_value:
+                continue
+            conn.execute(
+                text(
+                    "UPDATE agent_conversations SET model = :value WHERE id = :row_id"
+                ),
+                {"value": corrected, "row_id": row_id},
+            )
+
 def _migrate_external_wiki_schema(engine) -> None:
     """Create project_external_wikis table and index if not present."""
     with engine.begin() as conn:
@@ -806,6 +941,46 @@ def _migrate_external_wiki_schema(engine) -> None:
         conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_project_external_wikis_project_id ON project_external_wikis(project_id)"))
 
 
+def _migrate_prompt_single_active(engine, *, create_index: bool = False) -> None:
+    """Normalize legacy prompt rows and enforce one active non-generate row."""
+    with engine.begin() as conn:
+        table_exists = conn.execute(
+            text(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'prompt_templates'"
+            )
+        ).first()
+        if not table_exists:
+            return
+
+        rows = conn.execute(
+            text(
+                "SELECT id, type FROM prompt_templates "
+                "WHERE is_active = 1 AND type <> 'generate' "
+                "ORDER BY type, updated_at DESC, id DESC"
+            )
+        ).fetchall()
+        seen: set[str] = set()
+        for row in rows:
+            prompt_type = str(row[1])
+            if prompt_type in seen:
+                conn.execute(
+                    text("UPDATE prompt_templates SET is_active = 0 WHERE id = :id"),
+                    {"id": row[0]},
+                )
+            else:
+                seen.add(prompt_type)
+
+        if create_index:
+            conn.execute(
+                text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_prompt_templates_single_active "
+                    "ON prompt_templates(type) "
+                    "WHERE is_active = 1 AND type <> 'generate'"
+                )
+            )
+
+
 def init_db() -> None:
     from app.models import entities  # noqa: F401
     from app.services.wiki_migrate import backup_before_wiki_migration, migrate_wiki_schema
@@ -817,16 +992,26 @@ def init_db() -> None:
     backup_before_wiki_migration(engine)
     _migrate_model_defaults(engine)
     _migrate_project_schema(engine)
+    # Clean legacy multi-active prompt rows before create_all can encounter
+    # the partial unique index on prompt_templates.
+    _migrate_prompt_single_active(engine)
     # Wiki migration performs its backup before any create/alter/backfill
     # operation.  It also calls create_all so the new Wiki tables are present
     # before the remaining compatibility migration runs.
     migrate_wiki_schema(engine)
+    _migrate_prompt_single_active(engine, create_index=True)
     _migrate_project_schema(engine, backfill=True)
     _migrate_sqlite_columns(engine)
     _migrate_model_defaults(engine)
     _migrate_case_management_schema(engine)
     _migrate_test_design_schema(engine)
     _migrate_external_wiki_schema(engine)
+    # Runs last so SQLModel.metadata.create_all has already created the
+    # projects / users / agent_conversations tables on a fresh database.
+    _migrate_user_visibility_schema(engine)
+    # Runs after the visibility migration so the conversation table/columns
+    # definitely exist; idempotent and offline (never calls DSH).
+    _migrate_agent_conversation_models(engine)
 
 
 def get_session():

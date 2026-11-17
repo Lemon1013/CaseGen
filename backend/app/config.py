@@ -53,6 +53,11 @@ AUTH_COOKIE_NAME = os.getenv("CASEGEN_AUTH_COOKIE_NAME", "casegen_session")
 AUTH_CSRF_COOKIE_NAME = os.getenv("CASEGEN_AUTH_CSRF_COOKIE_NAME", "casegen_csrf")
 AUTH_SESSION_DAYS = max(1, int(os.getenv("CASEGEN_AUTH_SESSION_DAYS", "7")))
 AUTH_MAX_SESSIONS_PER_USER = max(1, int(os.getenv("CASEGEN_AUTH_MAX_SESSIONS", "8")))
+# Public self-service registration defaults to enabled; administrators can
+# still switch it off at runtime through /api/auth/registration-setting.
+ALLOW_REGISTRATION = os.getenv("CASEGEN_ALLOW_REGISTRATION", "true").strip().lower() in {
+    "1", "true", "yes", "on"
+}
 _cookie_secure_raw = os.getenv("CASEGEN_AUTH_COOKIE_SECURE", "auto").strip().lower()
 AUTH_COOKIE_SECURE: bool | None = (
     None
@@ -89,7 +94,7 @@ AGENT_MAX_CONCURRENT = max(1, int(os.getenv("AGENT_MAX_CONCURRENT", "4")))
 # empty value to fall back to ``DATA_DIR / "agent-workspace"`` (test fixtures
 # redirect ``DATA_DIR`` to a temporary directory).  ``data/meta`` holds
 # plaintext model API keys and is never inside this root.
-AGENT_WORKSPACE_ROOT = os.getenv("AGENT_WORKSPACE_ROOT", "~/.casegen/agent-workspace").strip()
+AGENT_WORKSPACE_ROOT = os.getenv("AGENT_WORKSPACE_ROOT", "").strip()
 # DSH can take 5-8 minutes to emit the first token while a model loads, so the
 # read timeout must stay far above the LLM defaults.
 AGENT_FIRST_TOKEN_TIMEOUT_SEC = max(30, int(os.getenv("AGENT_FIRST_TOKEN_TIMEOUT_SEC", "600")))

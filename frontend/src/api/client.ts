@@ -11,11 +11,17 @@ export class ApiError extends Error {
 }
 
 type UnauthorizedHandler = (requestEpoch: number) => void | Promise<void>
+type ProjectInvalidHandler = () => void | Promise<void>
 let unauthorizedHandler: UnauthorizedHandler | null = null
+let projectInvalidHandler: ProjectInvalidHandler | null = null
 let authEpoch = 0
 
 export function setUnauthorizedHandler(handler: UnauthorizedHandler | null) {
   unauthorizedHandler = handler
+}
+
+export function setProjectInvalidHandler(handler: ProjectInvalidHandler | null) {
+  projectInvalidHandler = handler
 }
 
 export function getAuthEpoch() {
@@ -70,6 +76,9 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
     } catch {
       // Non-JSON gateway errors fall through to the status-aware message.
     }
+    if (res.status === 404 && /Project not found or inactive/i.test(detail)) {
+      void projectInvalidHandler?.()
+    }
     const translated = translateApiError(detail, res.status)
     if (res.status === 401 && !path.startsWith('/api/auth/')) {
       void unauthorizedHandler?.(requestEpoch)
@@ -99,6 +108,9 @@ export async function apiBlob(path: string, init?: RequestInit): Promise<Blob> {
   const res = await fetch(path, { ...init, headers, credentials: 'include' })
   if (!res.ok) {
     const text = await res.text()
+    if (res.status === 404 && /Project not found or inactive/i.test(text)) {
+      void projectInvalidHandler?.()
+    }
     if (res.status === 401 && !path.startsWith('/api/auth/')) {
       void unauthorizedHandler?.(requestEpoch)
     }
@@ -118,6 +130,7 @@ function translateApiError(detail: string, status: number) {
     [/Document not found/i, '文档不存在，请刷新列表后重试'],
     [/Wiki page not found/i, 'Wiki 页面不存在，可能已被归档或删除'],
     [/Source chunk not found/i, '原文块不存在，请重新摄入对应文档'],
+    [/Another active prompt of this type is already enabled/i, '该类型已有启用中的提示词，请先停用其他模板后再启用这条'],
   ]
   for (const [pattern, message] of rules) {
     if (pattern.test(detail)) return message

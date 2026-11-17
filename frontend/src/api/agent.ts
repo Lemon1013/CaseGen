@@ -67,6 +67,28 @@ export interface AgentSkillItem {
   path?: string
 }
 
+/**
+ * DSH 模型目录项（GET /api/agent/models，后端 AgentModelItem）。
+ * 与 /api/models 的 ModelConfig 完全无关：Agent 对话走 DSH agent 平面，
+ * 必须用 DSH 自己的 provider / id，否则 DSH 会静默回落到默认模型。
+ * `value` = `${provider}/${id}`，是可直接存进 conversation.model 的合法值。
+ */
+export interface AgentModelItem {
+  id: string
+  provider: string
+  name: string
+  is_default: boolean
+  value: string
+}
+
+/** GET /api/agent/models 响应体（后端 AgentModelsOut）。 */
+export interface AgentModelsResponse {
+  models: AgentModelItem[]
+  default_provider: string
+  default_model: string
+  default_reasoning_effort: string
+}
+
 /** 结构化进度（spec §3.6：优先读它，回退正则从 message 抠 [n/m]，都拿不到用不定进度条）。 */
 export interface AgentStreamProgress {
   current?: number
@@ -374,6 +396,15 @@ export function saveAgentConversationAsDraft(id: string, projectId?: AgentProjec
 
 export function listAgentSkills(projectId?: AgentProjectId | null) {
   return api<unknown>(`/api/agent/skills${_projectQuery(projectId)}`).then(normalizeSkillList)
+}
+
+/**
+ * 拉取 DSH 模型目录（不是 /api/models，那是旧 LLM 直连流水线的配置）。
+ * project_id 由 client.ts 自动注入，这里也显式拼一次更稳。
+ * DSH 不可达时后端返回 502，api() 会抛 ApiError，由调用方展示错误。
+ */
+export function listAgentModels(projectId?: AgentProjectId | null) {
+  return api<AgentModelsResponse>(`/api/agent/models${_projectQuery(projectId)}`)
 }
 
 /**

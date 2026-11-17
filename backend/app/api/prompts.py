@@ -2,11 +2,13 @@ from datetime import datetime, timezone
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, col, func, select
 
 from app.db import get_session
 from app.models.entities import GenerationTask, PromptRevision, PromptTemplate
 from app.schemas.prompts import PromptCreate, PromptOut, PromptUpdate
+from app.services.prompts_seed import MULTI_ACTIVE_PROMPT_TYPES
 
 router = APIRouter(prefix="/api/prompts", tags=["prompts"])
 
@@ -22,6 +24,28 @@ def _next_version(session: Session, prompt_type: str) -> int:
     if current is None:
         return 1
     return int(current) + 1
+
+
+def _deactivate_active_prompts(
+    session: Session,
+    prompt_type: str,
+    *,
+    exclude_id: int | None = None,
+) -> None:
+    if prompt_type in MULTI_ACTIVE_PROMPT_TYPES:
+        return
+    statement = select(PromptTemplate).where(
+        PromptTemplate.type == prompt_type,
+        PromptTemplate.is_active == True,  # noqa: E712
+    )
+    if exclude_id is not None:
+        statement = statement.where(PromptTemplate.id != exclude_id)
+    for row in session.exec(statement).all():
+        row.is_active = False
+        session.add(row)
+    # Flush deactivations before the caller activates another row; SQLite's
+    # partial unique index checks each statement, not the final transaction.
+    session.flush()
 
 
 @router.get("", response_model=List[PromptOut])
@@ -40,6 +64,8 @@ def create_prompt(
     body: PromptCreate,
     session: Session = Depends(get_session),
 ) -> PromptTemplate:
+    if body.is_active:
+        _deactivate_active_prompts(session, body.type)
     row = PromptTemplate(
         name=body.name,
         type=body.type,
@@ -48,7 +74,14 @@ def create_prompt(
         is_active=body.is_active,
     )
     session.add(row)
-    session.commit()
+    try:
+        session.commit()
+    except IntegrityError as exc:
+        session.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="Another active prompt of this type is already enabled",
+        ) from exc
     session.refresh(row)
     return row
 
@@ -72,11 +105,20 @@ def update_prompt(
         raise HTTPException(status_code=404, detail="Prompt not found")
 
     data = body.model_dump(exclude_unset=True)
+    if data.get("is_active") is True:
+        _deactivate_active_prompts(session, row.type, exclude_id=row.id)
     for key, value in data.items():
         setattr(row, key, value)
     row.updated_at = _utcnow()
     session.add(row)
-    session.commit()
+    try:
+        session.commit()
+    except IntegrityError as exc:
+        session.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="Another active prompt of this type is already enabled",
+        ) from exc
     session.refresh(row)
     return row
 

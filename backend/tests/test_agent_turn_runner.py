@@ -40,7 +40,7 @@ def _seed_conversation(conversation_id: str) -> None:
 
 
 def _monkeypatch_stream(monkeypatch, events):
-    def _stream_prompt(session_id, prompt, *, should_stop=None, stats=None, transport=None):
+    def _stream_prompt(session_id, prompt, *, model=None, should_stop=None, stats=None, transport=None):
         for event in events:
             yield event
 

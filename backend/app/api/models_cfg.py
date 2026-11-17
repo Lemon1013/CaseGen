@@ -1,13 +1,14 @@
 from datetime import datetime, timezone
 from typing import List
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlmodel import Session, select
 
 from app.db import get_session
 from app.models.entities import ModelConfig
 from app.schemas.models_cfg import ModelCreate, ModelOut, ModelPingOut, ModelUpdate
 from app.services.llm import LLMError, chat_completion
+from app.services.permissions import require_admin
 
 router = APIRouter(prefix="/api/models", tags=["models"])
 
@@ -63,8 +64,10 @@ def to_model_out(row: ModelConfig) -> ModelOut:
 @router.post("", response_model=ModelOut)
 def create_model(
     body: ModelCreate,
+    request: Request,
     session: Session = Depends(get_session),
 ) -> ModelOut:
+    require_admin(request)
     if body.is_default:
         _clear_default_siblings(session)
         session.flush()
@@ -101,8 +104,10 @@ def get_model(model_id: int, session: Session = Depends(get_session)) -> ModelOu
 def update_model(
     model_id: int,
     body: ModelUpdate,
+    request: Request,
     session: Session = Depends(get_session),
 ) -> ModelOut:
+    require_admin(request)
     row = session.get(ModelConfig, model_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Model not found")
@@ -121,7 +126,8 @@ def update_model(
 
 
 @router.delete("/{model_id}")
-def delete_model(model_id: int, session: Session = Depends(get_session)) -> dict:
+def delete_model(model_id: int, request: Request, session: Session = Depends(get_session)) -> dict:
+    require_admin(request)
     row = session.get(ModelConfig, model_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Model not found")
@@ -135,7 +141,14 @@ def delete_model(model_id: int, session: Session = Depends(get_session)) -> dict
 
 
 @router.post("/{model_id}/ping", response_model=ModelPingOut)
-def ping_model(model_id: int, session: Session = Depends(get_session)) -> ModelPingOut:
+def ping_model(
+    model_id: int,
+    request: Request,
+    session: Session = Depends(get_session),
+) -> ModelPingOut:
+    # Unsafe method that uses the stored plaintext api_key for an outbound
+    # call: keep it behind the same admin gate as the other config writes.
+    require_admin(request)
     row = session.get(ModelConfig, model_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Model not found")

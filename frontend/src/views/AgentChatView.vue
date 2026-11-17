@@ -11,7 +11,6 @@ import SkillPicker from '../components/agent/SkillPicker.vue'
 import CitationList from '../components/CitationList.vue'
 import { listCitations, type TaskCitation } from '../api/tasks'
 import type { AgentConversationItem, AgentSaveAsDraftResult } from '../api/agent'
-import type { ModelConfig } from '../api/models'
 
 /**
  * Agent 对话页（spec §3.6-3）。
@@ -70,15 +69,20 @@ const spaceId = computed<number | undefined>(() => {
 const conversations = computed(() => store.conversations)
 const current = computed(() => store.currentConversation)
 
+/** SkillPicker 的模型候选：DSH 的 provider/id 两段式，value 可直接落库。 */
 const modelOptions = computed(() =>
-  store.models.map((item) => ({ id: item.id, name: item.name, model_name: item.model_name })),
+  store.models.map((item) => ({
+    id: item.id,
+    provider: item.provider,
+    name: item.name,
+  })),
 )
 
-/** 展开区模型候选：沿用 SkillPicker 的「name/model_name」口径。 */
+/** 展开区模型候选：与 SkillPicker 同口径，标注 DSH 默认项。 */
 const modelCandidates = computed(() =>
-  store.models.map((item: ModelConfig) => ({
-    label: `${item.name}（${item.model_name}）`,
-    value: item.name ? `${item.name}/${item.model_name}` : item.model_name,
+  store.models.map((item) => ({
+    label: `${item.name}（${item.provider}/${item.id}）${item.is_default ? ' · DSH 默认' : ''}`,
+    value: item.value,
   })),
 )
 
@@ -167,14 +171,18 @@ async function saveCurrentConfig() {
   if (!current.value || store.isBusy) return
   configSaving.value = true
   try {
+    // 清空时传 null：后端 PATCH 用 model_fields_set 区分「未传」与「显式 null」，
+    // null 会把 conversation.model 置空，即回到 DSH 默认模型。
     await store.updateConversationConfig(
       currentSkillDraft.value || null,
       currentModelDraft.value.trim() || null,
     )
-    ElMessage.success('配置已保存，下一条消息起生效')
+    ElMessage.success('会话配置已更新并同步至 Agent')
     configExpanded.value = false
   } catch (error) {
-    ElMessage.error(`保存配置失败：${(error as Error).message}`)
+    // 后端在 DSH 拒绝切换模型时返回 502；绝不吞掉错误或谎报成功。
+    const detail = (error as { detail?: string } | null)?.detail || (error as Error).message
+    ElMessage.error(`模型切换失败，请稍后重试或新建对话：${detail}`)
   } finally {
     configSaving.value = false
   }
@@ -236,19 +244,19 @@ function syncQuery(conversationId: string | null) {
 async function onCloseConversation(conversation: AgentConversationItem) {
   try {
     await ElMessageBox.confirm(
-      `关闭会话「${conversation.title || conversation.id}」后将无法继续对话，历史记录仍会保留。确认关闭？`,
-      '关闭会话',
-      { confirmButtonText: '关闭会话', cancelButtonText: '取消', type: 'warning' },
+      `确定删除会话「${conversation.title || conversation.id}」？删除后该会话的消息记录将一并清理。`,
+      '删除会话',
+      { confirmButtonText: '删除会话', cancelButtonText: '取消', type: 'warning' },
     )
   } catch {
     return
   }
   try {
     await store.closeConversation(conversation.id)
-    ElMessage.success('会话已关闭')
-    if (conversation.id === store.currentId) syncQuery(null)
+    ElMessage.success('会话已删除')
+    syncQuery(store.currentId)
   } catch (error) {
-    ElMessage.error(`关闭会话失败：${(error as Error).message}`)
+    ElMessage.error(`删除会话失败：${(error as Error).message}`)
   }
 }
 
@@ -333,6 +341,19 @@ onUnmounted(() => {
       title="技能列表载入失败，可稍后重试"
       :description="store.skillsError"
     />
+    <el-alert
+      v-if="store.modelsError"
+      class="page-alert"
+      type="warning"
+      show-icon
+      :closable="false"
+      title="DSH 模型列表载入失败，可手动输入 provider/model 或稍后重试"
+      :description="store.modelsError"
+    >
+      <template #default>
+        <el-button size="small" link type="primary" @click="store.loadModels(true)">重试</el-button>
+      </template>
+    </el-alert>
 
     <div class="agent-layout" :class="{ 'layout--list-collapsed': listCollapsed }">
       <el-card shadow="never" class="block list-block">
@@ -423,7 +444,7 @@ onUnmounted(() => {
               link
               type="danger"
               class="conversation-close"
-              title="关闭会话"
+              title="删除会话"
               @click.stop="onCloseConversation(conversation)"
             >
               <el-icon><Delete /></el-icon>
@@ -512,22 +533,16 @@ onUnmounted(() => {
               </el-select>
             </div>
             <div class="config-field">
-              <label class="config-field-label">模型</label>
-              <el-input
-                :model-value="currentModelDraft"
-                placeholder="provider/model，留空则用后端默认"
-                clearable
-                :disabled="!store.agentAvailable || !current || store.isBusy"
-                class="config-field-control"
-                @update:model-value="onModelDraftChange"
-              />
-            </div>
-            <div v-if="modelCandidates.length" class="config-field">
-              <label class="config-field-label">已配置模型</label>
+              <label class="config-field-label">模型（选择或输入 DSH 的 provider/model）</label>
               <el-select
-                placeholder="从已配置模型选"
-                class="config-field-control"
+                :model-value="currentModelDraft"
+                placeholder="选择或输入 DSH 的 provider/model，留空则用 DSH 默认"
+                clearable
+                filterable
+                allow-create
+                default-first-option
                 :disabled="!store.agentAvailable || !current || store.isBusy"
+                class="config-field-control"
                 @update:model-value="onModelDraftChange"
               >
                 <el-option
@@ -588,7 +603,7 @@ onUnmounted(() => {
           </div>
           <div class="info-row">
             <dt>模型</dt>
-            <dd>{{ current.model || '后端默认' }}</dd>
+            <dd>{{ current.model || 'DSH 默认（' + store.defaultModelLabel + '）' }}</dd>
           </div>
           <div class="info-row">
             <dt>DSH 会话</dt>
@@ -798,11 +813,15 @@ onUnmounted(() => {
 
 .agent-layout {
   display: grid;
-  grid-template-columns: clamp(332px, 24vw, 368px) minmax(0, 1fr);
+  grid-template-columns: clamp(310px, 23vw, 356px) minmax(0, 1fr);
   gap: 0;
   flex: 1 1 auto;
   min-height: 0;
   overflow: hidden;
+  background: var(--cg-surface, #ffffff);
+  border: 1px solid var(--cg-border, #e4e4e7);
+  border-radius: var(--cg-radius-lg, 12px);
+  box-shadow: var(--cg-shadow);
   transition: grid-template-columns 260ms cubic-bezier(0.22, 1, 0.36, 1);
 }
 
@@ -1076,27 +1095,7 @@ onUnmounted(() => {
   padding: 4px 16px 20px;
 }
 
-/* 观感：气泡与输入框更舒展（只改样式，不动功能与 props/emit 契约） */
-.chat-block :deep(.bubble-body) {
-  padding: 12px 16px;
-  border-radius: var(--cg-radius-lg, 12px);
-  line-height: 1.7;
-}
 
-.chat-block :deep(.is-user .bubble-body),
-.chat-block :deep(.bubble-body.is-user-body) {
-  max-width: 88%;
-}
-
-.chat-block :deep(.panel-scroll) {
-  padding: 4px 10px 10px 4px;
-}
-
-.chat-block :deep(.chat-composer .el-textarea__inner) {
-  border-radius: var(--cg-radius, 8px);
-  padding: 10px 12px;
-  line-height: 1.6;
-}
 
 @media (max-width: 1280px) {
   .agent-layout {

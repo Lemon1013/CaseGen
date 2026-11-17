@@ -22,6 +22,7 @@ from app.schemas.wiki import IngestJobOut
 from app.services.document_delete import delete_document
 from app.services.parse_document import parse_document
 from app.services.paths import make_raw_filename, raw_path_for, relative_raw_stored_path
+from app.services.permissions import require_admin
 from app.services.source_chunks_store import replace_chunks_for_document
 from app.services.wiki_ingest import ingest_document
 from app.services.wiki_jobs import (
@@ -40,9 +41,7 @@ _INGEST_CHAT_FN = None
 def _require_shared_admin(request: Request, space) -> None:
     if space.scope != "shared" or not config.AUTH_ENABLED:
         return
-    user = getattr(request.state, "user", None)
-    if user is None or getattr(user, "role", "") != "admin":
-        raise HTTPException(status_code=403, detail="Shared Wiki spaces require an administrator")
+    require_admin(request, detail="Shared Wiki spaces require an administrator")
 
 
 def _document_or_404(session: Session, document_id: int) -> Document:

@@ -188,7 +188,7 @@ onMounted(load)
           <el-option label="已归档" value="archived" />
         </el-select>
         <el-button type="primary" @click="openCreate">新建空间</el-button>
-        <el-button v-if="auth.user?.role === 'admin'" type="danger" :loading="purgeLoading" @click="openPurge">清理归档 Wiki</el-button>
+        <el-button v-if="auth.isAdmin" type="danger" :loading="purgeLoading" @click="openPurge">清理归档 Wiki</el-button>
       </div>
     </div>
 

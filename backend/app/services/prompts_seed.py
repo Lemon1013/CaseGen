@@ -19,11 +19,15 @@ PROMPT_TYPES = (
     "data_description_parse",
 )
 
+# `generate` supports per-task template selection.  Every other type must
+# keep exactly one active row so prompt resolution is deterministic.
+MULTI_ACTIVE_PROMPT_TYPES = frozenset({"generate"})
+
 DEFAULT_PROMPTS_DIR = Path(__file__).resolve().parents[1] / "default_prompts"
 
 # Bump this only when the bundled prompt contract changes. Recognized v1 hashes
 # let existing installations upgrade without replacing a user-created prompt.
-BUNDLED_PROMPT_VERSION = 9
+BUNDLED_PROMPT_VERSION = 10
 _LEGACY_DEFAULT_HASHES: dict[str, frozenset[str]] = {
     "generate": frozenset(
         {
@@ -37,7 +41,11 @@ _LEGACY_DEFAULT_HASHES: dict[str, frozenset[str]] = {
             "d0880132a4281dbfc3f2b8e5b0e9e25fac0f9ccbf2a367175f926ba5498fb74b",
         }
     ),
-    "test_points": frozenset(),
+    "test_points": frozenset(
+        {
+            "109697d4cf72d2390c16b802abcc5c157777910f0594264497e162d4c66f4ba3",
+        }
+    ),
     "optimize": frozenset(
         {
             "ac8acfdc68fa6e00979b853dfcd33214892912444e629d9afbba0289e3d8a66b",
@@ -117,6 +125,23 @@ def seed_default_prompts(session: Session) -> None:
         if custom_active:
             # Multiple active templates are intentional.  A custom active
             # template must not be disabled or hidden by startup seeding.
+            # Keep the refreshed bundled test-point contract available as an
+            # inactive option so users can switch to it explicitly.
+            if ptype == "test_points" and not session.exec(
+                select(PromptTemplate).where(
+                    PromptTemplate.type == ptype,
+                    PromptTemplate.content == content,
+                )
+            ).first():
+                session.add(
+                    PromptTemplate(
+                        name=f"default_{ptype}",
+                        type=ptype,
+                        content=content,
+                        version=_next_version(session, ptype),
+                        is_active=False,
+                    )
+                )
             continue
 
         legacy_active = [
@@ -131,6 +156,10 @@ def seed_default_prompts(session: Session) -> None:
         for row in legacy_active:
             row.is_active = False
             session.add(row)
+        if legacy_active:
+            # Deactivate the old default before inserting the replacement;
+            # the partial unique index is checked per statement.
+            session.flush()
 
         session.add(
             PromptTemplate(
@@ -142,3 +171,30 @@ def seed_default_prompts(session: Session) -> None:
             )
         )
     session.commit()
+    normalize_single_active_prompts(session)
+
+
+def normalize_single_active_prompts(session: Session) -> None:
+    """Keep only the most recently updated active row for single-active types."""
+    prompt_types = session.exec(select(PromptTemplate.type).distinct()).all()
+    changed = False
+    for prompt_type in prompt_types:
+        if prompt_type in MULTI_ACTIVE_PROMPT_TYPES:
+            continue
+        active_rows = session.exec(
+            select(PromptTemplate)
+            .where(
+                PromptTemplate.type == prompt_type,
+                PromptTemplate.is_active == True,  # noqa: E712
+            )
+            .order_by(
+                col(PromptTemplate.updated_at).desc(),
+                col(PromptTemplate.id).desc(),
+            )
+        ).all()
+        for row in active_rows[1:]:
+            row.is_active = False
+            session.add(row)
+            changed = True
+    if changed:
+        session.commit()
