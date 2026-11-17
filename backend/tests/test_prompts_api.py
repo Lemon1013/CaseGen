@@ -1,3 +1,4 @@
+from datetime import datetime
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -7,7 +8,11 @@ from app.db import get_engine
 from app.main import create_app
 from app.models.entities import PromptTemplate
 from app.services import prompts_seed
-from app.services.prompts_seed import BUNDLED_PROMPT_VERSION, seed_default_prompts
+from app.services.prompts_seed import (
+    BUNDLED_PROMPT_VERSION,
+    normalize_single_active_prompts,
+    seed_default_prompts,
+)
 
 
 TEST_POINTS_V7 = (Path(__file__).parent / "fixtures" / "test_points_v7.md").read_text(encoding="utf-8")
@@ -45,6 +50,75 @@ def test_multiple_active_prompts_per_type(tmp_app_data):
     actives = [p for p in items if p["is_active"]]
     active_contents = {p["content"] for p in actives}
     assert {"A", "B"}.issubset(active_contents)
+
+
+def test_single_active_for_non_generate_prompt_types(tmp_app_data):
+    client = TestClient(create_app())
+    first = client.post(
+        "/api/prompts",
+        json={"name": "review-a", "type": "review", "content": "A", "is_active": True},
+    ).json()
+    second = client.post(
+        "/api/prompts",
+        json={"name": "review-b", "type": "review", "content": "B", "is_active": True},
+    ).json()
+
+    active = [p for p in client.get("/api/prompts", params={"type": "review"}).json() if p["is_active"]]
+    assert [p["id"] for p in active] == [second["id"]]
+
+    client.put(f"/api/prompts/{first['id']}", json={"is_active": True})
+    active = [p for p in client.get("/api/prompts", params={"type": "review"}).json() if p["is_active"]]
+    assert [p["id"] for p in active] == [first["id"]]
+
+
+def test_normalize_single_active_prompts_keeps_latest(tmp_app_data):
+    TestClient(create_app())
+    with Session(get_engine()) as session:
+        for row in session.exec(
+            select(PromptTemplate).where(PromptTemplate.type == "review")
+        ).all():
+            row.is_active = False
+            session.add(row)
+        older = PromptTemplate(
+            name="review-older",
+            type="review",
+            content="older",
+            version=1,
+            is_active=True,
+            updated_at=datetime(2020, 1, 1),
+        )
+        newer = PromptTemplate(
+            name="review-newer",
+            type="review",
+            content="newer",
+            version=2,
+            is_active=True,
+            updated_at=datetime(2021, 1, 1),
+        )
+        gen_a = PromptTemplate(name="gen-a", type="generate", content="a", version=1, is_active=True)
+        gen_b = PromptTemplate(name="gen-b", type="generate", content="b", version=2, is_active=True)
+        session.add(older)
+        session.add(newer)
+        session.add(gen_a)
+        session.add(gen_b)
+        session.commit()
+
+        normalize_single_active_prompts(session)
+        review_active = session.exec(
+            select(PromptTemplate).where(
+                PromptTemplate.type == "review",
+                PromptTemplate.is_active == True,  # noqa: E712
+            )
+        ).all()
+        generate_active = session.exec(
+            select(PromptTemplate).where(
+                PromptTemplate.type == "generate",
+                PromptTemplate.is_active == True,  # noqa: E712
+            )
+        ).all()
+
+    assert [row.id for row in review_active] == [newer.id]
+    assert {gen_a.id, gen_b.id}.issubset({row.id for row in generate_active})
 
 
 def test_default_prompts_seeded(tmp_app_data):
