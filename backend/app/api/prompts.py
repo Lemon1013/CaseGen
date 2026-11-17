@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, col, func, select
 
 from app.db import get_session
@@ -42,6 +43,9 @@ def _deactivate_active_prompts(
     for row in session.exec(statement).all():
         row.is_active = False
         session.add(row)
+    # Flush deactivations before the caller activates another row; SQLite's
+    # partial unique index checks each statement, not the final transaction.
+    session.flush()
 
 
 @router.get("", response_model=List[PromptOut])
@@ -70,7 +74,14 @@ def create_prompt(
         is_active=body.is_active,
     )
     session.add(row)
-    session.commit()
+    try:
+        session.commit()
+    except IntegrityError as exc:
+        session.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="Another active prompt of this type is already enabled",
+        ) from exc
     session.refresh(row)
     return row
 
@@ -100,7 +111,14 @@ def update_prompt(
         setattr(row, key, value)
     row.updated_at = _utcnow()
     session.add(row)
-    session.commit()
+    try:
+        session.commit()
+    except IntegrityError as exc:
+        session.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="Another active prompt of this type is already enabled",
+        ) from exc
     session.refresh(row)
     return row
 

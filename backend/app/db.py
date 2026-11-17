@@ -941,6 +941,46 @@ def _migrate_external_wiki_schema(engine) -> None:
         conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_project_external_wikis_project_id ON project_external_wikis(project_id)"))
 
 
+def _migrate_prompt_single_active(engine, *, create_index: bool = False) -> None:
+    """Normalize legacy prompt rows and enforce one active non-generate row."""
+    with engine.begin() as conn:
+        table_exists = conn.execute(
+            text(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'prompt_templates'"
+            )
+        ).first()
+        if not table_exists:
+            return
+
+        rows = conn.execute(
+            text(
+                "SELECT id, type FROM prompt_templates "
+                "WHERE is_active = 1 AND type <> 'generate' "
+                "ORDER BY type, updated_at DESC, id DESC"
+            )
+        ).fetchall()
+        seen: set[str] = set()
+        for row in rows:
+            prompt_type = str(row[1])
+            if prompt_type in seen:
+                conn.execute(
+                    text("UPDATE prompt_templates SET is_active = 0 WHERE id = :id"),
+                    {"id": row[0]},
+                )
+            else:
+                seen.add(prompt_type)
+
+        if create_index:
+            conn.execute(
+                text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_prompt_templates_single_active "
+                    "ON prompt_templates(type) "
+                    "WHERE is_active = 1 AND type <> 'generate'"
+                )
+            )
+
+
 def init_db() -> None:
     from app.models import entities  # noqa: F401
     from app.services.wiki_migrate import backup_before_wiki_migration, migrate_wiki_schema
@@ -952,10 +992,14 @@ def init_db() -> None:
     backup_before_wiki_migration(engine)
     _migrate_model_defaults(engine)
     _migrate_project_schema(engine)
+    # Clean legacy multi-active prompt rows before create_all can encounter
+    # the partial unique index on prompt_templates.
+    _migrate_prompt_single_active(engine)
     # Wiki migration performs its backup before any create/alter/backfill
     # operation.  It also calls create_all so the new Wiki tables are present
     # before the remaining compatibility migration runs.
     migrate_wiki_schema(engine)
+    _migrate_prompt_single_active(engine, create_index=True)
     _migrate_project_schema(engine, backfill=True)
     _migrate_sqlite_columns(engine)
     _migrate_model_defaults(engine)
