@@ -3,7 +3,6 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlmodel import Session, select
 
-from app import config
 from app.db import get_session
 from app.models.entities import Project
 from app.models.external_wiki import ProjectExternalWiki, _utcnow
@@ -14,16 +13,13 @@ from app.schemas.external_wiki import (
     ExternalWikiTestResponse,
 )
 from app.services.external_wiki_client import list_external_projects
+from app.services.permissions import require_admin
 
 router = APIRouter(prefix="/api/projects/{project_id}/external-wiki", tags=["external-wiki"])
 
 
 def _require_admin(request: Request) -> None:
-    if not config.AUTH_ENABLED:
-        return
-    user = getattr(request.state, "user", None)
-    if user is None or getattr(user, "role", "") != "admin":
-        raise HTTPException(status_code=403, detail="Project management requires an administrator")
+    require_admin(request, detail="Project management requires an administrator")
 
 
 def _require_project(request: Request, project_id: int) -> None:

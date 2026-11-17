@@ -9,13 +9,13 @@ const router = createRouter({
       path: '/login',
       name: 'login',
       component: () => import('../views/LoginView.vue'),
-      meta: { title: '登录', public: true },
+      meta: { title: '登录' },
     },
     {
       path: '/setup',
       name: 'setup',
       component: () => import('../views/SetupView.vue'),
-      meta: { title: '初始化管理员', public: true },
+      meta: { title: '初始化管理员' },
     },
     {
       path: '/',
@@ -56,66 +56,67 @@ const router = createRouter({
           path: 'data-pools',
           name: 'data-pools',
           component: () => import('../views/DataPoolsView.vue'),
-          meta: { title: '数据池', description: '导入并预览项目级实体数据与抽象测试数据' },
+          meta: { title: '数据池', description: '导入并预览项目级实体数据与抽象测试数据', adminOnly: true },
         },
         {
           path: 'platform-adapters',
           name: 'platform-adapters',
           redirect: '/platform-management',
+          meta: { adminOnly: true },
         },
         {
           path: 'platform-management',
           name: 'platform-management',
           component: () => import('../views/PlatformManagementView.vue'),
-          meta: { title: '平台管理', description: '维护平台、示例类型及其格式样例' },
+          meta: { title: '平台管理', description: '维护平台、示例类型及其格式样例', adminOnly: true },
         },
         {
           path: 'platform-case-generate',
           name: 'platform-case-generate',
           component: () => import('../views/PlatformCaseGeneratorView.vue'),
-          meta: { title: '生成平台用例', description: '根据语义用例、示例类型和数据生成平台产物' },
+          meta: { title: '生成平台用例', description: '根据语义用例、示例类型和数据生成平台产物', adminOnly: true },
         },
         {
           path: 'platform-cases',
           name: 'platform-cases',
           component: () => import('../views/PlatformCasesView.vue'),
-          meta: { title: '平台用例管理', description: '查看、预览和维护生成产物的管理副本' },
+          meta: { title: '平台用例管理', description: '查看、预览和维护生成产物的管理副本', adminOnly: true },
         },
         {
           path: 'platform-upload',
           name: 'platform-upload',
           component: () => import('../views/PlatformUploadView.vue'),
-          meta: { title: '上传至测试平台', description: '查看并下载生成产物，等待后续连接器推送' },
+          meta: { title: '上传至测试平台', description: '查看并下载生成产物，等待后续连接器推送', adminOnly: true },
         },
         {
           path: 'documents',
           name: 'documents',
           component: () => import('../views/DocumentsView.vue'),
-          meta: { title: '文档摄入', description: '上传业务文档、检查解析质量并摄入当前 Wiki 空间' },
+          meta: { title: '文档摄入', description: '上传业务文档、检查解析质量并摄入当前 Wiki 空间', adminOnly: true },
         },
         {
           path: 'wiki',
           name: 'wiki',
           component: () => import('../views/WikiView.vue'),
-          meta: { title: '知识浏览', description: '检索与预览当前 Wiki 空间的知识页面和原文依据' },
+          meta: { title: '知识浏览', description: '检索与预览当前 Wiki 空间的知识页面和原文依据', adminOnly: true },
         },
         {
           path: 'wiki/reviews',
           name: 'wiki-reviews',
           component: () => import('../views/WikiReviewView.vue'),
-          meta: { title: '变更审核', description: '审核 Wiki 候选变更、来源证据、历史版本与回滚记录' },
+          meta: { title: '变更审核', description: '审核 Wiki 候选变更、来源证据、历史版本与回滚记录', adminOnly: true },
         },
         {
           path: 'wiki-spaces',
           name: 'wiki-spaces',
           component: () => import('../views/WikiSpacesView.vue'),
-          meta: { title: '知识空间', description: '按项目管理隔离的 Wiki 文档、页面、审核与检索边界' },
+          meta: { title: '知识空间', description: '按项目管理隔离的 Wiki 文档、页面、审核与检索边界', adminOnly: true },
         },
         {
           path: 'spaces',
           name: 'space-management',
           component: () => import('../views/SpaceManagementView.vue'),
-          meta: { title: '空间管理', description: '管理全站项目空间及其生命周期' },
+          meta: { title: '空间管理', description: '管理全站项目空间及其生命周期', adminOnly: true },
         },
         {
           path: 'prompts',
@@ -127,9 +128,20 @@ const router = createRouter({
           path: 'models',
           name: 'models',
           component: () => import('../views/ModelsView.vue'),
-          meta: { title: '模型配置', description: '配置 OpenAI 兼容模型网关与默认模型' },
+          meta: { title: '模型配置', description: '配置 OpenAI 兼容模型网关与默认模型', adminOnly: true },
+        },
+        {
+          path: 'users',
+          name: 'users',
+          component: () => import('../views/UsersView.vue'),
+          meta: { title: '用户管理', description: '管理本地账号、角色与登录口令', adminOnly: true, skipProjectGate: true },
         },
       ],
+    },
+    {
+      path: '/:pathMatch(.*)*',
+      name: 'not-found',
+      redirect: '/',
     },
   ],
 })
@@ -150,6 +162,9 @@ router.beforeEach(async (to) => {
   if (to.name === 'setup') return { name: 'login' }
   if (to.meta.requiresAuth && !auth.isAuthenticated) {
     return { name: 'login', query: to.fullPath === '/' ? undefined : { redirect: to.fullPath } }
+  }
+  if (to.meta.adminOnly && !auth.isAdmin) {
+    return { name: 'workbench' }
   }
   if ((to.name === 'login' || to.name === 'setup') && auth.isAuthenticated) {
     return { name: 'workbench' }

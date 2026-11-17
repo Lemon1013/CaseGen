@@ -6,7 +6,6 @@ from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from app.db import get_session
-from app import config
 from app.models.entities import (
     DataPool,
     Document,
@@ -25,6 +24,7 @@ from app.models.entities import (
     WikiSpace,
 )
 from app.schemas.projects import ProjectBindingIn, ProjectCreate, ProjectOut, ProjectSpaceOut, ProjectUpdate
+from app.services.permissions import current_user, is_admin, require_admin
 from app.services.wiki_spaces import normalize_space_slug, slug_from_name
 from app.services.wiki_spaces import DEFAULT_SPACE_SLUG, ensure_space_dirs, space_root
 
@@ -32,11 +32,7 @@ router = APIRouter(prefix="/api/projects", tags=["projects"])
 
 
 def _require_admin(request: Request) -> None:
-    if not config.AUTH_ENABLED:
-        return
-    user = getattr(request.state, "user", None)
-    if user is None or getattr(user, "role", "") != "admin":
-        raise HTTPException(status_code=403, detail="Project management requires an administrator")
+    require_admin(request, detail="Project management requires an administrator")
 
 
 def _require_project(request: Request, project_id: int) -> None:

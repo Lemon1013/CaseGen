@@ -1,9 +1,17 @@
 import { computed, reactive } from 'vue'
 import type { LocationQuery, Router } from 'vue-router'
+import { ApiError } from './api/client'
 import { listProjects, type Project } from './api/projects'
 
 const STORAGE_KEY = 'casegen:last-project-id'
 const state = reactive({ projects: [] as Project[], currentId: null as number | null, loaded: false })
+
+/** Clear the module-level singleton so a new login cannot inherit the previous user's scope. */
+export function resetProjectStoreState() {
+  state.projects = []
+  state.currentId = null
+  state.loaded = false
+}
 
 function queryId(query: LocationQuery) {
   const raw = Array.isArray(query.project_id) ? query.project_id[0] : query.project_id
@@ -11,10 +19,28 @@ function queryId(query: LocationQuery) {
   return Number.isInteger(value) && value > 0 ? value : null
 }
 
+/**
+ * Load projects, recovering once from a stale/hidden cached project id.
+ * client.ts injects localStorage's project_id into every /api request, so a
+ * hidden or revoked id can make even the list endpoint fail.  Dropping the
+ * cached id and retrying lets the user switch to a visible project.
+ */
+async function loadProjectsWithRecovery(): Promise<Project[]> {
+  try {
+    return await listProjects()
+  } catch (error) {
+    const status = error instanceof ApiError ? error.status : 0
+    if (status !== 404 && status !== 401) throw error
+    if (!localStorage.getItem(STORAGE_KEY)) throw error
+    localStorage.removeItem(STORAGE_KEY)
+    return listProjects()
+  }
+}
+
 export function useProjectStore() {
   const current = computed(() => state.projects.find((item) => item.id === state.currentId) || null)
   async function load(query: LocationQuery) {
-    state.projects = await listProjects()
+    state.projects = await loadProjectsWithRecovery()
     const requested = queryId(query) || Number(localStorage.getItem(STORAGE_KEY))
     const project = state.projects.find((item) => item.id === requested && item.status === 'active') || state.projects.find((item) => item.status === 'active') || null
     state.currentId = project?.id || null
@@ -29,7 +55,7 @@ export function useProjectStore() {
     state.currentId = id
   }
   async function refresh(router?: Router) {
-    state.projects = await listProjects()
+    state.projects = await loadProjectsWithRecovery()
     const selected = state.projects.find((item) => item.id === state.currentId && item.status === 'active') || state.projects.find((item) => item.status === 'active') || null
     state.currentId = selected?.id || null
     if (selected) localStorage.setItem(STORAGE_KEY, String(selected.id))

@@ -21,10 +21,12 @@ from app.api.platform_data import router as platform_data_router
 from app.api.projects import router as projects_router
 from app.api.external_wikis import router as external_wikis_router
 from app.api.agent_chat import router as agent_chat_router
+from app.api.users import router as users_router
 from app import config
 from app.config import ensure_data_dirs
 from app.db import get_engine, init_db
 from app.services.auth import get_user_for_token
+from app.services.permissions import current_user, is_admin, snapshot_user
 from app.services.prompts_seed import seed_default_prompts
 from app.services.wiki_jobs import recover_ingest_jobs
 from app.services.task_jobs import recover_generation_jobs
@@ -116,9 +118,15 @@ def create_app() -> FastAPI:
                         auth_session,
                         request.cookies.get(config.AUTH_COOKIE_NAME),
                     )
-                if user is None:
+                    # Freeze the identity WHILE the session is still open.
+                    # The ORM User becomes detached (and its attributes expire)
+                    # as soon as this `with` block closes; keeping it on the
+                    # request would make any later getattr(user, ...) attempt
+                    # a lazy refresh and raise DetachedInstanceError -> 500.
+                    identity = snapshot_user(user) if user is not None else None
+                if identity is None:
                     return JSONResponse({"detail": "Not authenticated"}, status_code=401)
-                request.state.user = user
+                request.state.user = identity
 
             if config.AUTH_ENABLED and unsafe:
                 origin = request.headers.get("origin")
@@ -187,6 +195,7 @@ def create_app() -> FastAPI:
     app.include_router(platform_data_router)
     app.include_router(projects_router)
     app.include_router(external_wikis_router)
+    app.include_router(users_router)
     # Agent plane (line A).  Registered last so its /api/agent prefix can never
     # shadow an existing route, and before the SPA catch-all mount.
     app.include_router(agent_chat_router)

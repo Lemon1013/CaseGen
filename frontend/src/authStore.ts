@@ -3,6 +3,7 @@ import { defineStore } from 'pinia'
 import { useRouter } from 'vue-router'
 import { getAuthBootstrap, login, logout, setupAccount, type AuthUser } from './api/auth'
 import { bumpAuthEpoch, getAuthEpoch } from './api/client'
+import { resetProjectStoreState } from './projectStore'
 
 function safeRedirect(value: unknown): string {
   if (typeof value !== 'string' || !value.startsWith('/') || value.startsWith('//')) return '/'
@@ -23,6 +24,20 @@ export const useAuthStore = defineStore('auth', () => {
   let unauthorizedFlight: Promise<void> | null = null
 
   const isAuthenticated = computed(() => user.value !== null)
+  const isAdmin = computed(() => user.value?.role === 'admin')
+
+  // Clear every bit of the previous account's client-side scope so a later
+  // login cannot inherit its project_id (client.ts injects it into every
+  // /api request) or its UI state.
+  function clearAccountScope() {
+    for (const key of [
+      'casegen:last-project-id',
+      'casegen:last-wiki-space-id',
+      'casegen:nav-collapsed',
+      'casegen:agent-list-collapsed',
+    ]) localStorage.removeItem(key)
+    resetProjectStoreState()
+  }
 
   function invalidateRestore() {
     restoreGeneration += 1
@@ -96,6 +111,7 @@ export const useAuthStore = defineStore('auth', () => {
     try {
       await logout()
     } finally {
+      clearAccountScope()
       user.value = null
       restored.value = true
       await router.replace({ name: 'login' })
@@ -108,6 +124,7 @@ export const useAuthStore = defineStore('auth', () => {
     unauthorizedFlight = (async () => {
       invalidateRestore()
       bumpAuthEpoch()
+      clearAccountScope()
       user.value = null
       restored.value = true
       const routeName = router.currentRoute.value.name
@@ -129,6 +146,7 @@ export const useAuthStore = defineStore('auth', () => {
     restoreError,
     restoreUnavailable,
     isAuthenticated,
+    isAdmin,
     restoreSession,
     retryRestore,
     signIn,

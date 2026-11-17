@@ -4,7 +4,7 @@ export interface AuthUser {
   id: number
   username: string
   display_name: string
-  role: string
+  role: 'admin' | 'user'
 }
 
 export interface BootstrapResponse {

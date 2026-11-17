@@ -7,7 +7,6 @@ from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from app.db import get_session
-from app import config
 from app.models.entities import Document, IngestJob, Project, WikiPageRow, WikiReviewItem, WikiSpace
 from app.schemas.wiki_spaces import (
     WikiSpaceCreate,
@@ -15,6 +14,7 @@ from app.schemas.wiki_spaces import (
     WikiSpaceStatusUpdate,
     WikiSpaceUpdate,
 )
+from app.services.permissions import require_admin
 from app.services.wiki_spaces import (
     ACTIVE_SPACE_STATUS,
     ARCHIVED_SPACE_STATUS,
@@ -30,11 +30,7 @@ router = APIRouter(prefix="/api/wiki-spaces", tags=["wiki-spaces"])
 
 
 def _require_admin_for_shared(request: Request) -> None:
-    if not config.AUTH_ENABLED:
-        return
-    user = getattr(request.state, "user", None)
-    if user is None or getattr(user, "role", "") != "admin":
-        raise HTTPException(status_code=403, detail="Shared Wiki spaces require an administrator")
+    require_admin(request, detail="Shared Wiki spaces require an administrator")
 
 
 def _out(session: Session, row: WikiSpace) -> WikiSpaceOut:
