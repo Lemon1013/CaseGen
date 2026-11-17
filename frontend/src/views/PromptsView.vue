@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { ApiError } from '../api/client'
 import {
   createPrompt,
   deletePrompt,
@@ -16,6 +17,7 @@ const deleting = ref(false)
 const prompts = ref<PromptTemplate[]>([])
 const filterType = ref<string>('')
 const selectedId = ref<number | null>(null)
+const conflictMessage = ref('')
 
 const form = reactive({
   name: '',
@@ -48,6 +50,7 @@ async function load() {
 }
 
 function selectPrompt(row: PromptTemplate) {
+  conflictMessage.value = ''
   isCreateMode.value = false
   selectedId.value = row.id
   form.name = row.name
@@ -57,6 +60,7 @@ function selectPrompt(row: PromptTemplate) {
 }
 
 function startCreate() {
+  conflictMessage.value = ''
   isCreateMode.value = true
   selectedId.value = null
   form.name = ''
@@ -71,6 +75,7 @@ async function save() {
     return
   }
   saving.value = true
+  conflictMessage.value = ''
   try {
     if (isCreateMode.value) {
       const created = await createPrompt({
@@ -94,6 +99,13 @@ async function save() {
       selectPrompt(updated)
     }
   } catch (e) {
+    const conflict = promptConflictMessage(e)
+    if (conflict) {
+      conflictMessage.value = conflict
+      ElMessage.error(conflict)
+      await load()
+      return
+    }
     ElMessage.error(`保存失败：${(e as Error).message}`)
   } finally {
     saving.value = false
@@ -103,16 +115,31 @@ async function save() {
 async function setActive() {
   if (!selectedId.value) return
   saving.value = true
+  conflictMessage.value = ''
   try {
     const updated = await updatePrompt(selectedId.value, { is_active: true })
     ElMessage.success(selected.value?.type === 'generate' ? '已设为启用' : '已设为唯一启用')
     await load()
     selectPrompt(updated)
   } catch (e) {
+    const conflict = promptConflictMessage(e)
+    if (conflict) {
+      conflictMessage.value = conflict
+      ElMessage.error(conflict)
+      await load()
+      return
+    }
     ElMessage.error(`操作失败：${(e as Error).message}`)
   } finally {
     saving.value = false
   }
+}
+
+function promptConflictMessage(error: unknown) {
+  if (error instanceof ApiError && error.status === 409) {
+    return '该类型已有启用中的提示词。请先停用同类型的其他模板，再启用当前模板。'
+  }
+  return ''
 }
 
 function deleteError(error: unknown) {
@@ -225,6 +252,14 @@ onMounted(load)
               v{{ selected.version }} · {{ typeLabel(selected.type) }}
             </span>
           </div>
+          <el-alert
+            v-if="conflictMessage"
+            :title="conflictMessage"
+            type="warning"
+            show-icon
+            :closable="false"
+            class="conflict-alert"
+          />
           <el-form label-width="80px">
             <el-form-item label="名称" required>
               <el-input v-model="form.name" />
@@ -297,6 +332,10 @@ onMounted(load)
   align-items: center;
   margin-bottom: 12px;
   font-weight: 700;
+}
+
+.conflict-alert {
+  margin-bottom: 12px;
 }
 
 .meta {
