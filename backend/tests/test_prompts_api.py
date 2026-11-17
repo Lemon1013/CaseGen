@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from fastapi.testclient import TestClient
 from sqlmodel import Session, select
 
@@ -6,6 +8,9 @@ from app.main import create_app
 from app.models.entities import PromptTemplate
 from app.services import prompts_seed
 from app.services.prompts_seed import BUNDLED_PROMPT_VERSION, seed_default_prompts
+
+
+TEST_POINTS_V7 = (Path(__file__).parent / "fixtures" / "test_points_v7.md").read_text(encoding="utf-8")
 
 
 def test_multiple_active_prompts_per_type(tmp_app_data):
@@ -32,6 +37,7 @@ def test_default_prompts_seeded(tmp_app_data):
     types = {p["type"] for p in items if p["is_active"]}
     assert {
         "generate",
+        "test_points",
         "review",
         "optimize",
         "wiki_analyze",
@@ -111,6 +117,75 @@ def test_seed_upgrades_recognized_bundled_prompt(tmp_app_data, monkeypatch):
     assert old is not None and old.is_active is False
 
 
+def test_seed_upgrades_v7_test_points_prompt(tmp_app_data):
+    TestClient(create_app())
+    assert prompts_seed._content_hash(TEST_POINTS_V7) == (
+        "109697d4cf72d2390c16b802abcc5c157777910f0594264497e162d4c66f4ba3"
+    )
+
+    with Session(get_engine()) as session:
+        for row in session.exec(
+            select(PromptTemplate).where(PromptTemplate.type == "test_points")
+        ).all():
+            row.is_active = False
+            session.add(row)
+        legacy = PromptTemplate(
+            name="default_test_points",
+            type="test_points",
+            content=TEST_POINTS_V7,
+            version=7,
+            is_active=True,
+        )
+        session.add(legacy)
+        session.commit()
+        session.refresh(legacy)
+
+        seed_default_prompts(session)
+        rows = session.exec(
+            select(PromptTemplate)
+            .where(PromptTemplate.type == "test_points")
+            .order_by(PromptTemplate.id)
+        ).all()
+
+    old = next(row for row in rows if row.id == legacy.id)
+    active = [row for row in rows if row.is_active]
+    assert old.is_active is False
+    assert len(active) == 1
+    assert active[0].version >= BUNDLED_PROMPT_VERSION
+    assert "model_citation_label" in active[0].content
+
+
+def test_seed_adds_inactive_bundled_test_points_for_custom_active(tmp_app_data):
+    TestClient(create_app())
+    with Session(get_engine()) as session:
+        for row in session.exec(
+            select(PromptTemplate).where(PromptTemplate.type == "test_points")
+        ).all():
+            row.is_active = False
+            session.add(row)
+        custom = PromptTemplate(
+            name="team-test-points",
+            type="test_points",
+            content="团队自定义测试点提示词",
+            version=8,
+            is_active=True,
+        )
+        session.add(custom)
+        session.commit()
+        session.refresh(custom)
+
+        seed_default_prompts(session)
+        rows = session.exec(
+            select(PromptTemplate).where(PromptTemplate.type == "test_points")
+        ).all()
+
+    custom = next(row for row in rows if row.id == custom.id)
+    bundled = [row for row in rows if row.name == "default_test_points" and "model_citation_label" in row.content]
+    assert custom.is_active is True
+    assert bundled
+    assert all(row.is_active is False for row in bundled)
+
+
 def test_bundled_prompts_keep_required_output_contracts(tmp_app_data):
     items = TestClient(create_app()).get("/api/prompts").json()
     active = {p["type"]: p["content"] for p in items if p["is_active"]}
@@ -120,6 +195,10 @@ def test_bundled_prompts_keep_required_output_contracts(tmp_app_data):
     assert "本次需求中的专属" in active["optimize"]
     assert all(token in active["wiki_analyze"] for token in ("page_operations", "source_anchors", "禁止 merge"))
     assert all(token in active["wiki_write"] for token in ('"pages"', "replace_existing", "不决定磁盘路径"))
+    assert all(
+        token in active["test_points"]
+        for token in ("model_citation_label", "reference_case_snapshots", "test_point_json_repair_request")
+    )
 
 
 def test_delete_prompt_is_safe_for_runtime_and_history(tmp_app_data):
