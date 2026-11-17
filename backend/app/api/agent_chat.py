@@ -54,6 +54,7 @@ from app.schemas.agent import (
 from app.services import agent_draft, agent_gateway, agent_skills, agent_turn
 from app.services.agent_stream import agent_stream, encode_sse
 from app.services.case_management import CaseDraftParseError
+from app.services.permissions import current_user
 from app.services.projects import request_project_id
 
 # Re-exported so callers can import the draft contract from one place.
@@ -78,7 +79,9 @@ _TITLE_FROM_MESSAGE_CHARS = 40
 _MAX_LIST_ROWS = 200
 
 _DETAIL_DISABLED = "Agent 功能未启用（AGENT_ENABLED=false）"
-_DETAIL_NOT_FOUND = "Agent 会话不存在。"
+# Single neutral 404 wording for missing, cross-project and foreign-owner
+# conversations.  Keeping them identical prevents existence enumeration and
+# matches the project middleware's "Resource not found in project".
 _DETAIL_FOREIGN = "Resource not found in project"
 _DETAIL_BUSY = "本轮对话仍在进行中，请等待结束或先取消。"
 _DETAIL_CLOSED = "会话已关闭，无法继续对话。"
@@ -111,6 +114,18 @@ def _require_project(request: Request) -> int:
     return int(project_id)
 
 
+def _owner_id(request: Request) -> Optional[int]:
+    """Return the signed-in user's id, or ``None`` when auth is disabled.
+
+    ``tests/conftest.py`` turns authentication off for the legacy pipeline
+    suite, so ``request.state.user`` is absent.  In that compatibility mode
+    conversation ownership checks are skipped; production always has a user.
+    """
+
+    user = current_user(request)
+    return int(user.id) if user is not None and user.id is not None else None
+
+
 def _message_counts(session: Session, conversation_ids: list[str]) -> dict[str, int]:
     if not conversation_ids:
         return {}
@@ -134,16 +149,31 @@ def _conversation_out(
 
 
 def _get_conversation(
-    session: Session, conversation_id: str, project_id: Optional[int]
+    session: Session,
+    conversation_id: str,
+    project_id: Optional[int],
+    owner_id: Optional[int] = None,
 ) -> AgentConversation:
-    """Load one conversation and enforce project ownership (404 when foreign)."""
+    """Load one conversation and enforce project + user ownership (404).
+
+    Conversations are private to their creator; even an administrator cannot
+    open another user's chat.  ``owner_id is None`` means the compatibility
+    mode (auth disabled) and skips only the user check, never the project one.
+    All rejection branches return the same neutral 404 so the response never
+    reveals whether a given conversation exists.
+    """
 
     conversation = session.get(AgentConversation, str(conversation_id))
+    # Every rejection below uses the SAME neutral 404 detail.  A caller must
+    # not be able to enumerate whether another user's conversation exists by
+    # comparing error messages for "missing" vs "foreign project" vs
+    # "foreign owner"; all three are indistinguishable from a missing row.
+    # The wording also matches the project middleware's 404.
     if conversation is None:
-        raise HTTPException(status_code=404, detail=_DETAIL_NOT_FOUND)
+        raise HTTPException(status_code=404, detail=_DETAIL_FOREIGN)
     if project_id is not None and str(conversation.project_id) != str(project_id):
-        # Same wording as the project middleware so the browser cannot tell a
-        # foreign conversation apart from a missing one.
+        raise HTTPException(status_code=404, detail=_DETAIL_FOREIGN)
+    if owner_id is not None and conversation.user_id != owner_id:
         raise HTTPException(status_code=404, detail=_DETAIL_FOREIGN)
     return conversation
 
@@ -161,13 +191,18 @@ def _title_from_message(content: str) -> str:
 
 
 def _list_conversations(
-    session: Session, project_id: int
+    session: Session, project_id: int, owner_id: Optional[int] = None
 ) -> list[AgentConversationOut]:
+    query = select(AgentConversation).where(
+        col(AgentConversation.project_id) == str(project_id)
+    )
+    if owner_id is not None:
+        query = query.where(col(AgentConversation.user_id) == owner_id)
     rows = session.exec(
-        select(AgentConversation)
-        .where(col(AgentConversation.project_id) == str(project_id))
-        .order_by(col(AgentConversation.updated_at).desc(), col(AgentConversation.id).desc())
-        .limit(_MAX_LIST_ROWS)
+        query.order_by(
+            col(AgentConversation.updated_at).desc(),
+            col(AgentConversation.id).desc(),
+        ).limit(_MAX_LIST_ROWS)
     ).all()
     counts = _message_counts(session, [str(row.id) for row in rows])
     return [
@@ -281,7 +316,7 @@ def list_conversations(
     """List this project's conversations, newest activity first (bare array)."""
 
     _require_agent_enabled()
-    return _list_conversations(session, _require_project(request))
+    return _list_conversations(session, _require_project(request), _owner_id(request))
 
 
 @router.post("/conversations", response_model=AgentConversationOut)
@@ -299,6 +334,7 @@ def create_conversation(
     ws_dir = project.workspace_dir if project else ""
     conversation = AgentConversation(
         project_id=str(project_id),
+        user_id=_owner_id(request),
         title=_normalize_title(body.title),
         skill_name=(body.skill_name or "").strip() or None,
         model=(body.model or "").strip() or None,
@@ -326,7 +362,7 @@ def get_conversation(
     """
 
     _require_agent_enabled()
-    conversation = _get_conversation(session, conversation_id, _require_project(request))
+    conversation = _get_conversation(session, conversation_id, _require_project(request), _owner_id(request))
     _recover_orphaned_turn(session, conversation)
     detail = AgentConversationDetail.model_validate(conversation)
     detail.messages = _load_messages(session, conversation_id)
@@ -344,7 +380,7 @@ def update_conversation(
     """Rename a conversation or switch its skill/model for the next turn."""
 
     _require_agent_enabled()
-    conversation = _get_conversation(session, conversation_id, _require_project(request))
+    conversation = _get_conversation(session, conversation_id, _require_project(request), _owner_id(request))
     _check_version(conversation, body.expected_version)
     if body.title is not None and " ".join(body.title.split()):
         conversation.title = _normalize_title(body.title)
@@ -384,7 +420,7 @@ def delete_conversation(
     project_id = _require_project(request)
     with agent_gateway.conversation_locks.hold(conversation_id):
         session.expire_all()
-        conversation = _get_conversation(session, conversation_id, project_id)
+        conversation = _get_conversation(session, conversation_id, project_id, _owner_id(request))
         if conversation.status == _BUSY_STATUS:
             raise HTTPException(status_code=409, detail=_DETAIL_DELETE_BUSY)
         dsh_session_id = conversation.dsh_session_id
@@ -429,7 +465,7 @@ def post_message(
     with agent_gateway.conversation_locks.hold(conversation_id):
         # Another request may have committed a turn while this one waited.
         session.expire_all()
-        conversation = _get_conversation(session, conversation_id, project_id)
+        conversation = _get_conversation(session, conversation_id, project_id, _owner_id(request))
         if conversation.status == _BUSY_STATUS:
             raise HTTPException(status_code=409, detail=_DETAIL_BUSY)
         if conversation.status == _CLOSED_STATUS:
@@ -496,10 +532,10 @@ def cancel_turn(
 
     _require_agent_enabled()
     project_id = _require_project(request)
-    conversation = _get_conversation(session, conversation_id, project_id)
+    conversation = _get_conversation(session, conversation_id, project_id, _owner_id(request))
     cancelled = agent_turn.request_cancel(conversation_id)
     session.expire_all()
-    conversation = _get_conversation(session, conversation_id, project_id)
+    conversation = _get_conversation(session, conversation_id, project_id, _owner_id(request))
     return AgentCancelOut(
         conversation=_conversation_out(session, conversation),
         cancelled=cancelled,
@@ -519,11 +555,13 @@ def list_skills(
     _require_project(request)
     return [AgentSkillOut(**item.as_dict()) for item in agent_skills.list_skills()]
 
-def _load_conversation_status(conversation_id: str, project_id: Optional[int]) -> str:
+def _load_conversation_status(
+    conversation_id: str, project_id: Optional[int], owner_id: Optional[int]
+) -> str:
     """Load only durable stream eligibility and close the DB session eagerly."""
 
     with Session(get_engine()) as session:
-        conversation = _get_conversation(session, conversation_id, project_id)
+        conversation = _get_conversation(session, conversation_id, project_id, owner_id)
         return str(conversation.status or _IDLE_STATUS)
 
 
@@ -542,7 +580,7 @@ def stream_conversation(
 
     _require_agent_enabled()
     project_id = _require_project(request)
-    conversation_status = _load_conversation_status(conversation_id, project_id)
+    conversation_status = _load_conversation_status(conversation_id, project_id, _owner_id(request))
     snapshot = agent_stream.snapshot(conversation_id)
     durable_terminal: Optional[str] = None
     if snapshot is not None:
@@ -634,7 +672,7 @@ def save_as_draft(
 
     _require_agent_enabled()
     project_id = _require_project(request)
-    conversation = _get_conversation(session, conversation_id, project_id)
+    conversation = _get_conversation(session, conversation_id, project_id, _owner_id(request))
     if conversation.status == _BUSY_STATUS:
         raise HTTPException(status_code=409, detail=_DETAIL_DRAFT_BUSY)
     try:
