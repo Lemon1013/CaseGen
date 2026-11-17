@@ -109,6 +109,18 @@ def test_init_db_creates_expected_tables(tmp_app_data):
         "task_events",
     }
     assert expected.issubset(table_names)
+    # Visibility/ownership columns added by the migration must exist on a
+    # freshly initialized database (init_db runs on every create_app).
+    with engine.connect() as conn:
+        project_cols = {
+            str(row[1]) for row in conn.execute(text("PRAGMA table_info(projects)"))
+        }
+        conversation_cols = {
+            str(row[1])
+            for row in conn.execute(text("PRAGMA table_info(agent_conversations)"))
+        }
+    assert "is_public" in project_cols
+    assert "user_id" in conversation_cols
 
 
 def test_model_config_roundtrip(tmp_app_data):

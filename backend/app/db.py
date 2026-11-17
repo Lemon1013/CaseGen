@@ -712,6 +712,80 @@ def _migrate_project_schema(engine, *, backfill: bool = False) -> None:
         conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_wiki_spaces_shared_namespace ON wiki_spaces(namespace) WHERE scope = 'shared'"))
 
 
+def _migrate_user_visibility_schema(engine) -> None:
+    """Add project visibility and agent-conversation ownership columns.
+
+    Follows the existing idempotent ``PRAGMA table_info`` + ``ALTER TABLE``
+    pattern.  Every statement is safe to run on every ``create_app`` call:
+
+    - ``projects.is_public`` defaults to 1 so existing projects stay visible;
+    - ``agent_conversations.user_id`` is nullable, and only rows that are
+      still NULL are ever backfilled.  New conversations always carry an
+      explicit owner, so a repeated run can never reassign another user's
+      chat to the bootstrap administrator.
+    """
+
+    with engine.begin() as conn:
+        project_cols = conn.execute(text("PRAGMA table_info(projects)")).fetchall()
+        if project_cols:
+            project_names = {str(row[1]) for row in project_cols}
+            if "is_public" not in project_names:
+                conn.execute(
+                    text(
+                        "ALTER TABLE projects ADD COLUMN is_public BOOLEAN NOT NULL DEFAULT 1"
+                    )
+                )
+            # Covers legacy rows written before the column existed as well as
+            # any hand-edited NULLs; idempotent and never hides data.
+            conn.execute(
+                text("UPDATE projects SET is_public = 1 WHERE is_public IS NULL")
+            )
+            conn.execute(
+                text("CREATE INDEX IF NOT EXISTS ix_projects_is_public ON projects(is_public)")
+            )
+
+        conv_cols = conn.execute(
+            text("PRAGMA table_info(agent_conversations)")
+        ).fetchall()
+        if conv_cols:
+            conv_names = {str(row[1]) for row in conv_cols}
+            if "user_id" not in conv_names:
+                conn.execute(
+                    text(
+                        "ALTER TABLE agent_conversations ADD COLUMN user_id INTEGER"
+                    )
+                )
+            # Bootstrap admin owns pre-existing (ownerless) conversations:
+            # the earliest administrator, or the earliest account if no admin
+            # role exists yet.  Only NULL rows are touched, so a repeated run
+            # can never reassign a conversation that already has an owner.
+            user_cols = conn.execute(text("PRAGMA table_info(users)")).fetchall()
+            admin_id = None
+            if user_cols:
+                admin_id = conn.execute(
+                    text(
+                        "SELECT id FROM users WHERE role = 'admin' ORDER BY id ASC LIMIT 1"
+                    )
+                ).scalar()
+                if admin_id is None:
+                    admin_id = conn.execute(
+                        text("SELECT id FROM users ORDER BY id ASC LIMIT 1")
+                    ).scalar()
+            if admin_id is not None:
+                conn.execute(
+                    text(
+                        "UPDATE agent_conversations SET user_id = :admin_id "
+                        "WHERE user_id IS NULL"
+                    ),
+                    {"admin_id": int(admin_id)},
+                )
+            conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_agent_conversations_user_id "
+                    "ON agent_conversations(user_id)"
+                )
+            )
+
 def _migrate_external_wiki_schema(engine) -> None:
     """Create project_external_wikis table and index if not present."""
     with engine.begin() as conn:
@@ -757,6 +831,9 @@ def init_db() -> None:
     _migrate_case_management_schema(engine)
     _migrate_test_design_schema(engine)
     _migrate_external_wiki_schema(engine)
+    # Runs last so SQLModel.metadata.create_all has already created the
+    # projects / users / agent_conversations tables on a fresh database.
+    _migrate_user_visibility_schema(engine)
 
 
 def get_session():
