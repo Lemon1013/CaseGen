@@ -30,7 +30,11 @@ from app.services.permissions import current_user, is_admin, snapshot_user
 from app.services.prompts_seed import seed_default_prompts
 from app.services.wiki_jobs import recover_ingest_jobs
 from app.services.task_jobs import recover_generation_jobs
-from app.services.projects import is_project_scoped_path, validate_request_project_scope
+from app.services.projects import (
+    is_project_scoped_path,
+    is_project_visibility_path,
+    validate_request_project_scope,
+)
 
 
 def _mount_frontend_dist(app: FastAPI) -> None:
@@ -151,6 +155,32 @@ def create_app() -> FastAPI:
                 return JSONResponse({"detail": "project_id is required"}, status_code=422)
             if project_raw is not None and not project_raw.isdigit():
                 return JSONResponse({"detail": "project_id must be a positive integer"}, status_code=422)
+            # Visibility fallback: a project hidden from ordinary users must
+            # be unreachable on project DATA paths such as /api/tasks and
+            # /api/cases, even though the scope check below deliberately skips
+            # the /api/projects/ prefix.  It applies only to real project-data
+            # paths: client.ts injects project_id into every /api request, so
+            # a global guard would also 404 GET /api/projects (the list the
+            # user needs in order to switch away) and GET /api/prompts (which
+            # must stay visible and editable for everyone).  The 404 wording
+            # matches the existing scope guard so a hidden project is
+            # indistinguishable from one that does not exist.
+            if (
+                project_raw
+                and project_raw.isdigit()
+                and config.AUTH_ENABLED
+                and current_user(request) is not None
+                and not is_admin(request)
+                and is_project_visibility_path(path)
+            ):
+                from app.models.entities import Project
+
+                with Session(get_engine()) as visibility_session:
+                    project = visibility_session.get(Project, int(project_raw))
+                    if project is not None and not bool(project.is_public):
+                        return JSONResponse(
+                            {"detail": "Resource not found in project"}, status_code=404
+                        )
             if project_raw and project_raw.isdigit() and is_project_scoped_path(path) and not path.startswith("/api/projects/"):
                 query_spaces = [
                     int(value)

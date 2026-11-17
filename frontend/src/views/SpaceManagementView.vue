@@ -16,10 +16,11 @@ import { useProjectStore } from '../projectStore'
 const router = useRouter()
 const auth = useAuthStore()
 const projects = useProjectStore()
-const isAdmin = computed(() => auth.user?.role === 'admin')
+const isAdmin = computed(() => auth.isAdmin)
 const dialog = ref(false)
 const editing = ref<Project | null>(null)
 const saving = ref(false)
+const publicSavingId = ref<number | null>(null)
 const form = reactive({ name: '', slug: '', description: '' })
 
 // External wiki dialog states
@@ -155,6 +156,20 @@ async function toggleStatus(row: Project) {
   } catch (error) { ElMessage.error((error as Error).message) }
 }
 
+async function togglePublic(row: Project, value: unknown) {
+  const next = Boolean(value)
+  publicSavingId.value = row.id
+  try {
+    await updateProject(row.id, { is_public: next })
+    await projects.refresh()
+    ElMessage.success(next ? '项目已对全员可见' : '项目已对普通用户隐藏')
+  } catch (error) {
+    ElMessage.error((error as Error).message)
+  } finally {
+    publicSavingId.value = null
+  }
+}
+
 async function remove(row: Project) {
   try {
     await ElMessageBox.confirm(`永久删除空空间「${row.name}」？此操作不可撤销。`, '删除空间', { type: 'warning', confirmButtonText: '删除' })
@@ -179,6 +194,7 @@ async function remove(row: Project) {
         <el-table-column label="状态" width="100"><template #default="{ row }"><el-tag :type="row.status === 'active' ? 'success' : 'info'">{{ row.status === 'active' ? '使用中' : '已归档' }}</el-tag></template></el-table-column>
         <el-table-column label="默认私有知识库" min-width="160"><template #default="{ row }">{{ row.private_spaces.find((item: Project['private_spaces'][number]) => item.id === row.default_wiki_space_id)?.name || '未设置' }}</template></el-table-column>
         <el-table-column label="公共库" width="90"><template #default="{ row }">{{ row.shared_spaces.filter((item: Project['shared_spaces'][number]) => item.enabled).length }}</template></el-table-column>
+        <el-table-column v-if="isAdmin" label="全员可见" width="100"><template #default="{ row }"><el-switch :model-value="row.is_public" :loading="publicSavingId === row.id" @change="togglePublic(row, $event)" /></template></el-table-column>
         <el-table-column v-if="isAdmin" label="操作" width="280" fixed="right"><template #default="{ row }"><el-button link @click="openForm(row)">编辑</el-button><el-button link type="primary" @click="openExternalWiki(row)">外部知识库</el-button><el-button link @click="toggleStatus(row)">{{ row.status === 'active' ? '归档' : '恢复' }}</el-button><el-button link type="danger" @click="remove(row)">删除</el-button></template></el-table-column>
       </el-table>
     </el-card>

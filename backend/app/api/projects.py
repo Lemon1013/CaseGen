@@ -108,8 +108,15 @@ def _project_has_data(session: Session, project_id: int, space_ids: list[int]) -
 
 
 @router.get("", response_model=list[ProjectOut])
-def list_projects(session: Session = Depends(get_session)):
-    return [_out(session, row) for row in session.exec(select(Project).order_by(Project.status, Project.name)).all()]
+def list_projects(request: Request, session: Session = Depends(get_session)):
+    # Ordinary users only see projects an administrator marked as visible;
+    # administrators need the full list to configure the switch.  When auth
+    # is disabled (legacy test compatibility) everyone sees everything.
+    query = select(Project)
+    if not is_admin(request) and current_user(request) is not None:
+        query = query.where(Project.is_public == True)  # noqa: E712
+    rows = session.exec(query.order_by(Project.status, Project.name)).all()
+    return [_out(session, row) for row in rows]
 
 
 @router.post("", response_model=ProjectOut, status_code=status.HTTP_201_CREATED)
@@ -159,6 +166,8 @@ def update_project(project_id: int, body: ProjectUpdate, request: Request, sessi
         value = getattr(body, name)
         if value is not None:
             setattr(row, name, value.strip())
+    if body.is_public is not None:
+        row.is_public = bool(body.is_public)
     if row.status not in {"active", "archived"}:
         raise HTTPException(422, "Unsupported project status")
     row.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
