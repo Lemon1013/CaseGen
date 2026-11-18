@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, type Component } from 'vue'
+import { computed, onMounted, onUnmounted, ref, type Component } from 'vue'
 import { ElMessage } from 'element-plus'
 import { CircleCheck, Collection, Document, InfoFilled, Refresh, Tickets } from '@element-plus/icons-vue'
 import { getDashboardOverview, type DashboardOverview } from '../api/dashboard'
+import { ApiError } from '../api/client'
 
 const TASK_GROUP_ITEMS = [
   { key: 'draft', label: '草稿' },
@@ -110,6 +111,7 @@ const PRIORITIES = ['P0', 'P1', 'P2']
 const loading = ref(false)
 const error = ref('')
 const overview = ref<DashboardOverview | null>(null)
+let disposed = false
 
 function finite(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : 0
@@ -396,19 +398,28 @@ function trendTitle(point: { date: string; tasks: number; cases: number; documen
 }
 
 async function load() {
+  if (disposed) return
   loading.value = true
   error.value = ''
   try {
-    overview.value = await getDashboardOverview()
+    const result = await getDashboardOverview()
+    if (disposed) return
+    overview.value = result
   } catch (e) {
+    if (disposed) return
+    if (e instanceof ApiError && e.status === 401) return
     error.value = '数据看板加载失败：' + (e as Error).message
     ElMessage.error(error.value)
   } finally {
-    loading.value = false
+    if (!disposed) loading.value = false
   }
 }
 
 onMounted(load)
+
+onUnmounted(() => {
+  disposed = true
+})
 </script>
 
 <template>
