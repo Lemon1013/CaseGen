@@ -2549,6 +2549,9 @@ def finalize_task(
     session: Session,
     task_id: int,
     draft_id: int | None = None,
+    *,
+    overwrite_existing: bool = False,
+    operator: str | None = None,
 ) -> GenerationTask:
     task = session.get(GenerationTask, task_id)
     if task is None:
@@ -2574,7 +2577,13 @@ def finalize_task(
             raise ValueError("Task is already finalized with another draft")
         if task.finalized_draft_id == draft.id:
             return task
-        imported = import_cases_from_draft(session, task, draft)
+        imported = import_cases_from_draft(
+            session,
+            task,
+            draft,
+            overwrite_existing=overwrite_existing,
+            operator=operator,
+        )
         task.finalized_draft_id = draft.id
         task.finalized_at = task.finalized_at or utcnow()
         session.add(task)
@@ -2621,7 +2630,13 @@ def finalize_task(
 
     # Parse and import before moving the task state.  A malformed draft must
     # leave the task retryable and must never commit a partial case set.
-    imported = import_cases_from_draft(session, task, draft)
+    imported = import_cases_from_draft(
+        session,
+        task,
+        draft,
+        overwrite_existing=overwrite_existing,
+        operator=operator,
+    )
 
     try:
         _set_status(task, "finalized")

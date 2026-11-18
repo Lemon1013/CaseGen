@@ -233,7 +233,20 @@ onMounted(loadOptions)
       <el-col :xs="24" :lg="15">
         <el-card shadow="never" class="block"><template #header>需求输入与优化</template>
           <el-form label-position="top" @submit.prevent>
-            <el-form-item label="已有需求"><el-select v-model="form.requirement_id" clearable filterable style="width:100%" placeholder="可选" @change="selectRequirement"><el-option v-for="row in requirements" :key="row.id" :label="`#${row.id} · ${row.title}`" :value="row.id" /></el-select></el-form-item>
+            <el-form-item label="已有需求">
+              <div class="requirement-field">
+                <el-select v-model="form.requirement_id" clearable filterable style="width:100%" placeholder="可选" @change="selectRequirement"><el-option v-for="row in requirements" :key="row.id" :label="`#${row.id} · ${row.title}`" :value="row.id" /></el-select>
+                <el-alert
+                  v-if="form.requirement_id"
+                  class="requirement-overwrite-alert"
+                  type="warning"
+                  :closable="false"
+                  show-icon
+                  title="选择已有需求会覆盖已生成用例"
+                  description="终版时会按 case_key 更新该需求下已存在的用例，并记录操作日志。"
+                />
+              </div>
+            </el-form-item>
             <el-form-item label="标题" required><el-input v-model="form.title" maxlength="120" show-word-limit /></el-form-item>
             <el-form-item label="需求描述" required>
               <div class="description-field">
@@ -354,6 +367,14 @@ small,
 .block {
   margin-bottom: 16px;
   border-radius: var(--cg-radius) !important;
+}
+
+.requirement-field {
+  width: 100%;
+}
+
+.requirement-overwrite-alert {
+  margin-top: 8px;
 }
 
 .questions {

@@ -12,6 +12,7 @@ import { formatDateTime as formatTime } from '../utils/datetime'
 import {
   applyPrompt,
   finalizeTask,
+  getFinalizeConflicts,
   generateTask,
   getTask,
   listCitations,
@@ -29,6 +30,7 @@ import {
   taskStreamUrl,
   type ApplyPromptMode,
   type CaseDraft,
+  type FinalizeConflict,
   type PromptRevision,
   type ReviewResult,
   type TaskCitation,
@@ -958,6 +960,32 @@ async function onRegenerate() {
 
 async function onFinalize() {
   if (!task.value) return
+  const selectedDraftId = activeDraftTab.value ? Number(activeDraftTab.value) : null
+  let conflicts: FinalizeConflict[]
+  acting.value = true
+  try {
+    const preview = await getFinalizeConflicts(task.value.id, selectedDraftId)
+    conflicts = preview.conflicts
+  } catch (e) {
+    ElMessage.error(`检查终版冲突失败：${(e as Error).message}`)
+    return
+  } finally {
+    acting.value = false
+  }
+  if (conflicts.length > 0) {
+    const caseKeys = conflicts.slice(0, 5).map((item) => item.case_key).join('、')
+    const suffix = conflicts.length > 5 ? ' 等' : ''
+    try {
+      await ElMessageBox.confirm(
+        `本次终版会更新 ${conflicts.length} 条该需求下已存在的用例：${caseKeys}${suffix}。更新会覆盖已有用例内容并记录操作日志，是否继续？`,
+        '更新已有用例',
+        { type: 'warning', confirmButtonText: '继续终版', cancelButtonText: '返回' },
+      )
+    } catch {
+      return
+    }
+    return runAction('终版', (id) => finalizeTask(id, selectedDraftId, true))
+  }
   try {
     await ElMessageBox.confirm('确认将当前草稿标记为终版？', '终版确认', {
       type: 'warning',
@@ -965,8 +993,7 @@ async function onFinalize() {
   } catch {
     return
   }
-  const selectedDraftId = activeDraftTab.value ? Number(activeDraftTab.value) : null
-  return runAction('终版', (id) => finalizeTask(id, selectedDraftId))
+  return runAction('终版', (id) => finalizeTask(id, selectedDraftId, false))
 }
 
 async function onRetryFailed() {

@@ -328,10 +328,30 @@ export function regenerateTask(id: number) {
   return api<TaskItem>(`/api/tasks/${id}/regenerate`, { method: 'POST' })
 }
 
-export function finalizeTask(id: number, draftId?: number | null) {
+export interface FinalizeConflict {
+  case_key: string
+  existing_case_id: number
+  existing_title: string
+  existing_status: string
+  new_title: string
+}
+
+export interface FinalizeConflicts {
+  conflicts: FinalizeConflict[]
+}
+
+export function getFinalizeConflicts(id: number, draftId?: number | null) {
+  const query = draftId == null ? '' : `?draft_id=${draftId}`
+  return api<FinalizeConflicts>(`/api/tasks/${id}/finalize-conflicts${query}`)
+}
+
+export function finalizeTask(id: number, draftId?: number | null, overwriteExisting = false) {
+  const body: { draft_id?: number; overwrite_existing?: boolean } = {}
+  if (draftId != null) body.draft_id = draftId
+  if (overwriteExisting) body.overwrite_existing = true
   return api<TaskItem>(`/api/tasks/${id}/finalize`, {
     method: 'POST',
-    ...(draftId == null ? {} : { body: JSON.stringify({ draft_id: draftId }) }),
+    ...(Object.keys(body).length ? { body: JSON.stringify(body) } : {}),
   })
 }
 

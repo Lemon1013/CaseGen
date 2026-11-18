@@ -39,6 +39,22 @@ class CaseDraftParseError(ValueError):
     """Raised when a draft cannot be split without risking content loss."""
 
 
+class CaseKeyConflictError(CaseDraftParseError):
+    """Raised when finalization would replace cases that already exist.
+
+    The conflicts attribute mirrors the preview response so API callers can
+    show the same information in an error message or confirmation dialog.
+    Nothing has been written when this error is raised.
+    """
+
+    def __init__(self, conflicts: list[dict[str, Any]], message: str | None = None):
+        self.conflicts = [dict(item) for item in conflicts]
+        if message is None:
+            keys = "、".join(str(item.get("case_key") or "") for item in self.conflicts)
+            message = f"用例键 {keys} 已存在于当前需求，请在终版确认后覆盖更新"
+        super().__init__(message)
+
+
 def normalize_case_key(value: str) -> str:
     """Normalize case identifiers for requirement-scoped uniqueness."""
 
@@ -212,22 +228,150 @@ def append_case_log(
     return row
 
 
+def _normalized_sections(draft: CaseDraft) -> list[dict[str, Any]]:
+    """Split and normalize a draft without touching the database."""
+
+    return [
+        {**section, "case_key": normalize_case_key(section["case_key"])}
+        for section in split_case_draft(draft.content_md)
+    ]
+
+
+def _find_source_case(
+    session: Session,
+    task: GenerationTask,
+    draft: CaseDraft,
+    case_key: str,
+) -> TestCase | None:
+    """Find the row previously imported from this exact task/draft/key."""
+
+    return session.exec(
+        select(TestCase)
+        .where(
+            TestCase.source_task_id == task.id,
+            TestCase.source_draft_id == draft.id,
+            func.lower(func.trim(TestCase.source_case_key)) == case_key.casefold(),
+        )
+        .order_by(col(TestCase.id).asc())
+    ).first()
+
+
+def _find_requirement_case(
+    session: Session,
+    requirement_id: int,
+    case_key: str,
+) -> TestCase | None:
+    """Find an existing case by the requirement-scoped normalized key."""
+
+    return session.exec(
+        select(TestCase)
+        .where(
+            TestCase.requirement_id == int(requirement_id),
+            func.lower(func.trim(TestCase.case_key)) == case_key.casefold(),
+        )
+        .order_by(col(TestCase.id).asc())
+    ).first()
+
+
+def _conflict_payload(section: dict[str, Any], existing: TestCase) -> dict[str, Any]:
+    return {
+        "case_key": section["case_key"],
+        "existing_case_id": int(existing.id),
+        "existing_title": existing.title or "",
+        "existing_status": existing.status or "active",
+        "new_title": section["title"],
+    }
+
+
+def _plan_import_actions(
+    session: Session,
+    task: GenerationTask,
+    draft: CaseDraft,
+    sections: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Resolve every section to skip/overwrite/create before any write.
+
+    The same plan powers both the preview endpoint and the importer, so the
+    confirmation dialog and the final write cannot disagree about which
+    keys collide.
+    """
+
+    requirement_id = task.requirement_id
+    if requirement_id is None:
+        raise CaseDraftParseError("task has no requirement")
+
+    actions: list[dict[str, Any]] = []
+    for section in sections:
+        key = section["case_key"]
+        source_case = _find_source_case(session, task, draft, key)
+        if source_case is not None:
+            actions.append({
+                "section": section,
+                "action": "skip",
+                "case": source_case,
+            })
+            continue
+        existing = _find_requirement_case(session, int(requirement_id), key)
+        actions.append({
+            "section": section,
+            "action": "overwrite" if existing is not None else "create",
+            "case": existing,
+        })
+    return actions
+
+
+def find_finalize_conflicts(
+    session: Session,
+    task: GenerationTask,
+    draft: CaseDraft,
+) -> list[dict[str, Any]]:
+    """Return requirement-scoped case-key collisions without writing."""
+
+    if draft.task_id != task.id:
+        raise CaseDraftParseError("draft does not belong to task")
+    sections = _normalized_sections(draft)
+    return [
+        _conflict_payload(action["section"], action["case"])
+        for action in _plan_import_actions(session, task, draft, sections)
+        if action["action"] == "overwrite"
+    ]
+
+
 def import_cases_from_draft(
     session: Session,
     task: GenerationTask,
     draft: CaseDraft,
+    *,
+    overwrite_existing: bool = False,
+    operator: str | None = None,
 ) -> list[TestCase]:
-    """Idempotently import a selected draft and return affected/current rows."""
+    """Idempotently import a selected draft and return affected/current rows.
+
+    When a case key already belongs to another row in the same requirement,
+    the caller must opt into replacing that row. Conflicts are collected for
+    the whole draft before anything is written, so a rejected request leaves
+    every existing case untouched.
+    """
 
     if draft.task_id != task.id:
         raise CaseDraftParseError("draft does not belong to task")
     if task.requirement_id is None:
         raise CaseDraftParseError("task has no requirement")
 
-    sections = [
-        {**section, "case_key": normalize_case_key(section["case_key"])}
-        for section in split_case_draft(draft.content_md)
+    sections = _normalized_sections(draft)
+    actions = _plan_import_actions(session, task, draft, sections)
+    conflicts = [
+        _conflict_payload(action["section"], action["case"])
+        for action in actions
+        if action["action"] == "overwrite"
     ]
+    if conflicts and not overwrite_existing:
+        keys = "、".join(str(item["case_key"]) for item in conflicts)
+        raise CaseKeyConflictError(
+            conflicts,
+            f"用例键 {keys} 已存在于当前需求，请在终版确认后覆盖更新",
+        )
+
     current_checkpoint = session.exec(
         select(TaskTestPointCheckpoint)
         .where(
@@ -271,63 +415,61 @@ def import_cases_from_draft(
                     test_point_id=int(point.id),
                     test_case_id=int(case.id),
                 ))
-    # Validate all requirement-scoped collisions before adding any rows so a
-    # malformed multi-case draft cannot leave a partially imported set in a
-    # caller's open transaction.
-    for section in sections:
-        key = section["case_key"]
-        existing_source = session.exec(
-            select(TestCase)
-            .where(
-                TestCase.source_task_id == task.id,
-                TestCase.source_draft_id == draft.id,
-                func.lower(func.trim(TestCase.source_case_key)) == key.casefold(),
-            )
-        ).first()
-        if existing_source is not None:
-            continue
-        collision = session.exec(
-            select(TestCase)
-            .where(
-                TestCase.requirement_id == int(task.requirement_id),
-                func.lower(func.trim(TestCase.case_key)) == key.casefold(),
-            )
-        ).first()
-        if collision is not None:
-            raise CaseDraftParseError(
-                f"case key {key} already exists for requirement {task.requirement_id}"
-            )
-
     imported: list[TestCase] = []
-    for section in sections:
-        key = normalize_case_key(section["case_key"])
-        existing = session.exec(
-            select(TestCase)
-            .where(
-                TestCase.source_task_id == task.id,
-                TestCase.source_draft_id == draft.id,
-                func.lower(func.trim(TestCase.source_case_key)) == key.casefold(),
-            )
-            .order_by(col(TestCase.id).asc())
-        ).first()
-        if existing is not None:
+    for action in actions:
+        section = action["section"]
+        key = section["case_key"]
+        existing = action["case"]
+        if action["action"] == "skip":
             # Idempotent repeat: do not replace title/body/status/revision.
             ensure_point_links(existing, section)
             imported.append(existing)
             continue
 
-        collision = session.exec(
-            select(TestCase)
-            .where(
-                TestCase.requirement_id == int(task.requirement_id),
-                func.lower(func.trim(TestCase.case_key)) == key.casefold(),
+        if action["action"] == "overwrite":
+            before = existing.content_md
+            title_changed = existing.title != section["title"]
+            changed_fields: set[str] = set()
+            if title_changed:
+                changed_fields.add("title")
+            if before != section["content_md"]:
+                changed_fields.add("content_md")
+            if (existing.priority or "P1") != (section.get("priority") or "P1"):
+                changed_fields.add("priority")
+            if existing.source_task_id != task.id:
+                changed_fields.add("source_task_id")
+            if existing.source_draft_id != draft.id:
+                changed_fields.add("source_draft_id")
+            if existing.source_case_key != key:
+                changed_fields.add("source_case_key")
+
+            existing.title = section["title"]
+            existing.content_md = section["content_md"]
+            existing.priority = section.get("priority") or "P1"
+            existing.revision = int(existing.revision or 0) + 1
+            existing.updated_at = utcnow()
+            existing.source_task_id = task.id
+            existing.source_draft_id = draft.id
+            existing.source_case_key = key
+            session.add(existing)
+            session.flush()
+            append_case_log(
+                session,
+                existing,
+                "update",
+                before=before,
+                after=existing.content_md,
+                reason="终版更新已有用例",
+                operator=operator,
+                source_task_id=task.id,
+                source_draft_id=draft.id,
+                source_case_key=key,
+                changed_fields=changed_fields,
+                title_changed=title_changed,
             )
-            .order_by(col(TestCase.id).asc())
-        ).first()
-        if collision is not None:
-            raise CaseDraftParseError(
-                f"case key {key} already exists for requirement {task.requirement_id}"
-            )
+            ensure_point_links(existing, section)
+            imported.append(existing)
+            continue
 
         case = TestCase(
             requirement_id=int(task.requirement_id),

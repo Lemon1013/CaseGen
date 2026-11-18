@@ -295,6 +295,19 @@ class FinalizeTaskBody(BaseModel):
     """
 
     draft_id: Optional[int] = Field(default=None, ge=1)
+    overwrite_existing: bool = False
+
+
+class FinalizeConflictOut(BaseModel):
+    case_key: str
+    existing_case_id: int
+    existing_title: str = ""
+    existing_status: str
+    new_title: str = ""
+
+
+class FinalizeConflictsOut(BaseModel):
+    conflicts: List[FinalizeConflictOut] = Field(default_factory=list)
 
 
 class TestCaseOut(BaseModel):

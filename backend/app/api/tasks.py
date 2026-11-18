@@ -40,6 +40,7 @@ from app.models.entities import (
 from app.schemas.tasks import (
     ApplyPromptBody,
     CaseDraftOut,
+    FinalizeConflictsOut,
     FinalizeTaskBody,
     PromptRevisionOut,
     ReviewResultOut,
@@ -81,7 +82,11 @@ from app.services.task_pipeline import (
     _fail_task,
 )
 from app.services.coverage import build_coverage
-from app.services.case_management import aggregate_draft_cases_by_points
+from app.services.case_management import (
+    CaseKeyConflictError,
+    aggregate_draft_cases_by_points,
+    find_finalize_conflicts,
+)
 from app.services.requirement_optimizer import optimize_requirement
 from app.services.test_points import (
     TEST_DIMENSIONS,
@@ -218,6 +223,11 @@ def _latest_draft(session: Session, task_id: int) -> Optional[CaseDraft]:
         .where(CaseDraft.task_id == task_id)
         .order_by(col(CaseDraft.version).desc())
     ).first()
+
+
+def _request_operator(request: Request) -> str:
+    user = getattr(request.state, "user", None)
+    return str(getattr(user, "username", None) or "system")[:128]
 
 
 def _latest_review_row(session: Session, task_id: int) -> Optional[ReviewResult]:
@@ -1365,28 +1375,70 @@ def _regenerate_task_locked(
     return to_task_out(session, task)
 
 
+@router.get("/{task_id}/finalize-conflicts", response_model=FinalizeConflictsOut)
+def finalize_conflicts_route(
+    task_id: int,
+    draft_id: int | None = Query(default=None, ge=1),
+    session: Session = Depends(get_session),
+) -> FinalizeConflictsOut:
+    task = session.get(GenerationTask, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if draft_id is None:
+        draft = _latest_draft(session, task_id)
+        if draft is None:
+            raise HTTPException(status_code=400, detail="Task has no case draft")
+    else:
+        draft = session.get(CaseDraft, draft_id)
+        if draft is None:
+            raise HTTPException(status_code=400, detail="Draft not found")
+        if draft.task_id != task_id:
+            raise HTTPException(status_code=400, detail="Draft does not belong to task")
+    try:
+        conflicts = find_finalize_conflicts(session, task, draft)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return FinalizeConflictsOut(conflicts=conflicts)
+
+
 @router.post("/{task_id}/finalize", response_model=TaskOut)
 def finalize_task_route(
     task_id: int,
+    request: Request,
     body: FinalizeTaskBody | None = None,
     session: Session = Depends(get_session),
 ) -> TaskOut:
     with task_locks.hold(task_id):
         session.expire_all()
-        return _finalize_task_locked(task_id, body, session)
+        return _finalize_task_locked(
+            task_id,
+            body,
+            session,
+            operator=_request_operator(request),
+        )
 
 
 def _finalize_task_locked(
     task_id: int,
     body: FinalizeTaskBody | None,
     session: Session,
+    *,
+    operator: str | None = None,
 ) -> TaskOut:
     task = session.get(GenerationTask, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
 
     try:
-        task = finalize_task(session, task_id, draft_id=body.draft_id if body else None)
+        task = finalize_task(
+            session,
+            task_id,
+            draft_id=body.draft_id if body else None,
+            overwrite_existing=body.overwrite_existing if body else False,
+            operator=operator,
+        )
+    except CaseKeyConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return to_task_out(session, task)
