@@ -45,6 +45,7 @@ const projectQuery = computed(() => {
 })
 
 const useCaseItems = [
+  { path: '/dashboard', label: '数据看板', icon: DataAnalysis, adminOnly: true },
   { path: '/', label: '用例生成', icon: Tickets },
   { path: '/tasks', label: '生成任务', icon: List },
   { path: '/agent', label: 'Agent 对话', icon: ChatDotRound },

@@ -35,6 +35,12 @@ const router = createRouter({
           meta: { title: '用例生成', description: '填写需求，创建任务并生成测试用例草稿' },
         },
         {
+          path: 'dashboard',
+          name: 'dashboard',
+          component: () => import('../views/DashboardView.vue'),
+          meta: { title: '数据看板', description: '全站运营与用例生成质量概览', adminOnly: true, skipProjectGate: true },
+        },
+        {
           path: 'account/security',
           name: 'account-security',
           component: () => import('../views/AccountSecurityView.vue'),
