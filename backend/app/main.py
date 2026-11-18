@@ -22,6 +22,7 @@ from app.api.projects import router as projects_router
 from app.api.external_wikis import router as external_wikis_router
 from app.api.agent_chat import router as agent_chat_router
 from app.api.users import router as users_router
+from app.api.dashboard import router as dashboard_router
 from app import config
 from app.config import ensure_data_dirs
 from app.db import get_engine, init_db
@@ -227,6 +228,7 @@ def create_app() -> FastAPI:
     app.include_router(projects_router)
     app.include_router(external_wikis_router)
     app.include_router(users_router)
+    app.include_router(dashboard_router)
     # Agent plane (line A).  Registered last so its /api/agent prefix can never
     # shadow an existing route, and before the SPA catch-all mount.
     app.include_router(agent_chat_router)
