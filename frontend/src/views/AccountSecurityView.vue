@@ -3,6 +3,7 @@ import { ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '../authStore'
+import { PASSWORD_POLICY_HINT, passwordPolicyError } from '../utils/password'
 
 const auth = useAuthStore()
 const router = useRouter()
@@ -24,8 +25,9 @@ async function submit() {
     ElMessage.warning('请输入新密码')
     return
   }
-  if (newPassword.value.length < 10) {
-    ElMessage.warning('新密码至少 10 位')
+  const passwordError = passwordPolicyError(newPassword.value)
+  if (passwordError) {
+    ElMessage.warning(passwordError)
     return
   }
   if (newPassword.value !== confirmPassword.value) {
@@ -79,7 +81,7 @@ async function submit() {
             maxlength="1024"
             show-password
             autocomplete="new-password"
-            placeholder="至少 10 位"
+            :placeholder="PASSWORD_POLICY_HINT"
             @keyup.enter="submit"
           />
         </el-form-item>

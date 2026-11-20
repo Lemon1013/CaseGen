@@ -22,6 +22,7 @@ matching rule as defence in depth.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import shutil
 import time
@@ -29,7 +30,7 @@ from pathlib import Path
 from typing import AsyncIterator, Optional
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func
 from sqlmodel import Session, col, select
@@ -48,12 +49,13 @@ from app.schemas.agent import (
     AgentMessageAccepted,
     AgentMessageCreate,
     AgentMessageOut,
+    AgentAttachmentOut,
     AgentModelItem,
     AgentModelsOut,
     AgentSaveAsDraftOut,
     AgentSkillOut,
 )
-from app.services import agent_draft, agent_gateway, agent_skills, agent_turn
+from app.services import agent_draft, agent_attachments, agent_gateway, agent_skills, agent_turn
 from app.services.agent_gateway import AgentGatewayError
 from app.services.agent_stream import agent_stream, encode_sse
 from app.services.case_management import CaseDraftParseError
@@ -127,6 +129,11 @@ def _owner_id(request: Request) -> Optional[int]:
 
     user = current_user(request)
     return int(user.id) if user is not None and user.id is not None else None
+
+
+def _project_workspace_dir(session: Session, project_id: int, conversation: AgentConversation) -> str:
+    project = session.get(Project, project_id)
+    return str((project.workspace_dir if project is not None else "") or conversation.workspace_dir or "")
 
 
 def _message_counts(session: Session, conversation_ids: list[str]) -> dict[str, int]:
@@ -220,7 +227,17 @@ def _load_messages(session: Session, conversation_id: str) -> list[AgentMessageO
         .where(col(AgentMessage.conversation_id) == str(conversation_id))
         .order_by(col(AgentMessage.created_at), col(AgentMessage.id))
     ).all()
-    return [AgentMessageOut.model_validate(row) for row in rows]
+    return [_message_out(row) for row in rows]
+
+
+def _message_out(row: AgentMessage) -> AgentMessageOut:
+    try:
+        raw = json.loads(row.attachments_json or "[]")
+        items = [AgentAttachmentOut(**{key: item[key] for key in ("id", "filename", "size", "content_type", "char_count", "created_at")})
+                 for item in raw if isinstance(item, dict)]
+    except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+        items = []
+    return AgentMessageOut.model_validate(row).model_copy(update={"attachments": items})
 
 
 def _duplicate_message(
@@ -496,6 +513,7 @@ def delete_conversation(
         if conversation.status == _BUSY_STATUS:
             raise HTTPException(status_code=409, detail=_DETAIL_DELETE_BUSY)
         dsh_session_id = conversation.dsh_session_id
+        workspace_dir = _project_workspace_dir(session, project_id, conversation)
         messages = session.exec(
             select(AgentMessage).where(col(AgentMessage.conversation_id) == str(conversation_id))
         ).all()
@@ -508,7 +526,36 @@ def delete_conversation(
     agent_stream.discard(conversation_id)
     # Only close the session; shared project workspace & dir are preserved.
     _close_dsh_session(dsh_session_id or "")
+    try:
+        agent_attachments.delete_conversation_attachments(project_id=project_id, conversation_id=conversation_id,
+                                                           workspace_dir=workspace_dir)
+    except Exception:
+        logger.warning("清理 Agent 附件失败：conversation=%s", conversation_id, exc_info=True)
     return AgentDeleteOut(id=str(conversation_id), status="deleted", message=_DETAIL_DELETE_OK)
+
+
+@router.post("/conversations/{conversation_id}/attachments", response_model=AgentAttachmentOut)
+def upload_attachment(conversation_id: str, request: Request, file: UploadFile = File(...),
+                      session: Session = Depends(get_session)) -> AgentAttachmentOut:
+    _require_agent_enabled()
+    project_id = _require_project(request)
+    conversation = _get_conversation(session, conversation_id, project_id, _owner_id(request))
+    workspace_dir = _project_workspace_dir(session, project_id, conversation)
+    if conversation.status == _BUSY_STATUS:
+        raise HTTPException(status_code=409, detail=_DETAIL_BUSY)
+    if conversation.status == _CLOSED_STATUS:
+        raise HTTPException(status_code=409, detail=_DETAIL_CLOSED)
+    try:
+        content = file.file.read(config.MAX_UPLOAD_BYTES + 1)
+        meta = agent_attachments.save_attachment(project_id=project_id, conversation_id=conversation_id,
+            filename=file.filename or "", content=content, content_type=file.content_type,
+            workspace_dir=workspace_dir)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    except Exception:
+        logger.exception("Agent 附件解析失败：conversation=%s", conversation_id)
+        raise HTTPException(status_code=422, detail="附件解析失败，未保存附件。") from None
+    return AgentAttachmentOut(**{key: meta[key] for key in ("id", "filename", "size", "content_type", "char_count", "created_at")})
 
 
 @router.post("/conversations/{conversation_id}/messages", response_model=AgentMessageAccepted)
@@ -530,8 +577,6 @@ def post_message(
     project_id = _require_project(request)
     idempotency_key = body.idempotency_key.strip()
     content = body.content.strip()
-    if not content:
-        raise HTTPException(status_code=422, detail="消息内容不能为空。")
 
     started_stream_id: Optional[int] = None
     with agent_gateway.conversation_locks.hold(conversation_id):
@@ -543,24 +588,34 @@ def post_message(
         if conversation.status == _CLOSED_STATUS:
             raise HTTPException(status_code=409, detail=_DETAIL_CLOSED)
         _check_version(conversation, body.expected_version)
-
         duplicate = _duplicate_message(session, conversation_id, idempotency_key)
         if duplicate is not None:
-            message = AgentMessageOut.model_validate(duplicate)
+            message = _message_out(duplicate)
             conversation_out = _conversation_out(session, conversation)
             return AgentMessageAccepted(
                 conversation=conversation_out, message=message, duplicated=True
             )
 
+        if not content and not body.attachment_ids:
+            raise HTTPException(status_code=422, detail="消息内容不能为空。")
+
+        workspace_dir = _project_workspace_dir(session, project_id, conversation)
+        try:
+            attachments = agent_attachments.resolve_attachments(project_id=project_id, conversation_id=conversation_id,
+                attachment_ids=body.attachment_ids, workspace_dir=workspace_dir)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
+
         message = AgentMessage(
             conversation_id=str(conversation_id),
             role="user",
             content=content,
+            attachments_json=json.dumps(attachments, ensure_ascii=False),
             idempotency_key=idempotency_key,
         )
         session.add(message)
         if conversation.title == _DEFAULT_TITLE:
-            conversation.title = _title_from_message(content)
+            conversation.title = _title_from_message(content or f"附件：{attachments[0]['filename']}")
         conversation.status = _BUSY_STATUS
         conversation.cancel_requested = False
         conversation.version = int(conversation.version or 1) + 1
@@ -578,7 +633,7 @@ def post_message(
         )
         snapshot = agent_stream.snapshot(conversation_id) or {}
         started_stream_id = int(snapshot.get("stream_id") or 0)
-        message_out = AgentMessageOut.model_validate(message)
+        message_out = _message_out(message)
         conversation_out = _conversation_out(session, conversation)
 
     agent_turn.start_turn(conversation_id, stream_id=started_stream_id or 0)

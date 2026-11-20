@@ -18,6 +18,7 @@ import {
   sendAgentMessage,
   updateAgentConversation,
   type AgentConversationItem,
+  type AgentAttachmentItem,
   type AgentMessageItem,
   type AgentModelItem,
   type AgentModelsResponse,
@@ -43,6 +44,7 @@ export interface AgentDisplayMessage {
   conversation_id: string
   role: 'user' | 'assistant'
   content: string
+  attachments?: AgentAttachmentItem[]
   /** 思考过程（模型 reasoning + tool_call 前的过场说明）。 */
   thought?: string
   created_at: string
@@ -197,6 +199,7 @@ export const useAgentChatStore = defineStore('agentChat', () => {
         conversation_id: item.conversation_id,
         role: item.role === 'assistant' ? 'assistant' : 'user',
         content: item.content,
+        attachments: item.attachments,
         thought: item.reasoning || '',
         created_at: item.created_at,
       }),
@@ -473,6 +476,7 @@ export const useAgentChatStore = defineStore('agentChat', () => {
         role: message.role,
         content: message.content,
         reasoning: message.thought || '',
+        attachments: message.attachments,
         created_at: message.created_at,
       },
     ]
@@ -710,10 +714,10 @@ export const useAgentChatStore = defineStore('agentChat', () => {
     }
   }
 
-  async function sendMessage(content: string) {
+  async function sendMessage(content: string, attachmentIds: string[] = [], attachments: AgentAttachmentItem[] = []) {
     const text = content.trim()
     const id = currentId.value
-    if (!text || !id) return
+    if ((!text && !attachmentIds.length) || !id) return
     sending.value = true
     streamError.value = ''
     cancelRequested = false
@@ -726,6 +730,7 @@ export const useAgentChatStore = defineStore('agentChat', () => {
       conversation_id: id,
       role: 'user',
       content: text,
+      attachments,
       created_at: new Date().toISOString(),
       pending: true,
     })
@@ -740,7 +745,7 @@ export const useAgentChatStore = defineStore('agentChat', () => {
       // 传了只会在版本号过期时把正常发送变成 409。
       const accepted = await sendAgentMessage(
         id,
-        { content: text, idempotency_key: idempotencyKey },
+        { content: text, idempotency_key: idempotencyKey, attachment_ids: attachmentIds },
         projectId.value,
       )
       // duplicated=true 表示幂等命中（同键重发），后端已存在的消息即权威记录。

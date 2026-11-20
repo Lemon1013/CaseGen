@@ -41,7 +41,7 @@ def _admin_client(tmp_app_data, monkeypatch) -> TestClient:
     response = client.post(
         "/api/auth/setup",
         headers=_origin(),
-        json={"username": "admin", "display_name": "Admin", "password": "password1234"},
+        json={"username": "admin", "display_name": "Admin", "password": "CaseGen-Test1!"},
     )
     assert response.status_code == 200
     with Session(get_engine()) as session:

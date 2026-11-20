@@ -29,7 +29,7 @@ def _admin_client(tmp_app_data, monkeypatch) -> TestClient:
     response = client.post(
         "/api/auth/setup",
         headers=_origin(),
-        json={"username": "admin", "display_name": "Admin", "password": "password1234"},
+        json={"username": "admin", "display_name": "Admin", "password": "CaseGen-Test1!"},
     )
     assert response.status_code == 200
     return client
@@ -137,7 +137,7 @@ def test_import_doc_requires_login_and_same_origin(tmp_app_data, monkeypatch):
     setup = client.post(
         "/api/auth/setup",
         headers=_origin(),
-        json={"username": "admin", "display_name": "Admin", "password": "password1234"},
+        json={"username": "admin", "display_name": "Admin", "password": "CaseGen-Test1!"},
     )
     assert setup.status_code == 200
     missing_origin = client.post(_import_url(), files=files)

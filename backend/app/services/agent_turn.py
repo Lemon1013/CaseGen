@@ -22,6 +22,7 @@ Design rules that shape this module:
 from __future__ import annotations
 
 import logging
+import json
 import threading
 import time
 from datetime import datetime, timezone
@@ -263,7 +264,18 @@ def _load_turn_inputs(conversation_id: str) -> Optional[dict[str, Any]]:
             "workspace_dir": project_workspace_dir or conversation.workspace_dir,
             "project_id": conversation.project_id or "",
             "prompt": (last_user.content if last_user is not None else "") or "",
+            "attachments": _parse_message_attachments(last_user),
         }
+
+
+def _parse_message_attachments(message: AgentMessage | None) -> list[dict[str, Any]]:
+    if message is None:
+        return []
+    try:
+        value = json.loads(message.attachments_json or "[]")
+        return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
 
 
 def _persist_session_ids(
@@ -398,25 +410,48 @@ def _knowledge_space_dirs(project_id: str) -> list[str]:
         return []
 
 
-def _knowledge_prompt_block(dirs: list[str]) -> str:
-    if not dirs:
-        return ""
-    lines = "\n".join(f"- {p}" for p in dirs)
-    return (
-        "[知识空间]\n"
-        "本项目的知识库以 Markdown 文件存放在以下目录（只读）：\n"
-        f"{lines}\n"
-        "需要背景资料时，请自行用文件检索工具（glob / grep / read）在这些目录内查阅相关文档，不要凭空编造。\n"
-        "严格限制：只允许在上述列出的目录内检索和阅读，不要访问其他知识空间目录（包括 data/wiki/spaces/ 下的其它空间），不要读取这些目录之外的任何文件，也不要把检索范围扩大到整个项目或磁盘。\n\n"
-    )
+def _knowledge_prompt_block(dirs: list[str], attachments: list[dict[str, Any]] | None = None) -> str:
+    attachments = attachments or []
+    blocks: list[str] = []
+    if dirs:
+        lines = "\n".join(f"- {p}" for p in dirs)
+        restriction = (
+            "严格限制：只允许在上述列出的目录及本轮附件路径内检索和阅读，不要访问其他知识空间目录（包括 data/wiki/spaces/ 下的其它空间），不要读取上述允许范围之外的任何文件，也不要把检索范围扩大到整个项目或磁盘。\n\n"
+            if attachments else
+            "严格限制：只允许在上述列出的目录内检索和阅读，不要访问其他知识空间目录（包括 data/wiki/spaces/ 下的其它空间），不要读取这些目录之外的任何文件，也不要把检索范围扩大到整个项目或磁盘。\n\n"
+        )
+        blocks.append(
+            "[知识空间]\n"
+            "本项目的知识库以 Markdown 文件存放在以下目录（只读）：\n"
+            f"{lines}\n"
+            "需要背景资料时，请自行用文件检索工具（glob / grep / read）在这些目录内查阅相关文档，不要凭空编造。\n"
+            f"{restriction}"
+        )
+    if attachments:
+        lines = "\n".join(f"- 文件名：{item.get('filename', '')}（{item.get('char_count', 0)} 字）\n  解析文本路径：{item.get('parsed_path', '')}" for item in attachments)
+        attachment_restriction = (
+            "除上述知识目录和本轮附件路径外，不得读取其它目录、整个项目或磁盘。"
+            if dirs else
+            "除本轮附件路径外，不得读取其它目录、整个项目或磁盘。"
+        )
+        blocks.append(
+            "[本轮附件]\n以下附件已上传到当前工作区，允许读取：\n"
+            + lines
+            + "\n需要时请使用文件读取工具读取上述路径；不要仅凭文件名猜测内容。"
+            + attachment_restriction
+            + "\n\n"
+        )
+    return "".join(blocks)
 
 
 def _build_prompt(
-    user_text: str, skill_name: Optional[str], knowledge_dirs: Optional[list[str]] = None
+    user_text: str, skill_name: Optional[str], knowledge_dirs: Optional[list[str]] = None,
+    attachments: Optional[list[dict[str, Any]]] = None,
 ) -> str:
     return (
         skill_prompt_prefix(skill_name or "")
-        + _knowledge_prompt_block(knowledge_dirs or [])
+        + _knowledge_prompt_block(knowledge_dirs or [], attachments or [])
+        + ("请先阅读本轮附件，再协助进行测试设计。\n" if attachments and not (user_text or "").strip() else "")
         + (user_text or "")
     )
 
@@ -533,10 +568,11 @@ def run_turn(
             return {"outcome": "failed", "category": "not_found", "text": ""}
 
         raw_user_text = inputs["prompt"] or ""
+        attachments = inputs.get("attachments") or []
         knowledge_dirs = _knowledge_space_dirs(str(inputs.get("project_id") or ""))
         prompt = (
-            _build_prompt(raw_user_text, inputs.get("skill_name"), knowledge_dirs)
-            if raw_user_text.strip()
+            _build_prompt(raw_user_text, inputs.get("skill_name"), knowledge_dirs, attachments)
+            if raw_user_text.strip() or attachments
             else ""
         )
         if not prompt.strip():

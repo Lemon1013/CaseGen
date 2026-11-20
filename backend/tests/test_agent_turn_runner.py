@@ -1,5 +1,6 @@
 # Tests for the agent turn runner's delta/commentary publication timing.
 
+import json
 import pytest
 from sqlmodel import Session, select
 
@@ -143,3 +144,40 @@ def test_answer_without_tool_stays_out_of_reasoning(runner_broker, monkeypatch):
     assert len(messages) == 1
     assert messages[0].content == "answer"
     assert messages[0].reasoning == "think"
+
+
+def test_attachment_prompt_contains_path_but_not_parsed_body(runner_broker, monkeypatch):
+    conversation_id = "0123456789abcdef0123456789abcdef"
+    with Session(get_engine()) as session:
+        session.add(AgentConversation(id=conversation_id, project_id="1", title="附件", status="busy", dsh_session_id="sess-test"))
+        session.add(AgentMessage(
+            conversation_id=conversation_id,
+            role="user",
+            content="",
+            attachments_json=json.dumps([{
+                "id": "abcdef0123456789abcdef0123456789",
+                "conversation_id": conversation_id,
+                "project_id": "1",
+                "filename": "需求.md",
+                "size": 12,
+                "content_type": "text/markdown",
+                "char_count": 18,
+                "original_path": "attachments/0123456789abcdef0123456789abcdef/abcdef0123456789abcdef0123456789/original.md",
+                "parsed_path": "attachments/0123456789abcdef0123456789abcdef/abcdef0123456789abcdef0123456789/parsed.txt",
+                "created_at": "2026-01-01T00:00:00+00:00",
+            }], ensure_ascii=False),
+        ))
+        session.commit()
+
+    captured = {}
+    def fake_stream(session_id, prompt, **kwargs):
+        captured["prompt"] = prompt
+        yield AgentEvent(kind="connected", session_id="sess-test")
+        yield AgentEvent(kind="completed")
+
+    monkeypatch.setattr(agent_turn.agent_gateway, "stream_prompt", fake_stream)
+    result = agent_turn.run_turn(conversation_id)
+    assert result["outcome"] == "completed"
+    assert "[本轮附件]" in captured["prompt"]
+    assert "attachments/0123456789abcdef0123456789abcdef/abcdef0123456789abcdef0123456789/parsed.txt" in captured["prompt"]
+    assert "UNIQUE_ATTACHMENT_BODY" not in captured["prompt"]

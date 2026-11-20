@@ -21,7 +21,7 @@ from app.services.auth import (
     hash_password,
     normalize_username,
     revoke_user_sessions,
-    validate_password,
+    validate_password_policy,
 )
 from app.services.permissions import require_admin
 
@@ -84,7 +84,7 @@ def create_user(body: UserCreate, request: Request, session: Session = Depends(g
     require_admin(request)
     try:
         username = normalize_username(body.username)
-        password = validate_password(body.password)
+        password = validate_password_policy(body.password)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     row = User(
@@ -141,7 +141,7 @@ def reset_user_password(
     require_admin(request)
     row = _get(session, user_id)
     try:
-        password = validate_password(body.password)
+        password = validate_password_policy(body.password)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     row.password_hash = hash_password(password)

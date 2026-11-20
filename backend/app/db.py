@@ -111,6 +111,8 @@ def _migrate_sqlite_columns(engine) -> None:
                         "ADD COLUMN reasoning TEXT DEFAULT ''"
                     )
                 )
+            if "attachments_json" not in agent_message_names:
+                conn.execute(text("ALTER TABLE agent_messages ADD COLUMN attachments_json TEXT DEFAULT '[]'"))
 
 
 def _migrate_model_defaults(engine) -> None:

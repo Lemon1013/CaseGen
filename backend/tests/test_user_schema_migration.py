@@ -58,7 +58,7 @@ def test_migration_adds_columns_and_backfills_legacy_rows(tmp_app_data):
     with Session(engine) as session:
         admin = User(
             username="admin",
-            password_hash=hash_password("password1234"),
+            password_hash=hash_password("CaseGen-Test1!"),
             role="admin",
             is_active=True,
         )
@@ -102,13 +102,13 @@ def test_backfill_never_reassigns_an_explicit_owner(tmp_app_data):
     with Session(get_engine()) as session:
         admin = User(
             username="admin",
-            password_hash=hash_password("password1234"),
+            password_hash=hash_password("CaseGen-Test1!"),
             role="admin",
             is_active=True,
         )
         member = User(
             username="member",
-            password_hash=hash_password("password1234"),
+            password_hash=hash_password("CaseGen-Test1!"),
             role="user",
             is_active=True,
         )

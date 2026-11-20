@@ -209,7 +209,7 @@ def test_project_backfill_decision_audit_conflict_rolls_back(tmp_app_data):
 def test_shared_write_endpoints_require_admin(tmp_app_data, monkeypatch):
     monkeypatch.setattr(config, "AUTH_ENABLED", True)
     client = TestClient(create_app()); origin = {"Origin": "http://testserver"}
-    assert client.post("/api/auth/setup", headers=origin, json={"username": "admin", "password": "password1234"}).status_code == 200
+    assert client.post("/api/auth/setup", headers=origin, json={"username": "admin", "password": "CaseGen-Test1!"}).status_code == 200
     with Session(get_engine()) as session:
         default_project = session.exec(select(Project)).first()
         client.params = {"project_id": int(default_project.id)}
@@ -220,8 +220,8 @@ def test_shared_write_endpoints_require_admin(tmp_app_data, monkeypatch):
         json={"wiki_space_id": shared["id"], "enabled": True, "priority": 100},
     ).status_code == 200
     with Session(get_engine()) as session:
-        session.add(User(username="member", display_name="Member", password_hash=hash_password("password1234"), role="user", is_active=True)); session.commit()
-    client.post("/api/auth/logout", headers=origin); assert client.post("/api/auth/login", headers=origin, json={"username": "member", "password": "password1234"}).status_code == 200
+        session.add(User(username="member", display_name="Member", password_hash=hash_password("CaseGen-Test1!"), role="user", is_active=True)); session.commit()
+    client.post("/api/auth/logout", headers=origin); assert client.post("/api/auth/login", headers=origin, json={"username": "member", "password": "CaseGen-Test1!"}).status_code == 200
     assert client.put(f"/api/wiki-spaces/{shared['id']}", headers=origin, json={"name": "Blocked"}).status_code == 403
     assert client.post("/api/documents", headers=origin, data={"space_id": shared["id"]}, files={"file": ("x.md", "x", "text/markdown")}).status_code == 403
     with Session(get_engine()) as session:
@@ -337,7 +337,7 @@ def test_authenticated_project_context_is_required_and_matches_targets(tmp_app_d
     monkeypatch.setattr(config, "AUTH_ENABLED", True)
     client = TestClient(create_app())
     origin = {"Origin": "http://testserver"}
-    assert client.post("/api/auth/setup", headers=origin, json={"username": "admin", "password": "password1234"}).status_code == 200
+    assert client.post("/api/auth/setup", headers=origin, json={"username": "admin", "password": "CaseGen-Test1!"}).status_code == 200
     with Session(get_engine()) as session:
         first = session.exec(select(Project)).first()
         first_id, first_space = int(first.id), int(first.default_wiki_space_id)
@@ -394,10 +394,10 @@ def test_authenticated_project_context_is_required_and_matches_targets(tmp_app_d
     ).status_code == 200
 
     with Session(get_engine()) as session:
-        session.add(User(username="member2", display_name="Member", password_hash=hash_password("password1234"), role="user", is_active=True))
+        session.add(User(username="member2", display_name="Member", password_hash=hash_password("CaseGen-Test1!"), role="user", is_active=True))
         session.commit()
     client.post("/api/auth/logout", headers=origin)
-    assert client.post("/api/auth/login", headers=origin, json={"username": "member2", "password": "password1234"}).status_code == 200
+    assert client.post("/api/auth/login", headers=origin, json={"username": "member2", "password": "CaseGen-Test1!"}).status_code == 200
     assert client.put(f"/api/projects/{first_id}", params=first_query, headers=origin, json={"name": "blocked"}).status_code == 403
     assert client.delete(f"/api/projects/{first_id}/shared-wikis/{shared['id']}", params=first_query, headers=origin).status_code == 403
     assert client.delete(f"/api/projects/{first_id}", params=first_query, headers=origin).status_code == 403

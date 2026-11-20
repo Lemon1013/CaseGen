@@ -1,7 +1,7 @@
 import { api } from './client'
 
 /**
- * Agent 对话（DSH 集成，spec docs/superpowers/specs/2026-11-04-dsh-agent-integration-design.md §3.1-§3.2）。
+ * Agent 对话（DSH 集成）。正文可为空，但正文和附件不能同时为空；正文上限为 32000 字。
  *
  * 约定：
  * - 走 api() 封装 ⇒ 自动带 X-CSRF-Token、credentials include、自动注入 project_id query。
@@ -16,7 +16,7 @@ export type AgentConversationStatus = 'active' | 'busy' | 'closed'
 
 /**
  * 单条用户消息正文上限，对齐 backend/app/schemas/agent.py:66
- * `AgentMessageCreate.content: str = Field(min_length=1, max_length=32_000)`。
+ * 正文可为空，但正文和附件不能同时为空；正文上限 32000。
  * 超限会被后端 422 拒掉，前端先拦，避免白跑一次请求。
  */
 export const AGENT_MESSAGE_MAX_CHARS = 32_000
@@ -56,6 +56,16 @@ export interface AgentMessageItem {
   content: string
   /** 思考过程（模型 reasoning + 过场说明）；与正文分开存储。 */
   reasoning?: string
+  attachments?: AgentAttachmentItem[]
+  created_at: string
+}
+
+export interface AgentAttachmentItem {
+  id: string
+  filename: string
+  size: number
+  content_type: string
+  char_count: number
   created_at: string
 }
 
@@ -183,12 +193,13 @@ export interface AgentCreateConversationBody {
 }
 
 export interface AgentSendMessageBody {
-  /** 上限 AGENT_MESSAGE_MAX_CHARS（32000），且不可为空白（min_length=1）。 */
+  /** 正文可为空，但正文和附件不能同时为空；正文上限 32000 字。 */
   content: string
   /** 客户端生成，服务端查重（幂等）；上限 200 字。 */
   idempotency_key: string
   /** 乐观锁：回传会话当前 version，过期写入返回 409（AgentMessageCreate.expected_version）。 */
   expected_version?: number
+  attachment_ids?: string[]
 }
 
 /** POST /messages 的返回体，对齐 AgentMessageAccepted（schemas/agent.py:72）。
@@ -377,6 +388,15 @@ export function sendAgentMessage(
   return api<AgentMessageAccepted>(`/api/agent/conversations/${id}/messages${_projectQuery(projectId)}`, {
     method: 'POST',
     body: JSON.stringify(body),
+  })
+}
+
+export function uploadAgentAttachment(conversationId: string, file: File, projectId?: AgentProjectId | null) {
+  const form = new FormData()
+  form.append('file', file)
+  return api<AgentAttachmentItem>('/api/agent/conversations/' + conversationId + '/attachments' + _projectQuery(projectId), {
+    method: 'POST',
+    body: form,
   })
 }
 

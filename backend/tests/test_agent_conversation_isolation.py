@@ -27,7 +27,7 @@ def _make_user(username: str, role: str = "user") -> int:
         row = User(
             username=username,
             display_name=username,
-            password_hash=hash_password("password1234"),
+            password_hash=hash_password("CaseGen-Test1!"),
             role=role,
             is_active=True,
         )
@@ -42,7 +42,7 @@ def _client_for(username: str) -> TestClient:
     assert client.post(
         "/api/auth/login",
         headers=_origin(),
-        json={"username": username, "password": "password1234"},
+        json={"username": username, "password": "CaseGen-Test1!"},
     ).status_code == 200
     return client
 
@@ -53,7 +53,7 @@ def _env(tmp_app_data, monkeypatch):
     assert admin.post(
         "/api/auth/setup",
         headers=_origin(),
-        json={"username": "root", "password": "password1234"},
+        json={"username": "root", "password": "CaseGen-Test1!"},
     ).status_code == 200
     with Session(get_engine()) as session:
         project_id = int(session.exec(select(Project)).first().id)

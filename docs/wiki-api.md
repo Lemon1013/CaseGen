@@ -114,9 +114,9 @@ Review 详情的 `source_evidence` 使用 `{document_id, chunk_ids, clauses}`；
 
 `GET /api/auth/bootstrap` 的 `registration_enabled` 在 `setup_required=true` 时固定为 `false`；初始化完成后返回运行时开关。开关默认来自 `CASEGEN_ALLOW_REGISTRATION`（默认 `true`），管理员修改后写入 SQLite 的 `app_settings` 表并立即生效，无需重启。
 
-`POST /api/auth/register` 请求体只接受 `username`、`display_name` 和 `password`；新账号固定为 `role=user`、`is_active=true`，请求中夹带的 `role` 等字段不会生效。用户名经规范化后必须为 3–32 位、以字母开头且仅含小写字母、数字、`.`、`_`、`-`；密码至少 10 位。成功返回 `201` 和与登录相同的 `{user, expires_at}`，并写入会话 Cookie 与 CSRF Cookie。业务错误：注册开关关闭返回 `403`（`公开注册已关闭`），系统尚无用户返回 `409`（`请先完成初始化`），用户名重复返回 `409`（`用户名已存在`），用户名或密码格式不合法返回 `422`。
+`POST /api/auth/register` 请求体只接受 `username`、`display_name` 和 `password`；新账号固定为 `role=user`、`is_active=true`，请求中夹带的 `role` 等字段不会生效。用户名经规范化后必须为 3–32 位、以字母开头且仅含小写字母、数字、`.`、`_`、`-`；密码至少 10 位、最多 1024 位，且必须同时包含大写字母、小写字母和特殊符号，不要求包含数字。成功返回 `201` 和与登录相同的 `{user, expires_at}`，并写入会话 Cookie 与 CSRF Cookie。业务错误：注册开关关闭返回 `403`（`公开注册已关闭`），系统尚无用户返回 `409`（`请先完成初始化`），用户名重复返回 `409`（`用户名已存在`），用户名或密码格式不合法返回 `422`。
 
-`POST /api/auth/change-password` 请求体为 `{current_password, new_password}`。当前密码错误返回 `400`；新密码不足 10 位、过长或与当前密码相同返回 `422`；未登录由全局中间件返回 `401`。成功后返回 `200`（`密码已修改，请重新登录`），删除该用户的全部 `AuthSession` 并清理响应中的会话/CSRF Cookie，因此当前会话和其他设备上的会话都必须重新登录。本系统不提供邮箱验证或找回密码；忘记密码仍由管理员通过用户管理接口重置。
+`POST /api/auth/change-password` 请求体为 `{current_password, new_password}`。当前密码错误返回 `400`；新密码至少 10 位、最多 1024 位，且必须同时包含大写字母、小写字母和特殊符号，不合规或与当前密码相同返回 `422`；未登录由全局中间件返回 `401`。成功后返回 `200`（`密码已修改，请重新登录`），删除该用户的全部 `AuthSession` 并清理响应中的会话/CSRF Cookie，因此当前会话和其他设备上的会话都必须重新登录。本系统不提供邮箱验证或找回密码；忘记密码仍由管理员通过用户管理接口重置。
 
 `GET/PUT /api/auth/registration-setting` 仅管理员可访问，响应和请求体均为 `{"enabled": bool}`；普通用户返回 `403`。
 

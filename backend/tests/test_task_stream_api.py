@@ -258,7 +258,7 @@ def test_task_stream_requires_auth_and_allows_authenticated_cookie(
         json={
             "username": "admin",
             "display_name": "Admin",
-            "password": "password1234",
+            "password": "CaseGen-Test1!",
         },
     )
     assert setup.status_code == 200

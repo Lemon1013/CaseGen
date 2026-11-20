@@ -38,7 +38,7 @@ def _admin_client(tmp_app_data, monkeypatch) -> TestClient:
     response = client.post(
         "/api/auth/setup",
         headers=_origin(),
-        json={"username": "admin", "display_name": "Admin", "password": "password1234"},
+        json={"username": "admin", "display_name": "Admin", "password": "CaseGen-Test1!"},
     )
     assert response.status_code == 200
     return client
@@ -81,13 +81,13 @@ def test_auth_off_and_non_admin_are_rejected(tmp_app_data, monkeypatch):
 
     monkeypatch.setattr(config, "AUTH_ENABLED", True)
     client = TestClient(create_app())
-    setup = client.post("/api/auth/setup", headers=_origin(), json={"username": "admin", "password": "password1234"})
+    setup = client.post("/api/auth/setup", headers=_origin(), json={"username": "admin", "password": "CaseGen-Test1!"})
     assert setup.status_code == 200
     with Session(get_engine()) as session:
-        session.add(User(username="operator", display_name="Operator", password_hash=hash_password("password1234"), role="user", is_active=True))
+        session.add(User(username="operator", display_name="Operator", password_hash=hash_password("CaseGen-Test1!"), role="user", is_active=True))
         session.commit()
     client.post("/api/auth/logout", headers=_origin())
-    assert client.post("/api/auth/login", headers=_origin(), json={"username": "operator", "password": "password1234"}).status_code == 200
+    assert client.post("/api/auth/login", headers=_origin(), json={"username": "operator", "password": "CaseGen-Test1!"}).status_code == 200
     assert client.get("/api/admin/wiki/purge/preview", headers=_origin()).status_code == 403
 
 

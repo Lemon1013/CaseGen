@@ -354,7 +354,7 @@ def test_finalize_overwrite_logs_authenticated_operator(tmp_app_data, monkeypatc
         json={
             "username": "admin",
             "display_name": "Admin",
-            "password": "correct-horse-battery-staple",
+            "password": "CaseGen-Test1!",
         },
     )
     assert setup.status_code == 200

@@ -19,6 +19,10 @@ from app.models.entities import AuthSession, SystemSetting, User
 
 USERNAME_RE = re.compile(r"^[a-z][a-z0-9_.-]{2,31}$")
 MIN_PASSWORD_LENGTH = 10
+MAX_PASSWORD_LENGTH = 1024
+UPPERCASE_PASSWORD_RE = re.compile(r"[A-Z]")
+LOWERCASE_PASSWORD_RE = re.compile(r"[a-z]")
+SPECIAL_PASSWORD_RE = re.compile(r"[^A-Za-z0-9\s]")
 _SCRYPT_N = 2**14
 _SCRYPT_R = 8
 _SCRYPT_P = 1
@@ -60,9 +64,20 @@ def normalize_username(username: str) -> str:
 
 def validate_password(password: str) -> str:
     if not isinstance(password, str) or len(password) < MIN_PASSWORD_LENGTH:
-        raise ValueError(f"Password must be at least {MIN_PASSWORD_LENGTH} characters")
-    if len(password) > 1024:
-        raise ValueError("Password is too long")
+        raise ValueError(f"密码至少 {MIN_PASSWORD_LENGTH} 位")
+    if len(password) > MAX_PASSWORD_LENGTH:
+        raise ValueError(f"密码不能超过 {MAX_PASSWORD_LENGTH} 位")
+    return password
+
+
+def validate_password_policy(password: str) -> str:
+    password = validate_password(password)
+    if (
+        not UPPERCASE_PASSWORD_RE.search(password)
+        or not LOWERCASE_PASSWORD_RE.search(password)
+        or not SPECIAL_PASSWORD_RE.search(password)
+    ):
+        raise ValueError("密码必须同时包含大写字母、小写字母和特殊符号")
     return password
 
 
@@ -156,7 +171,7 @@ def create_initial_user(
     """
 
     normalized = normalize_username(username)
-    password = validate_password(password)
+    password = validate_password_policy(password)
     with _SETUP_LOCK:
         # Session has not issued a query at this point in the setup route.  An
         # explicit IMMEDIATE transaction closes the count-then-insert race for
@@ -202,7 +217,7 @@ def register_user(
         normalized = normalize_username(username)
     except ValueError as exc:
         raise ValueError(USERNAME_FORMAT_DETAIL) from exc
-    validated = validate_password(password)
+    validated = validate_password_policy(password)
     row = User(
         username=normalized,
         display_name=(display_name or "").strip()[:80],
@@ -271,7 +286,7 @@ def change_password(
         raise CurrentPasswordIncorrectError("当前密码不正确")
     if new_password == current_password:
         raise PasswordUnchangedError("新密码不能与当前密码相同")
-    validated = validate_password(new_password)
+    validated = validate_password_policy(new_password)
     user.password_hash = hash_password(validated)
     user.updated_at = utcnow()
     session.add(user)

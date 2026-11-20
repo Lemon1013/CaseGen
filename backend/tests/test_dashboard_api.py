@@ -32,7 +32,7 @@ from app.models.entities import (
     WikiSpace,
 )
 
-ADMIN_PASSWORD = "password1234"
+ADMIN_PASSWORD = "CaseGen-Test1!"
 
 
 def _origin() -> dict[str, str]:

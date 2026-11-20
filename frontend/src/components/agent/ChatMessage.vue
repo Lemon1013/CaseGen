@@ -7,6 +7,7 @@ import CaseResultCard from './CaseResultCard.vue'
 import { hasAgentCaseJson, parseAgentCaseGroups, stripAgentCaseJson } from './parseAgentCases'
 import { formatDateTime } from '../../utils/datetime'
 import type { DraftPointGroup } from '../../api/tasks'
+import type { AgentAttachmentItem } from '../../api/agent'
 
 /**
  * 单条对话气泡。
@@ -29,6 +30,7 @@ const props = defineProps<{
   savingDraft?: boolean
   /** Agent 思考过程文本；无值时不渲染，不伪造内容。 */
   thought?: string
+  attachments?: AgentAttachmentItem[]
 }>()
 
 const emit = defineEmits<{
@@ -83,6 +85,11 @@ const hasCases = computed(() => {
 })
 
 const isUser = computed(() => props.role === 'user')
+
+function formatAttachmentSize(size: number): string {
+  if (size < 1024 * 1024) return String(Math.max(1, Math.round(size / 1024)) + ' KB')
+  return String((size / 1024 / 1024).toFixed(2) + ' MB')
+}
 
 function toggleExpanded() {
   expanded.value = !expanded.value
@@ -142,7 +149,7 @@ async function copyContent() {
         </div>
       </details>
       <div
-        v-if="displayContent || streaming || isUser"
+        v-if="displayContent || streaming || (isUser && !attachments?.length)"
         class="bubble-body"
         :class="{ 'is-user-body': isUser }"
       >
@@ -157,6 +164,11 @@ async function copyContent() {
           <span class="dot" />
           <span class="dot" />
         </div>
+      </div>
+      <div v-if="isUser && attachments?.length" class="attachment-list">
+        <el-tag v-for="item in attachments" :key="item.id" size="small" effect="plain">
+          {{ item.filename }}（{{ formatAttachmentSize(item.size) }}）
+        </el-tag>
       </div>
       <div v-if="!isUser && !isCollapsed && !streaming && (displayContent || thought || hasCases || canSaveDraft)" class="bubble-actions">
         <el-button v-if="collapsible && expanded" size="small" link @click="toggleExpanded">收起</el-button>
@@ -423,5 +435,12 @@ async function copyContent() {
 
 .bubble-cases {
   margin-top: 4px;
+}
+
+.attachment-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
 }
 </style>

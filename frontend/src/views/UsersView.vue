@@ -9,6 +9,7 @@ import {
   updateUser,
   type UserItem,
 } from '../api/users'
+import { PASSWORD_MAX_LENGTH, PASSWORD_POLICY_HINT, passwordPolicyError } from '../utils/password'
 
 const loading = ref(false)
 const saving = ref(false)
@@ -97,6 +98,11 @@ async function submitCreate() {
     ElMessage.warning('请填写用户名与初始口令')
     return
   }
+  const passwordError = passwordPolicyError(createForm.password)
+  if (passwordError) {
+    ElMessage.warning(passwordError)
+    return
+  }
   saving.value = true
   try {
     await createUser({
@@ -169,6 +175,11 @@ function openReset(row: UserItem) {
 async function submitReset() {
   if (!resetTarget.value || !resetForm.password) {
     ElMessage.warning('请填写新口令')
+    return
+  }
+  const passwordError = passwordPolicyError(resetForm.password)
+  if (passwordError) {
+    ElMessage.warning(passwordError)
     return
   }
   saving.value = true
@@ -258,7 +269,7 @@ onMounted(() => {
           <el-input v-model="createForm.display_name" />
         </el-form-item>
         <el-form-item label="初始口令" required>
-          <el-input v-model="createForm.password" type="password" show-password placeholder="至少 10 位" />
+          <el-input v-model="createForm.password" type="password" :maxlength="PASSWORD_MAX_LENGTH" show-password :placeholder="PASSWORD_POLICY_HINT" />
         </el-form-item>
         <el-form-item label="角色">
           <el-radio-group v-model="createForm.role">
@@ -294,7 +305,7 @@ onMounted(() => {
     <el-dialog v-model="resetDialog" :title="`重置口令 · ${resetTarget?.username || ''}`" width="440px">
       <el-form label-position="top">
         <el-form-item label="新口令" required>
-          <el-input v-model="resetForm.password" type="password" show-password placeholder="至少 10 位" />
+          <el-input v-model="resetForm.password" type="password" :maxlength="PASSWORD_MAX_LENGTH" show-password :placeholder="PASSWORD_POLICY_HINT" />
         </el-form-item>
       </el-form>
       <template #footer>

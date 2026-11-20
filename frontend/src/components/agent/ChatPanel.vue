@@ -5,7 +5,7 @@ import { useAgentChatStore } from '../../stores/agentChatStore'
 import { hasAgentCaseJson } from './parseAgentCases'
 import ChatMessage from './ChatMessage.vue'
 import ChatComposer from './ChatComposer.vue'
-import type { AgentSaveAsDraftResult } from '../../api/agent'
+import type { AgentAttachmentItem, AgentSaveAsDraftResult } from '../../api/agent'
 
 /**
  * 中列：消息流 + 状态条 + 输入区。
@@ -99,9 +99,10 @@ watch(
 
 onMounted(() => scrollToBottom(true))
 
-async function onSend(content: string) {
+async function onSend(content: string, attachmentIds: string[], attachments: AgentAttachmentItem[]) {
   try {
-    await store.sendMessage(content)
+    await store.sendMessage(content, attachmentIds, attachments)
+    composerRef.value?.clearAfterSend()
     scrollToBottom(true)
   } catch {
     // store 已写 streamError 并回滚乐观消息，这里只做滚动复位。
@@ -221,6 +222,7 @@ const composerDisabled = computed(() =>
           :key="message.id"
           :role="message.role"
           :content="message.content"
+          :attachments="message.attachments"
           :thought="message.thought"
           :created-at="message.created_at"
           :streaming="Boolean(message.streaming)"
@@ -234,12 +236,14 @@ const composerDisabled = computed(() =>
 
     <div class="panel-composer">
       <ChatComposer
+        :key="store.currentId || 'no-conversation'"
         ref="composerRef"
         :disabled="composerDisabled"
         :sending="store.sending"
         :busy="busy"
         :placeholder="composerPlaceholder"
         :project-id="store.projectId"
+        :conversation-id="store.currentId"
         @send="onSend"
       >
         <template #extra-actions>

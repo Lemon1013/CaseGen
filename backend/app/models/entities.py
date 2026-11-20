@@ -938,6 +938,7 @@ class AgentMessage(SQLModel, table=True):
     content: str = ""
     # Thinking process shown as a collapsible panel; answer stays in content.
     reasoning: str = ""
+    attachments_json: str = "[]"
     # Client-supplied dedupe key so a retried POST cannot start a second turn.
     idempotency_key: Optional[str] = Field(default=None, index=True)
     created_at: datetime = Field(default_factory=_utcnow)

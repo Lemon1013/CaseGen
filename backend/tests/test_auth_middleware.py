@@ -33,7 +33,7 @@ def _make_user(username: str, role: str = "user") -> int:
         row = User(
             username=username,
             display_name=username.upper(),
-            password_hash=hash_password("password1234"),
+            password_hash=hash_password("CaseGen-Test1!"),
             role=role,
             is_active=True,
         )
@@ -95,7 +95,7 @@ def test_middleware_snapshot_prevents_500(tmp_app_data, monkeypatch):
     admin = TestClient(create_app())
     assert admin.post(
         "/api/auth/setup", headers=_origin(),
-        json={"username": "root", "display_name": "Root", "password": "password1234"},
+            json={"username": "root", "display_name": "Root", "password": "CaseGen-Test1!"},
     ).status_code == 200
     with Session(get_engine()) as session:
         project_id = 1  # the default project seeded by migrations
@@ -103,7 +103,7 @@ def test_middleware_snapshot_prevents_500(tmp_app_data, monkeypatch):
     member = TestClient(create_app())
     assert member.post(
         "/api/auth/login", headers=_origin(),
-        json={"username": "member", "password": "password1234"},
+        json={"username": "member", "password": "CaseGen-Test1!"},
     ).status_code == 200
 
     # The exact failing request from nohup.out: an ordinary user hitting a
@@ -128,7 +128,7 @@ def test_session_and_me_still_use_live_session_user(tmp_app_data, monkeypatch):
     client = TestClient(create_app())
     assert client.post(
         "/api/auth/setup", headers=_origin(),
-        json={"username": "root", "password": "password1234"},
+            json={"username": "root", "password": "CaseGen-Test1!"},
     ).status_code == 200
     assert client.get("/api/auth/session").status_code == 200
     me = client.get("/api/auth/me")

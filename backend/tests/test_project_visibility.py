@@ -32,7 +32,7 @@ def _setup_admin(client: TestClient) -> None:
     response = client.post(
         "/api/auth/setup",
         headers=_origin(),
-        json={"username": "admin", "display_name": "Admin", "password": "password1234"},
+        json={"username": "admin", "display_name": "Admin", "password": "CaseGen-Test1!"},
     )
     assert response.status_code == 200, response.text
     with Session(get_engine()) as session:
@@ -45,7 +45,7 @@ def _make_user(username: str, role: str = "user") -> int:
         row = User(
             username=username,
             display_name=username,
-            password_hash=hash_password("password1234"),
+            password_hash=hash_password("CaseGen-Test1!"),
             role=role,
             is_active=True,
         )
@@ -60,7 +60,7 @@ def _login(username: str) -> TestClient:
     assert client.post(
         "/api/auth/login",
         headers=_origin(),
-        json={"username": username, "password": "password1234"},
+        json={"username": username, "password": "CaseGen-Test1!"},
     ).status_code == 200
     return client
 

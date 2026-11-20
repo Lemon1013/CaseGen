@@ -17,6 +17,7 @@ from app.db import get_engine
 from app.main import create_app
 from app.models.entities import AgentConversation, AgentMessage
 from app.services.agent_stream import AgentStreamBroker
+from app.services import agent_gateway
 from app.services.task_stream import TaskStreamEvent, TaskStreamPoll
 
 
@@ -327,6 +328,75 @@ def test_agent_disabled_returns_410(agent_env):
         client.post(f"/api/agent/conversations?project_id={pid}", json={}).status_code
         == 410
     )
+
+
+def test_upload_message_attachment_and_cleanup(agent_env):
+    client = agent_env.client
+    pid = _make_project(client, "attachments")
+    conv = _make_conversation(client, pid)
+    response = client.post(
+        f"/api/agent/conversations/{conv['id']}/attachments?project_id={pid}",
+        files={"file": ("需求.md", "# 私有正文\nUNIQUE_ATTACHMENT_BODY".encode(), "text/markdown")},
+    )
+    assert response.status_code == 200, response.text
+    attachment = response.json()
+    assert attachment["filename"] == "需求.md"
+    root = agent_gateway.ensure_project_workspace_dir(pid)
+    attachment_dir = root / "attachments" / conv["id"] / attachment["id"]
+    assert (attachment_dir / "original.md").is_file()
+    assert (attachment_dir / "parsed.txt").is_file()
+    assert (attachment_dir / "meta.json").is_file()
+
+    sent = client.post(
+        f"/api/agent/conversations/{conv['id']}/messages?project_id={pid}",
+        json={"content": "", "attachment_ids": [attachment["id"]], "idempotency_key": "attachment-only"},
+    )
+    assert sent.status_code == 200, sent.text
+    assert sent.json()["message"]["content"] == ""
+    assert sent.json()["message"]["attachments"][0]["id"] == attachment["id"]
+    with Session(get_engine()) as session:
+        row = session.get(AgentMessage, sent.json()["message"]["id"])
+        assert row is not None and json.loads(row.attachments_json)[0]["id"] == attachment["id"]
+
+    _set_status(conv["id"], "active")
+    retried = client.post(
+        f"/api/agent/conversations/{conv['id']}/messages?project_id={pid}",
+        json={"content": "", "idempotency_key": "attachment-only"},
+    )
+    assert retried.status_code == 200, retried.text
+    assert retried.json()["duplicated"] is True
+    assert retried.json()["message"]["id"] == sent.json()["message"]["id"]
+
+    deleted = client.delete(f"/api/agent/conversations/{conv['id']}?project_id={pid}")
+    assert deleted.status_code == 200
+    assert not (root / "attachments" / conv["id"]).exists()
+
+
+def test_attachment_message_validation_and_cross_conversation_rejection(agent_env):
+    client = agent_env.client
+    pid = _make_project(client, "attachment-validation")
+    first = _make_conversation(client, pid)
+    second = _make_conversation(client, pid, title="second")
+    empty = client.post(
+        f"/api/agent/conversations/{first['id']}/messages?project_id={pid}",
+        json={"content": "", "attachment_ids": [], "idempotency_key": "empty"},
+    )
+    assert empty.status_code == 422
+    uploaded = client.post(
+        f"/api/agent/conversations/{first['id']}/attachments?project_id={pid}",
+        files={"file": ("a.md", b"text", "text/markdown")},
+    )
+    attachment_id = uploaded.json()["id"]
+    forged = client.post(
+        f"/api/agent/conversations/{first['id']}/messages?project_id={pid}",
+        json={"content": "", "attachment_ids": ["0" * 32], "idempotency_key": "forged"},
+    )
+    assert forged.status_code == 422
+    cross = client.post(
+        f"/api/agent/conversations/{second['id']}/messages?project_id={pid}",
+        json={"content": "", "attachment_ids": [attachment_id], "idempotency_key": "cross"},
+    )
+    assert cross.status_code == 422
 
 
 def test_skills_lists_array(agent_env):

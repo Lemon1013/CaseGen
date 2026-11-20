@@ -46,6 +46,15 @@ class AgentConversationOut(BaseModel):
     updated_at: datetime
 
 
+class AgentAttachmentOut(BaseModel):
+    id: str
+    filename: str
+    size: int
+    content_type: str
+    char_count: int
+    created_at: datetime
+
+
 class AgentMessageOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -54,6 +63,7 @@ class AgentMessageOut(BaseModel):
     role: str
     content: str
     reasoning: str = ""
+    attachments: List[AgentAttachmentOut] = Field(default_factory=list)
     created_at: datetime
 
 
@@ -64,10 +74,11 @@ class AgentConversationDetail(AgentConversationOut):
 
 
 class AgentMessageCreate(BaseModel):
-    content: str = Field(min_length=1, max_length=32_000)
+    content: str = Field(default="", max_length=32_000)
     idempotency_key: str = Field(min_length=1, max_length=200)
     # Optional optimistic lock; when supplied a stale version yields 409.
     expected_version: Optional[int] = Field(default=None, ge=1)
+    attachment_ids: List[str] = Field(default_factory=list, max_length=5)
 
 
 class AgentMessageAccepted(BaseModel):

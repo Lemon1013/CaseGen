@@ -29,7 +29,7 @@ def _setup_admin(client: TestClient) -> dict:
     response = client.post(
         "/api/auth/setup",
         headers=_origin(),
-        json={"username": "rootadmin", "display_name": "Root", "password": "password1234"},
+        json={"username": "rootadmin", "display_name": "Root", "password": "CaseGen-Test1!"},
     )
     assert response.status_code == 200, response.text
     with Session(get_engine()) as session:
@@ -52,7 +52,7 @@ def test_user_lifecycle_list_create_login_escalation_disable(tmp_app_data, monke
     assert rows[0]["username"] == "rootadmin"
     assert rows[0]["role"] == "admin"
     assert "password_hash" not in rows[0]
-    assert "password1234" not in str(rows)
+    assert "CaseGen-Test1!" not in str(rows)
 
     # Admin creates a normal user.
     created = admin_client.post(
@@ -61,7 +61,7 @@ def test_user_lifecycle_list_create_login_escalation_disable(tmp_app_data, monke
         json={
             "username": "alice",
             "display_name": "Alice",
-            "password": "password1234",
+            "password": "CaseGen-Test1!",
             "role": "user",
         },
     )
@@ -77,7 +77,7 @@ def test_user_lifecycle_list_create_login_escalation_disable(tmp_app_data, monke
     duplicate = admin_client.post(
         "/api/users",
         headers=_origin(),
-        json={"username": "alice", "password": "password1234"},
+        json={"username": "alice", "password": "CaseGen-Test1!"},
     )
     assert duplicate.status_code == 409
 
@@ -86,7 +86,7 @@ def test_user_lifecycle_list_create_login_escalation_disable(tmp_app_data, monke
     login = alice_client.post(
         "/api/auth/login",
         headers=_origin(),
-        json={"username": "alice", "password": "password1234"},
+        json={"username": "alice", "password": "CaseGen-Test1!"},
     )
     assert login.status_code == 200, login.text
     assert login.json()["user"]["role"] == "user"
@@ -95,7 +95,7 @@ def test_user_lifecycle_list_create_login_escalation_disable(tmp_app_data, monke
     assert alice_client.get("/api/users", headers=_origin()).status_code == 403
     assert alice_client.post(
         "/api/users", headers=_origin(),
-        json={"username": "bob", "password": "password1234"},
+        json={"username": "bob", "password": "CaseGen-Test1!"},
     ).status_code == 403
     assert alice_client.post(
         "/api/models", headers=_origin(),
@@ -119,7 +119,7 @@ def test_user_lifecycle_list_create_login_escalation_disable(tmp_app_data, monke
     reset = admin_client.post(
         f"/api/users/{alice_id}/reset-password",
         headers=_origin(),
-        json={"password": "passwordnew"},
+        json={"password": "CaseGen-Test2!"},
     )
     assert reset.status_code == 200, reset.text
     assert "password_hash" not in reset.json()
@@ -149,7 +149,7 @@ def test_user_lifecycle_list_create_login_escalation_disable(tmp_app_data, monke
     # is refused by the authentication service as well.
     assert charlie_client.post(
         "/api/auth/login", headers=_origin(),
-        json={"username": "charlie", "password": "password1234"},
+        json={"username": "charlie", "password": "CaseGen-Test1!"},
     ).status_code == 401
 
 
@@ -160,7 +160,7 @@ def test_stale_session_after_disable_returns_401(tmp_app_data, monkeypatch):
     _setup_admin(admin_client)
     created = admin_client.post(
         "/api/users", headers=_origin(),
-        json={"username": "dave", "password": "password1234", "role": "user"},
+        json={"username": "dave", "password": "CaseGen-Test1!", "role": "user"},
     )
     assert created.status_code == 201
     dave_id = created.json()["id"]
@@ -168,7 +168,7 @@ def test_stale_session_after_disable_returns_401(tmp_app_data, monkeypatch):
     dave_client = TestClient(create_app())
     assert dave_client.post(
         "/api/auth/login", headers=_origin(),
-        json={"username": "dave", "password": "password1234"},
+        json={"username": "dave", "password": "CaseGen-Test1!"},
     ).status_code == 200
     assert dave_client.get("/api/prompts", headers=_origin()).status_code == 200
 
@@ -179,8 +179,36 @@ def test_stale_session_after_disable_returns_401(tmp_app_data, monkeypatch):
     assert dave_client.get("/api/prompts", headers=_origin()).status_code == 401
     assert dave_client.post(
         "/api/auth/login", headers=_origin(),
-        json={"username": "dave", "password": "password1234"},
+        json={"username": "dave", "password": "CaseGen-Test1!"},
     ).status_code == 401
+
+
+def test_admin_create_and_reset_reject_noncompliant_password(tmp_app_data, monkeypatch):
+    admin_client = _auth_client(tmp_app_data, monkeypatch)
+    _setup_admin(admin_client)
+    origin = _origin()
+
+    create = admin_client.post(
+        "/api/users",
+        headers=origin,
+        json={"username": "invalidnew", "password": "abcdefghij"},
+    )
+    assert create.status_code == 422
+    assert "大写字母" in create.json()["detail"]
+
+    created = admin_client.post(
+        "/api/users",
+        headers=origin,
+        json={"username": "resettarget", "password": "CaseGen-Test1!"},
+    )
+    assert created.status_code == 201, created.text
+    reset = admin_client.post(
+        f"/api/users/{created.json()['id']}/reset-password",
+        headers=origin,
+        json={"password": "abcdefghij"},
+    )
+    assert reset.status_code == 422
+    assert "特殊符号" in reset.json()["detail"]
 
 
 def test_users_router_requires_authentication(tmp_app_data, monkeypatch):
@@ -211,7 +239,7 @@ def test_last_active_admin_cannot_be_disabled_or_demoted(tmp_app_data, monkeypat
     # A second admin makes it safe to disable/demote one of them.
     second = admin_client.post(
         "/api/users", headers=origin,
-        json={"username": "secondadmin", "password": "password1234", "role": "admin"},
+        json={"username": "secondadmin", "password": "CaseGen-Test1!", "role": "admin"},
     )
     assert second.status_code == 201, second.text
     second_id = second.json()["id"]
@@ -229,7 +257,7 @@ def test_last_active_admin_cannot_be_disabled_or_demoted(tmp_app_data, monkeypat
     # Ordinary users are unaffected by the guard.
     created = admin_client.post(
         "/api/users", headers=origin,
-        json={"username": "plain", "password": "password1234", "role": "user"},
+        json={"username": "plain", "password": "CaseGen-Test1!", "role": "user"},
     )
     assert created.status_code == 201
     assert admin_client.patch(
@@ -239,7 +267,7 @@ def test_last_active_admin_cannot_be_disabled_or_demoted(tmp_app_data, monkeypat
     # Resetting the admin password is not blocked by the guard.
     reset = admin_client.post(
         f"/api/users/{second_id}/reset-password", headers=origin,
-        json={"password": "passwordnew"},
+        json={"password": "CaseGen-Test2!"},
     )
     assert reset.status_code == 200, reset.text
 
@@ -267,7 +295,7 @@ def test_model_ping_requires_admin(tmp_app_data, monkeypatch):
         session.add(User(
             username="member",
             display_name="Member",
-            password_hash=hash_password("password1234"),
+            password_hash=hash_password("CaseGen-Test1!"),
             role="user",
             is_active=True,
         ))
@@ -275,7 +303,7 @@ def test_model_ping_requires_admin(tmp_app_data, monkeypatch):
     member = TestClient(create_app())
     assert member.post(
         "/api/auth/login", headers=origin,
-        json={"username": "member", "password": "password1234"},
+        json={"username": "member", "password": "CaseGen-Test1!"},
     ).status_code == 200
     assert member.post(f"/api/models/{model_id}/ping", headers=origin).status_code == 403
     # Read side stays open for every signed-in user.
