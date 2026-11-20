@@ -28,7 +28,6 @@ import {
   statusTagType,
   stopTask,
   taskStreamUrl,
-  type ApplyPromptMode,
   type CaseDraft,
   type FinalizeConflict,
   type PromptRevision,
@@ -166,7 +165,6 @@ function getCitationTitle(id: number): string {
 }
 
 const applyDialogVisible = ref(false)
-const applyMode = ref<ApplyPromptMode>('task_temp')
 const selectedRevision = ref<PromptRevision | null>(null)
 const alsoRegenerate = ref(true)
 const editedPromptContent = ref('')
@@ -1004,7 +1002,6 @@ function openApplyDialog(rev?: PromptRevision) {
     ElMessage.warning('没有可应用的 Prompt 修订')
     return
   }
-  applyMode.value = 'task_temp'
   alsoRegenerate.value = true
   editedPromptContent.value = selectedRevision.value.new_content
   applyDialogVisible.value = true
@@ -1020,13 +1017,11 @@ async function confirmApply() {
   try {
     const applied = await applyPrompt(task.value.id, {
       revision_id: selectedRevision.value.id,
-      mode: applyMode.value,
+      mode: 'task_temp',
       content: editedPromptContent.value,
     })
     applyTaskUpdate(applied)
-    ElMessage.success(
-      applyMode.value === 'global' ? '已全局启用新 Prompt' : '已仅对本任务应用 Prompt',
-    )
+    ElMessage.success('已仅对本任务应用临时 Prompt')
     applyDialogVisible.value = false
     if (alsoRegenerate.value) {
       const regenerated = await regenerateTask(task.value.id)
@@ -1725,13 +1720,12 @@ onUnmounted(() => {
           :rows="12"
         />
         <div class="apply-hint">可在确认前手动修改；最终保存的是此处内容。</div>
-        <div class="apply-mode">
-          <div class="label">应用方式</div>
-          <el-radio-group v-model="applyMode">
-            <el-radio value="task_temp">仅本任务</el-radio>
-            <el-radio value="global">全局启用</el-radio>
-          </el-radio-group>
-        </div>
+        <el-alert
+          type="info"
+          show-icon
+          :closable="false"
+          title="此修订仅对当前任务临时生效，不会影响系统或其他用户的提示词模板"
+        />
         <el-checkbox v-model="alsoRegenerate">应用后立即再生成</el-checkbox>
       </div>
       <template #footer>
@@ -1989,11 +1983,6 @@ onUnmounted(() => {
   display: flex;
   flex-direction: column;
   gap: 12px;
-}
-
-.apply-mode .label {
-  margin-bottom: 6px;
-  font-weight: 600;
 }
 
 /* ==================== 测试点关联视图与草稿卡片样式 ==================== */

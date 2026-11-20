@@ -110,19 +110,19 @@ const router = createRouter({
           path: 'spaces',
           name: 'space-management',
           component: () => import('../views/SpaceManagementView.vue'),
-          meta: { title: '项目管理', description: '管理项目与多外部知识库连接配置', adminOnly: true },
+          meta: { title: '项目管理', description: '管理项目与多外部知识库连接配置', adminOnly: true, skipProjectGate: true },
         },
         {
           path: 'prompts',
           name: 'prompts',
           component: () => import('../views/PromptsView.vue'),
-          meta: { title: '提示词管理', description: '维护生成 / 测试点 / 评审等提示词模板' },
+          meta: { title: '提示词管理', description: '维护生成 / 测试点 / 评审等提示词模板', skipProjectGate: true },
         },
         {
           path: 'models',
           name: 'models',
           component: () => import('../views/ModelsView.vue'),
-          meta: { title: '模型配置', description: '配置 OpenAI 兼容模型网关与默认模型', adminOnly: true },
+          meta: { title: '模型配置', description: '配置 OpenAI 兼容模型网关与默认模型', adminOnly: true, skipProjectGate: true },
         },
         {
           path: 'users',

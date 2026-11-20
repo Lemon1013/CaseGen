@@ -5,6 +5,11 @@ export type PromptType =
   | 'test_points'
   | 'review'
   | 'optimize'
+  | 'requirement_optimize'
+  | 'platform_example_render'
+  | 'data_description_parse'
+
+export type PromptVisibility = 'system' | 'shared' | 'private'
 
 export interface PromptTemplate {
   id: number
@@ -13,6 +18,12 @@ export interface PromptTemplate {
   content: string
   version: number
   is_active: boolean
+  owner_user_id?: number | null
+  owner_username?: string | null
+  visibility: PromptVisibility
+  can_edit?: boolean
+  can_delete?: boolean
+  can_fork?: boolean
   created_at: string
   updated_at: string
 }
@@ -22,17 +33,27 @@ export interface PromptCreate {
   type: string
   content: string
   is_active?: boolean
+  visibility?: PromptVisibility
 }
 
 export interface PromptUpdate {
   name?: string
   content?: string
   is_active?: boolean
+  visibility?: PromptVisibility
 }
 
-export function listPrompts(type?: string) {
-  const qs = type ? `?type=${encodeURIComponent(type)}` : ''
-  return api<PromptTemplate[]>(`/api/prompts${qs}`)
+export interface PromptForkBody {
+  name?: string
+  visibility?: 'private' | 'shared'
+}
+
+export function listPrompts(type?: string, visibility?: PromptVisibility) {
+  const params = new URLSearchParams()
+  if (type) params.set('type', type)
+  if (visibility) params.set('visibility', visibility)
+  const qs = params.toString()
+  return api<PromptTemplate[]>(`/api/prompts${qs ? `?${qs}` : ''}`)
 }
 
 export function createPrompt(body: PromptCreate) {
@@ -55,9 +76,26 @@ export function deletePrompt(id: number) {
   })
 }
 
+export function forkPrompt(
+  id: number,
+  body?: PromptForkBody,
+): Promise<PromptTemplate> {
+  return api<PromptTemplate>(`/api/prompts/${id}/fork`, {
+    method: 'POST',
+    ...(body ? { body: JSON.stringify(body) } : {}),
+  })
+}
+
+export function isEnginePromptType(type: string): boolean {
+  return type !== 'generate'
+}
+
 export const PROMPT_TYPE_OPTIONS: { value: PromptType; label: string }[] = [
-  { value: 'generate', label: '生成 (generate)' },
+  { value: 'generate', label: '用例生成 (generate)' },
   { value: 'test_points', label: '测试点生成 (test_points)' },
-  { value: 'review', label: '评审 (review)' },
-  { value: 'optimize', label: '优化 (optimize)' },
+  { value: 'review', label: '用例评审 (review)' },
+  { value: 'optimize', label: 'Prompt 优化 (optimize)' },
+  { value: 'requirement_optimize', label: '需求分析优化 (requirement_optimize)' },
+  { value: 'platform_example_render', label: '平台用例渲染 (platform_example_render)' },
+  { value: 'data_description_parse', label: '数据描述解析 (data_description_parse)' },
 ]

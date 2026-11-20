@@ -191,12 +191,54 @@ def _migrate_0002_project_knowledge_sources(engine: Engine) -> None:
             )
 
 
+def _migrate_0003_prompt_visibility(engine: Engine) -> None:
+    """Add owner_user_id and visibility columns to prompt_templates and backfill defaults."""
+    with engine.begin() as conn:
+        cols = conn.execute(text("PRAGMA table_info(prompt_templates)")).fetchall()
+        if not cols:
+            return
+        existing_cols = {str(row[1]) for row in cols}
+        if "owner_user_id" not in existing_cols:
+            conn.execute(
+                text("ALTER TABLE prompt_templates ADD COLUMN owner_user_id INTEGER")
+            )
+        if "visibility" not in existing_cols:
+            conn.execute(
+                text(
+                    "ALTER TABLE prompt_templates ADD COLUMN visibility VARCHAR NOT NULL DEFAULT 'system'"
+                )
+            )
+        conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_prompt_templates_owner_user_id "
+                "ON prompt_templates(owner_user_id)"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_prompt_templates_visibility "
+                "ON prompt_templates(visibility)"
+            )
+        )
+        conn.execute(
+            text(
+                "UPDATE prompt_templates SET visibility = 'system' "
+                "WHERE visibility IS NULL OR TRIM(visibility) = ''"
+            )
+        )
+
+
 VERSIONED_MIGRATIONS: tuple[MigrationEntry, ...] = (
     ("0001_v2_refactor_baseline", "Record v2 refactor baseline", _noop_baseline_migration),
     (
         "0002_project_knowledge_sources",
         "Add project_knowledge_sources, citation external columns and backfill legacy external wikis",
         _migrate_0002_project_knowledge_sources,
+    ),
+    (
+        "0003_prompt_visibility",
+        "Add owner_user_id and visibility columns to prompt_templates",
+        _migrate_0003_prompt_visibility,
     ),
 )
 

@@ -47,6 +47,12 @@ class PromptTemplate(SQLModel, table=True):
     content: str
     version: int = 1
     is_active: bool = True
+    owner_user_id: Optional[int] = Field(default=None, index=True)
+    visibility: str = Field(
+        default="system",
+        index=True,
+        sa_column_kwargs={"server_default": "system"},
+    )  # "system" | "shared" | "private"
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow, sa_column_kwargs={"onupdate": _utcnow})
 

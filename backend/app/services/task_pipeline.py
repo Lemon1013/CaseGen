@@ -134,6 +134,21 @@ def _build_query(requirement: Requirement) -> str:
     return clean_retrieve_query(raw)
 
 
+def _resolve_default_generate_prompt(session: Session) -> Optional[PromptTemplate]:
+    """Resolve default active generate prompt: system first, then shared; never private."""
+    for vis in ("system", "shared"):
+        row = session.exec(
+            select(PromptTemplate).where(
+                PromptTemplate.type == "generate",
+                PromptTemplate.visibility == vis,
+                PromptTemplate.is_active == True,  # noqa: E712
+            ).order_by(col(PromptTemplate.updated_at).desc(), col(PromptTemplate.id).desc())
+        ).first()
+        if row is not None:
+            return row
+    return None
+
+
 def _resolve_generate_prompt(session: Session, task: GenerationTask) -> tuple[str, str]:
     """Return (prompt_content, prompt_version_ref)."""
     if task.temp_prompt_content:
@@ -148,12 +163,7 @@ def _resolve_generate_prompt(session: Session, task: GenerationTask) -> tuple[st
                 )
             return row.content, f"id:{row.id}:v{row.version}"
 
-    active = session.exec(
-        select(PromptTemplate).where(
-            PromptTemplate.type == "generate",
-            PromptTemplate.is_active == True,  # noqa: E712
-        ).order_by(col(PromptTemplate.updated_at).desc(), col(PromptTemplate.id).desc())
-    ).first()
+    active = _resolve_default_generate_prompt(session)
     if active is None:
         raise RuntimeError("No active generate prompt template found")
     return active.content, f"id:{active.id}:v{active.version}"
@@ -1284,12 +1294,16 @@ def _latest_review(session: Session, task_id: int) -> Optional[ReviewResult]:
 
 
 def _resolve_prompt_by_type(session: Session, prompt_type: str) -> PromptTemplate:
-    active = session.exec(
-        select(PromptTemplate).where(
-            PromptTemplate.type == prompt_type,
-            PromptTemplate.is_active == True,  # noqa: E712
-        ).order_by(col(PromptTemplate.updated_at).desc(), col(PromptTemplate.id).desc())
-    ).first()
+    if prompt_type == "generate":
+        active = _resolve_default_generate_prompt(session)
+    else:
+        active = session.exec(
+            select(PromptTemplate).where(
+                PromptTemplate.type == prompt_type,
+                PromptTemplate.visibility == "system",
+                PromptTemplate.is_active == True,  # noqa: E712
+            ).order_by(col(PromptTemplate.updated_at).desc(), col(PromptTemplate.id).desc())
+        ).first()
     if active is None:
         raise RuntimeError(f"No active {prompt_type} prompt template found")
     return active
@@ -1504,15 +1518,6 @@ def _build_optimize_messages(
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": "\n".join(user_parts)},
     ]
-
-
-def _next_prompt_version(session: Session, prompt_type: str) -> int:
-    current = session.exec(
-        select(func.max(PromptTemplate.version)).where(PromptTemplate.type == prompt_type)
-    ).one()
-    if current is None:
-        return 1
-    return int(current) + 1
 
 
 def _next_draft_version(session: Session, task_id: int) -> int:
@@ -2529,15 +2534,7 @@ def run_optimize_prompt(
         if task.prompt_template_id is not None:
             base_prompt_id = task.prompt_template_id
         else:
-            active_gen = session.exec(
-                select(PromptTemplate).where(
-                    PromptTemplate.type == "generate",
-                    PromptTemplate.is_active == True,  # noqa: E712
-                ).order_by(
-                    col(PromptTemplate.updated_at).desc(),
-                    col(PromptTemplate.id).desc(),
-                )
-            ).first()
+            active_gen = _resolve_default_generate_prompt(session)
             if active_gen is not None:
                 base_prompt_id = active_gen.id
 
@@ -2597,6 +2594,9 @@ def apply_prompt(
     mode: str,
     content: str | None = None,
 ) -> GenerationTask:
+    if mode != "task_temp":
+        raise ValueError("已禁止修改全局提示词，仅支持应用到当前任务（task_temp）")
+
     task = session.get(GenerationTask, task_id)
     if task is None:
         raise ValueError(f"GenerationTask id={task_id} not found")
@@ -2607,9 +2607,6 @@ def apply_prompt(
     if revision.status != "pending":
         raise ValueError("Only pending prompt revisions can be applied")
 
-    if mode not in ("global", "task_temp"):
-        raise ValueError(f"Invalid apply mode {mode!r}")
-
     edited = content is not None
     if content is not None:
         normalized_content = content.strip()
@@ -2618,53 +2615,17 @@ def apply_prompt(
         revision.new_content = normalized_content
         session.add(revision)
 
-    if mode == "task_temp":
-        task.temp_prompt_content = revision.new_content
-        session.add(task)
-        revision.status = "applied_task_temp"
-        session.add(revision)
-        append_event(
-            session,
-            task.id,
-            "apply_prompt",
-            f"已应用 revision#{revision_id} 为任务临时提示词",
-            detail={"mode": mode, "revision_id": revision_id, "edited": edited},
-        )
-    else:
-        # global: new active generate PromptTemplate version
-        base_name = "generate"
-        if revision.base_prompt_id is not None:
-            base = session.get(PromptTemplate, revision.base_prompt_id)
-            if base is not None:
-                base_name = base.name
-        version = _next_prompt_version(session, "generate")
-        row = PromptTemplate(
-            name=base_name,
-            type="generate",
-            content=revision.new_content,
-            version=version,
-            is_active=True,
-        )
-        session.add(row)
-        session.flush()
-        task.prompt_template_id = row.id
-        task.temp_prompt_content = None
-        session.add(task)
-        revision.status = "applied_global"
-        session.add(revision)
-        append_event(
-            session,
-            task.id,
-            "apply_prompt",
-            f"已应用 revision#{revision_id} 为全局 generate v{version}",
-            detail={
-                "mode": mode,
-                "revision_id": revision_id,
-                "prompt_template_id": row.id,
-                "version": version,
-                "edited": edited,
-            },
-        )
+    task.temp_prompt_content = revision.new_content
+    session.add(task)
+    revision.status = "applied_task_temp"
+    session.add(revision)
+    append_event(
+        session,
+        task.id,
+        "apply_prompt",
+        f"已应用 revision#{revision_id} 为任务临时提示词",
+        detail={"mode": mode, "revision_id": revision_id, "edited": edited},
+    )
 
     task.updated_at = _utcnow()
     session.add(task)

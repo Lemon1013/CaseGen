@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import secrets
 import json
+import re
+import secrets
 import time
 from datetime import datetime, timezone
 from typing import AsyncIterator, List, Optional
@@ -58,6 +59,8 @@ from app.schemas.tasks import (
     TestPointInput,
     TestPointOut,
 )
+from app.services.permissions import Identity, current_user
+from app.services.prompt_permissions import can_view_prompt
 from app.services.task_events import append_event
 from app.services.task_jobs import (
     job_generate,
@@ -328,7 +331,130 @@ def _review_to_out(row: ReviewResult) -> ReviewResultOut:
     )
 
 
-def to_task_out(session: Session, task: GenerationTask) -> TaskOut:
+_PROMPT_REF_ID_RE = re.compile(r"^id:(\d+):")
+_PRIVATE_TASK_PROMPT_FORBIDDEN_DETAIL = (
+    "该任务绑定了其他用户的私有提示词模板，当前账号无权操作"
+)
+
+
+def _is_prompt_id_visible(
+    session: Session,
+    prompt_id: int | None,
+    user: Identity | None,
+    cache: dict[int, bool] | None = None,
+) -> bool:
+    """Return True when prompt_id is unset, missing, or visible to ``user``."""
+    if prompt_id is None:
+        return True
+    pid = int(prompt_id)
+    if cache is not None and pid in cache:
+        return cache[pid]
+    row = session.get(PromptTemplate, pid)
+    visible = True if row is None else can_view_prompt(row, user)
+    if cache is not None:
+        cache[pid] = visible
+    return visible
+
+
+def _prompt_id_from_ref(ref: str | None) -> int | None:
+    if not ref:
+        return None
+    match = _PROMPT_REF_ID_RE.match(str(ref).strip())
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def _request_user(request: Request | None) -> Identity | None:
+    return current_user(request) if request is not None else None
+
+
+def _ensure_task_prompt_accessible(
+    session: Session,
+    task: GenerationTask,
+    request: Request | None,
+) -> None:
+    """Reject operations on a task bound to another user's private prompt."""
+    if task.prompt_template_id is None:
+        return
+    prompt = session.get(PromptTemplate, task.prompt_template_id)
+    if prompt is not None and not can_view_prompt(prompt, _request_user(request)):
+        raise HTTPException(
+            status_code=403,
+            detail=_PRIVATE_TASK_PROMPT_FORBIDDEN_DETAIL,
+        )
+
+
+def _sanitize_prompt_ref(
+    session: Session,
+    ref: str | None,
+    user: Identity | None,
+    *,
+    task_prompt_visible: bool,
+    cache: dict[int, bool],
+) -> str | None:
+    if ref is None:
+        return None
+    if not task_prompt_visible:
+        return "private"
+    ref_pid = _prompt_id_from_ref(ref)
+    if ref_pid is not None and not _is_prompt_id_visible(session, ref_pid, user, cache):
+        return "private"
+    return ref
+
+
+def _sanitize_event_detail_json(
+    session: Session,
+    detail_json: str | None,
+    user: Identity | None,
+    *,
+    task_prompt_visible: bool,
+    cache: dict[int, bool],
+) -> str | None:
+    if not detail_json:
+        return detail_json
+    try:
+        payload = json.loads(detail_json)
+    except (TypeError, ValueError):
+        return detail_json
+    if not isinstance(payload, dict):
+        return detail_json
+
+    mutated = False
+    for id_key in ("base_prompt_id", "prompt_template_id"):
+        if id_key in payload:
+            val = payload[id_key]
+            is_hidden_id = (
+                isinstance(val, int)
+                and not isinstance(val, bool)
+                and not _is_prompt_id_visible(session, val, user, cache)
+            )
+            if is_hidden_id or (not task_prompt_visible and val is not None):
+                payload.pop(id_key, None)
+                mutated = True
+
+    for ref_key in ("prompt_ref", "prompt_version_ref"):
+        if ref_key in payload:
+            val = payload[ref_key]
+            ref_pid = _prompt_id_from_ref(val if isinstance(val, str) else None)
+            if not task_prompt_visible or (
+                ref_pid is not None and not _is_prompt_id_visible(session, ref_pid, user, cache)
+            ):
+                payload[ref_key] = "private"
+                mutated = True
+
+    if not mutated:
+        return detail_json
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def to_task_out(
+    session: Session,
+    task: GenerationTask,
+    *,
+    user: Identity | None = None,
+    prompt_visibility_cache: dict[int, bool] | None = None,
+) -> TaskOut:
     requirement = session.get(Requirement, task.requirement_id)
     draft = _latest_draft(session, task.id)
     snippet = None
@@ -359,6 +485,17 @@ def to_task_out(session: Session, task: GenerationTask) -> TaskOut:
     except ValueError:
         space = None
 
+    visible_prompt_template_id = (
+        task.prompt_template_id
+        if _is_prompt_id_visible(
+            session,
+            task.prompt_template_id,
+            user,
+            prompt_visibility_cache,
+        )
+        else None
+    )
+
     return TaskOut(
         id=task.id,
         requirement_id=task.requirement_id,
@@ -367,7 +504,7 @@ def to_task_out(session: Session, task: GenerationTask) -> TaskOut:
         wiki_space_name=space.name if space else "",
         status=task.status,
         model_id=task.model_id,
-        prompt_template_id=task.prompt_template_id,
+        prompt_template_id=visible_prompt_template_id,
         error_message=task.error_message,
         title=requirement.title if requirement else None,
         description=requirement.description if requirement else None,
@@ -466,8 +603,8 @@ def create_task(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     if body.prompt_template_id is not None:
         prompt = session.get(PromptTemplate, body.prompt_template_id)
-        if prompt is None:
-            raise HTTPException(status_code=422, detail="Prompt template not found")
+        if prompt is None or not can_view_prompt(prompt, current_user(request)):
+            raise HTTPException(status_code=404, detail="Prompt not found")
         if prompt.type != "generate":
             raise HTTPException(
                 status_code=422,
@@ -612,16 +749,25 @@ def create_task(
                 job_generate, task.id, bool(body.auto_review)
             )
 
-    return to_task_out(session, task)
+    return to_task_out(session, task, user=current_user(request))
 
 
 @router.get("", response_model=List[TaskOut])
-def list_tasks(project_id: int | None = Query(default=None, ge=1), session: Session = Depends(get_session)) -> list[TaskOut]:
+def list_tasks(
+    project_id: int | None = Query(default=None, ge=1),
+    session: Session = Depends(get_session),
+    request: Request = None,
+) -> list[TaskOut]:
     statement = select(GenerationTask)
     if project_id is not None:
         statement = statement.where(GenerationTask.project_id == project_id)
     rows = session.exec(statement.order_by(col(GenerationTask.id).desc())).all()
-    return [to_task_out(session, r) for r in rows]
+    user = _request_user(request)
+    visibility_cache: dict[int, bool] = {}
+    return [
+        to_task_out(session, r, user=user, prompt_visibility_cache=visibility_cache)
+        for r in rows
+    ]
 
 
 @router.get("/{task_id}/stream")
@@ -754,6 +900,7 @@ def confirm_retrieval_checkpoint(
     body: RetrievalCheckpointConfirm,
     background_tasks: BackgroundTasks,
     session: Session = Depends(get_session),
+    request: Request = None,
 ) -> TaskOut:
     with task_locks.hold(task_id):
         task = session.get(GenerationTask, task_id)
@@ -797,7 +944,7 @@ def confirm_retrieval_checkpoint(
         ).hexdigest()
         if checkpoint.status == "confirmed":
             if checkpoint.decision_hash == payload_hash and checkpoint.idempotency_key == body.idempotency_key:
-                return to_task_out(session, task)
+                return to_task_out(session, task, user=_request_user(request))
             raise HTTPException(status_code=409, detail="Checkpoint already confirmed")
         if checkpoint.version != body.expected_version:
             raise HTTPException(status_code=409, detail="Stale retrieval checkpoint version")
@@ -835,7 +982,7 @@ def confirm_retrieval_checkpoint(
             checkpoint.resume_claim_token,
             "retrieval",
         )
-        return to_task_out(session, task)
+        return to_task_out(session, task, user=_request_user(request))
 
 
 def _test_point_out(session: Session, row: TestPoint) -> TestPointOut:
@@ -941,11 +1088,13 @@ def confirm_test_points(
     body: TestPointConfirmRequest,
     background_tasks: BackgroundTasks,
     session: Session = Depends(get_session),
+    request: Request = None,
 ) -> TaskOut:
     with task_locks.hold(task_id):
         task = session.get(GenerationTask, task_id)
         if task is None:
             raise HTTPException(status_code=404, detail="Task not found")
+        _ensure_task_prompt_accessible(session, task, request)
         checkpoint = latest_test_point_checkpoint(session, task_id)
         if checkpoint is None:
             raise HTTPException(status_code=404, detail="Test-point checkpoint not found")
@@ -960,7 +1109,7 @@ def confirm_test_points(
         payload_hash = _point_payload_hash(normalized)
         if checkpoint.status == "confirmed":
             if checkpoint.decision_hash == payload_hash and checkpoint.idempotency_key == body.idempotency_key:
-                return to_task_out(session, task)
+                return to_task_out(session, task, user=_request_user(request))
             raise HTTPException(status_code=409, detail="Test-point checkpoint already confirmed")
         if task.status != "awaiting_test_point_confirmation":
             raise HTTPException(status_code=409, detail="Task is not waiting for test-point confirmation")
@@ -995,7 +1144,7 @@ def confirm_test_points(
             checkpoint.resume_claim_token,
             "test_points",
         )
-        return to_task_out(session, task)
+        return to_task_out(session, task, user=_request_user(request))
 
 
 @router.get("/{task_id}/references", response_model=List[TaskReferenceCaseOut])
@@ -1021,11 +1170,15 @@ def task_coverage(task_id: int, session: Session = Depends(get_session)) -> Cove
 
 
 @router.get("/{task_id}", response_model=TaskOut)
-def get_task(task_id: int, session: Session = Depends(get_session)) -> TaskOut:
+def get_task(
+    task_id: int,
+    session: Session = Depends(get_session),
+    request: Request = None,
+) -> TaskOut:
     task = session.get(GenerationTask, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
-    return to_task_out(session, task)
+    return to_task_out(session, task, user=_request_user(request))
 
 
 @router.patch("/{task_id}/model", response_model=TaskOut)
@@ -1033,17 +1186,20 @@ def update_task_model(
     task_id: int,
     body: TaskModelUpdate,
     session: Session = Depends(get_session),
+    request: Request = None,
 ) -> TaskOut:
     """Change the model before an initial or failed generation attempt."""
     with task_locks.hold(task_id):
         session.expire_all()
-        return _update_task_model_locked(task_id, body, session)
+        return _update_task_model_locked(task_id, body, session, user=_request_user(request))
 
 
 def _update_task_model_locked(
     task_id: int,
     body: TaskModelUpdate,
     session: Session,
+    *,
+    user: Identity | None = None,
 ) -> TaskOut:
 
     task = session.get(GenerationTask, task_id)
@@ -1072,21 +1228,27 @@ def _update_task_model_locked(
     )
     session.commit()
     session.refresh(task)
-    return to_task_out(session, task)
+    return to_task_out(session, task, user=user)
 
 
 @router.post("/{task_id}/stop", response_model=TaskOut)
 def stop_task(
     task_id: int,
     session: Session = Depends(get_session),
+    request: Request = None,
 ) -> TaskOut:
     """Manually stop a generating task and release its durable resume lease."""
     with task_locks.hold(task_id):
         session.expire_all()
-        return _stop_task_locked(task_id, session)
+        return _stop_task_locked(task_id, session, user=_request_user(request))
 
 
-def _stop_task_locked(task_id: int, session: Session) -> TaskOut:
+def _stop_task_locked(
+    task_id: int,
+    session: Session,
+    *,
+    user: Identity | None = None,
+) -> TaskOut:
     task = session.get(GenerationTask, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
@@ -1121,7 +1283,7 @@ def _stop_task_locked(task_id: int, session: Session) -> TaskOut:
     # Publish post-commit so the SSE terminal event agrees with durable state
     # (same ordering as _fail_task in the pipeline).
     task_stream.fail(task_id, message="已手动停止生成")
-    return to_task_out(session, task)
+    return to_task_out(session, task, user=user)
 
 
 @router.delete("/{task_id}")
@@ -1211,6 +1373,7 @@ def generate_task(
     session: Session = Depends(get_session),
     wait: bool = Query(False),
     auto_review: bool = Query(False),
+    request: Request = None,
 ) -> TaskOut:
     with task_locks.hold(task_id):
         session.expire_all()
@@ -1218,6 +1381,7 @@ def generate_task(
             task_id,
             background_tasks,
             session,
+            request=request,
             wait=wait,
             auto_review=auto_review,
         )
@@ -1228,45 +1392,52 @@ def _generate_task_locked(
     background_tasks: BackgroundTasks,
     session: Session,
     *,
+    request: Request | None,
     wait: bool,
     auto_review: bool,
 ) -> TaskOut:
     task = session.get(GenerationTask, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
+    _ensure_task_prompt_accessible(session, task, request)
+    user = _request_user(request)
 
     if task.status in _BUSY:
         # Already running — do not double-schedule
-        return to_task_out(session, task)
+        return to_task_out(session, task, user=user)
 
     if task.status in {"awaiting_confirmation", "awaiting_test_point_confirmation"}:
-        return to_task_out(session, task)
+        return to_task_out(session, task, user=user)
 
     try:
         _resolve_model(session, task)
     except Exception as exc:  # noqa: BLE001
         _start_live_generate_stream(task, "生成失败")
-        return to_task_out(session, _fail_task(session, task, str(exc), publish_stream=True))
+        return to_task_out(
+            session,
+            _fail_task(session, task, str(exc), publish_stream=True),
+            user=user,
+        )
 
     if _force_sync("generate", wait):
         _start_live_generate_stream(task, "开始生成测试用例")
         task = run_generate(session, task_id, chat_fn=_chat_for("generate"), auto_review=auto_review)
         if auto_review and task.status == "generated":
             task = run_review(session, task_id, chat_fn=_chat_for("review"))
-        return to_task_out(session, task)
+        return to_task_out(session, task, user=user)
 
     if task.status not in ("draft", "failed", "regenerating"):
         # Preserve envelope: pipeline marks failed + error_message
         _start_live_generate_stream(task, "开始生成测试用例")
         task = run_generate(session, task_id, chat_fn=_chat_for("generate"), auto_review=auto_review)
-        return to_task_out(session, task)
+        return to_task_out(session, task, user=user)
 
     task = _begin_status(
         session, task, "retrieving", "retrieve", "后台开始检索 Wiki / 原文"
     )
     _start_live_generate_stream(task, "后台开始检索 Wiki / 原文")
     background_tasks.add_task(job_generate, task_id, auto_review)
-    return to_task_out(session, task)
+    return to_task_out(session, task, user=user)
 
 
 @router.post("/{task_id}/review", response_model=TaskOut)
@@ -1275,10 +1446,17 @@ def review_task(
     background_tasks: BackgroundTasks,
     session: Session = Depends(get_session),
     wait: bool = Query(False),
+    request: Request = None,
 ) -> TaskOut:
     with task_locks.hold(task_id):
         session.expire_all()
-        return _review_task_locked(task_id, background_tasks, session, wait=wait)
+        return _review_task_locked(
+            task_id,
+            background_tasks,
+            session,
+            user=_request_user(request),
+            wait=wait,
+        )
 
 
 def _review_task_locked(
@@ -1286,6 +1464,7 @@ def _review_task_locked(
     background_tasks: BackgroundTasks,
     session: Session,
     *,
+    user: Identity | None = None,
     wait: bool,
 ) -> TaskOut:
     task = session.get(GenerationTask, task_id)
@@ -1293,22 +1472,22 @@ def _review_task_locked(
         raise HTTPException(status_code=404, detail="Task not found")
 
     if task.status in _BUSY:
-        return to_task_out(session, task)
+        return to_task_out(session, task, user=user)
 
     if task.status in {"awaiting_confirmation", "awaiting_test_point_confirmation"}:
-        return to_task_out(session, task)
+        return to_task_out(session, task, user=user)
 
     if _force_sync("review", wait):
         task = run_review(session, task_id, chat_fn=_chat_for("review"))
-        return to_task_out(session, task)
+        return to_task_out(session, task, user=user)
 
     if task.status not in ("generated", "failed", "reviewed"):
         task = run_review(session, task_id, chat_fn=_chat_for("review"))
-        return to_task_out(session, task)
+        return to_task_out(session, task, user=user)
 
     task = _begin_status(session, task, "reviewing", "review", "后台开始评审")
     background_tasks.add_task(job_review, task_id)
-    return to_task_out(session, task)
+    return to_task_out(session, task, user=user)
 
 
 @router.post("/{task_id}/optimize-prompt", response_model=TaskOut)
@@ -1317,6 +1496,7 @@ def optimize_prompt_task(
     background_tasks: BackgroundTasks,
     session: Session = Depends(get_session),
     wait: bool = Query(False),
+    request: Request = None,
 ) -> TaskOut:
     with task_locks.hold(task_id):
         session.expire_all()
@@ -1324,6 +1504,7 @@ def optimize_prompt_task(
             task_id,
             background_tasks,
             session,
+            request=request,
             wait=wait,
         )
 
@@ -1333,28 +1514,31 @@ def _optimize_prompt_task_locked(
     background_tasks: BackgroundTasks,
     session: Session,
     *,
+    request: Request | None,
     wait: bool,
 ) -> TaskOut:
     task = session.get(GenerationTask, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
+    _ensure_task_prompt_accessible(session, task, request)
+    user = _request_user(request)
 
     if task.status in _BUSY:
-        return to_task_out(session, task)
+        return to_task_out(session, task, user=user)
 
     if _force_sync("optimize", wait):
         task = run_optimize_prompt(session, task_id, chat_fn=_chat_for("optimize"))
-        return to_task_out(session, task)
+        return to_task_out(session, task, user=user)
 
     if task.status not in ("reviewed", "failed"):
         task = run_optimize_prompt(session, task_id, chat_fn=_chat_for("optimize"))
-        return to_task_out(session, task)
+        return to_task_out(session, task, user=user)
 
     task = _begin_status(
         session, task, "optimizing", "optimize", "后台开始优化 Prompt"
     )
     background_tasks.add_task(job_optimize_prompt, task_id)
-    return to_task_out(session, task)
+    return to_task_out(session, task, user=user)
 
 
 @router.post("/{task_id}/apply-prompt", response_model=TaskOut)
@@ -1362,20 +1546,40 @@ def apply_prompt_task(
     task_id: int,
     body: ApplyPromptBody,
     session: Session = Depends(get_session),
+    request: Request = None,
 ) -> TaskOut:
     with task_locks.hold(task_id):
         session.expire_all()
-        return _apply_prompt_task_locked(task_id, body, session)
+        return _apply_prompt_task_locked(task_id, body, session, request=request)
 
 
 def _apply_prompt_task_locked(
     task_id: int,
     body: ApplyPromptBody,
     session: Session,
+    *,
+    request: Request | None,
 ) -> TaskOut:
     task = session.get(GenerationTask, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
+    _ensure_task_prompt_accessible(session, task, request)
+    user = _request_user(request)
+    revision_row = session.get(PromptRevision, body.revision_id)
+    if (
+        revision_row is not None
+        and revision_row.task_id == task.id
+        and not _is_prompt_id_visible(session, revision_row.base_prompt_id, user)
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail=_PRIVATE_TASK_PROMPT_FORBIDDEN_DETAIL,
+        )
+    if body.mode != "task_temp":
+        raise HTTPException(
+            status_code=422,
+            detail="已禁止修改全局提示词，仅支持应用到当前任务（task_temp）",
+        )
 
     try:
         task = apply_prompt(
@@ -1387,7 +1591,7 @@ def _apply_prompt_task_locked(
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return to_task_out(session, task)
+    return to_task_out(session, task, user=user)
 
 
 @router.post("/{task_id}/regenerate", response_model=TaskOut)
@@ -1396,6 +1600,7 @@ def regenerate_task(
     background_tasks: BackgroundTasks,
     session: Session = Depends(get_session),
     wait: bool = Query(False),
+    request: Request = None,
 ) -> TaskOut:
     with task_locks.hold(task_id):
         session.expire_all()
@@ -1403,6 +1608,7 @@ def regenerate_task(
             task_id,
             background_tasks,
             session,
+            request=request,
             wait=wait,
         )
 
@@ -1412,31 +1618,34 @@ def _regenerate_task_locked(
     background_tasks: BackgroundTasks,
     session: Session,
     *,
+    request: Request | None,
     wait: bool,
 ) -> TaskOut:
     task = session.get(GenerationTask, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
+    _ensure_task_prompt_accessible(session, task, request)
+    user = _request_user(request)
 
     if task.status in _BUSY:
-        return to_task_out(session, task)
+        return to_task_out(session, task, user=user)
 
     if _force_sync("generate", wait):
         _start_live_generate_stream(task, "开始重新生成测试用例")
         task = run_regenerate(session, task_id, chat_fn=_chat_for("generate"))
-        return to_task_out(session, task)
+        return to_task_out(session, task, user=user)
 
     if task.status not in ("generated", "reviewed", "failed"):
         _start_live_generate_stream(task, "开始重新生成测试用例")
         task = run_regenerate(session, task_id, chat_fn=_chat_for("generate"))
-        return to_task_out(session, task)
+        return to_task_out(session, task, user=user)
 
     task = _begin_status(
         session, task, "regenerating", "regenerate", "后台开始重新生成"
     )
     _start_live_generate_stream(task, "后台开始重新生成")
     background_tasks.add_task(job_regenerate, task_id)
-    return to_task_out(session, task)
+    return to_task_out(session, task, user=user)
 
 
 @router.get("/{task_id}/finalize-conflicts", response_model=FinalizeConflictsOut)
@@ -1479,6 +1688,7 @@ def finalize_task_route(
             body,
             session,
             operator=_request_operator(request),
+            user=current_user(request),
         )
 
 
@@ -1488,6 +1698,7 @@ def _finalize_task_locked(
     session: Session,
     *,
     operator: str | None = None,
+    user: Identity | None = None,
 ) -> TaskOut:
     task = session.get(GenerationTask, task_id)
     if task is None:
@@ -1505,14 +1716,23 @@ def _finalize_task_locked(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return to_task_out(session, task)
+    return to_task_out(session, task, user=user)
 
 
 @router.get("/{task_id}/drafts", response_model=List[CaseDraftOut])
-def list_drafts(task_id: int, session: Session = Depends(get_session)) -> list[CaseDraftOut]:
+def list_drafts(
+    task_id: int,
+    session: Session = Depends(get_session),
+    request: Request = None,
+) -> list[CaseDraftOut]:
     task = session.get(GenerationTask, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
+    user = _request_user(request)
+    visibility_cache: dict[int, bool] = {}
+    task_prompt_visible = _is_prompt_id_visible(
+        session, task.prompt_template_id, user, visibility_cache
+    )
     rows = session.exec(
         select(CaseDraft)
         .where(CaseDraft.task_id == task_id)
@@ -1527,7 +1747,13 @@ def list_drafts(task_id: int, session: Session = Depends(get_session)) -> list[C
                 task_id=int(d.task_id),
                 version=int(d.version),
                 content_md=str(d.content_md),
-                prompt_version_ref=d.prompt_version_ref,
+                prompt_version_ref=_sanitize_prompt_ref(
+                    session,
+                    d.prompt_version_ref,
+                    user,
+                    task_prompt_visible=task_prompt_visible,
+                    cache=visibility_cache,
+                ),
                 created_at=d.created_at,
                 points_with_cases=points_with_cases,
             )
@@ -1568,10 +1794,19 @@ def list_citations(
 
 
 @router.get("/{task_id}/events", response_model=List[TaskEventOut])
-def list_events(task_id: int, session: Session = Depends(get_session)) -> list[TaskEventOut]:
+def list_events(
+    task_id: int,
+    session: Session = Depends(get_session),
+    request: Request = None,
+) -> list[TaskEventOut]:
     task = session.get(GenerationTask, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
+    user = _request_user(request)
+    visibility_cache: dict[int, bool] = {}
+    task_prompt_visible = _is_prompt_id_visible(
+        session, task.prompt_template_id, user, visibility_cache
+    )
     rows = session.exec(
         select(TaskEvent)
         .where(TaskEvent.task_id == task_id)
@@ -1581,14 +1816,24 @@ def list_events(task_id: int, session: Session = Depends(get_session)) -> list[T
         space = resolve_space(session, task.wiki_space_id)
     except ValueError:
         space = None
-    return [
-        TaskEventOut(
-            **row.model_dump(),
-            wiki_space_id=task.wiki_space_id,
-            wiki_space_name=space.name if space else "",
+    results: list[TaskEventOut] = []
+    for row in rows:
+        row_data = row.model_dump()
+        row_data["detail_json"] = _sanitize_event_detail_json(
+            session,
+            row.detail_json,
+            user,
+            task_prompt_visible=task_prompt_visible,
+            cache=visibility_cache,
         )
-        for row in rows
-    ]
+        results.append(
+            TaskEventOut(
+                **row_data,
+                wiki_space_id=task.wiki_space_id,
+                wiki_space_name=space.name if space else "",
+            )
+        )
+    return results
 
 
 @router.get("/{task_id}/reviews", response_model=List[ReviewResultOut])
@@ -1608,14 +1853,26 @@ def list_reviews(
 
 @router.get("/{task_id}/revisions", response_model=List[PromptRevisionOut])
 def list_revisions(
-    task_id: int, session: Session = Depends(get_session)
+    task_id: int,
+    session: Session = Depends(get_session),
+    request: Request = None,
 ) -> list[PromptRevision]:
     task = session.get(GenerationTask, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
+    user = _request_user(request)
+    visibility_cache: dict[int, bool] = {}
+    if not _is_prompt_id_visible(
+        session, task.prompt_template_id, user, visibility_cache
+    ):
+        return []
     rows = session.exec(
         select(PromptRevision)
         .where(PromptRevision.task_id == task_id)
         .order_by(col(PromptRevision.id).desc())
     ).all()
-    return list(rows)
+    return [
+        row
+        for row in rows
+        if _is_prompt_id_visible(session, row.base_prompt_id, user, visibility_cache)
+    ]

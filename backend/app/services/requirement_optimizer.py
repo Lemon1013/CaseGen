@@ -61,6 +61,7 @@ def optimize_requirement(
         select(PromptTemplate)
         .where(
             PromptTemplate.type == "requirement_optimize",
+            PromptTemplate.visibility == "system",
             PromptTemplate.is_active == True,  # noqa: E712
         )
         .order_by(col(PromptTemplate.updated_at).desc(), col(PromptTemplate.id).desc())

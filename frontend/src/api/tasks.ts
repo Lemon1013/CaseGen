@@ -280,7 +280,7 @@ export interface CoverageSummary {
   citations: CoverageCitation[]
 }
 
-export type ApplyPromptMode = 'global' | 'task_temp'
+export type ApplyPromptMode = 'task_temp'
 
 export const IN_PROGRESS_STATUSES = new Set([
   'retrieving',
@@ -382,11 +382,12 @@ export function finalizeTask(id: number, draftId?: number | null, overwriteExist
 
 export function applyPrompt(
   id: number,
-  body: { revision_id: number; mode: ApplyPromptMode; content?: string },
+  body: { revision_id: number; mode?: 'task_temp'; content?: string },
 ) {
+  const { mode = 'task_temp', ...rest } = body
   return api<TaskItem>(`/api/tasks/${id}/apply-prompt`, {
     method: 'POST',
-    body: JSON.stringify(body),
+    body: JSON.stringify({ ...rest, mode }),
   })
 }
 

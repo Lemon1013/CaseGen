@@ -5,6 +5,7 @@ import {
   createModel,
   deleteModel,
   listModels,
+  notifyModelsUpdated,
   pingModel,
   updateModel,
   type ModelConfig,
@@ -99,6 +100,7 @@ async function submit() {
       })
       ElMessage.success('已创建模型')
     }
+    notifyModelsUpdated()
     dialogVisible.value = false
     await load()
   } catch (e) {
@@ -126,6 +128,7 @@ async function handleDelete(row: ModelConfig) {
       type: 'warning',
     })
     await deleteModel(row.id)
+    notifyModelsUpdated()
     ElMessage.success('已删除')
     await load()
   } catch (e) {

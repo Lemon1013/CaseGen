@@ -400,7 +400,7 @@ class TaskEventOut(BaseModel):
 
 class ApplyPromptBody(BaseModel):
     revision_id: int
-    mode: Literal["global", "task_temp"]
+    mode: str = "task_temp"
     content: Optional[str] = Field(default=None, min_length=1)
 
 

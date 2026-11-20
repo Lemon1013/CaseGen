@@ -627,7 +627,7 @@ def test_migration_0002_backfills_legacy_external_wikis_and_extends_citations(tm
     engine = create_engine(f"sqlite:///{db_path}")
     try:
         applied = run_versioned_migrations(engine)
-        assert applied == ["0002_project_knowledge_sources"]
+        assert "0002_project_knowledge_sources" in applied
         # Re-running is idempotent
         assert run_versioned_migrations(engine) == []
     finally:
@@ -761,7 +761,6 @@ def test_init_db_migrates_legacy_external_wikis_after_create_all(tmp_app_data):
                 "SELECT version FROM schema_migrations ORDER BY version ASC"
             ).fetchall()
         ]
-        assert applied == [
-            "0001_v2_refactor_baseline",
-            "0002_project_knowledge_sources",
-        ]
+        assert "0001_v2_refactor_baseline" in applied
+        assert "0002_project_knowledge_sources" in applied
+        assert "0003_prompt_visibility" in applied

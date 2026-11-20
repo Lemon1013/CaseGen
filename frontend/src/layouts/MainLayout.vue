@@ -20,7 +20,7 @@ import {
   Expand,
   Fold,
 } from '@element-plus/icons-vue'
-import { listModels, type ModelConfig } from '../api/models'
+import { listModels, MODELS_UPDATED_EVENT, type ModelConfig } from '../api/models'
 import { setProjectInvalidHandler } from '../api/client'
 import { useAuthStore } from '../authStore'
 import BrandMark from '../components/BrandMark.vue'
@@ -46,10 +46,10 @@ const useCaseItems = [
   { path: '/tasks', label: '生成任务', icon: List },
   { path: '/agent', label: 'Agent 对话', icon: ChatDotRound },
   { path: '/cases', label: '用例管理', icon: Collection },
-  { path: '/data-pools', label: '数据池', icon: DataAnalysis, adminOnly: true },
 ]
 
 const platformItems = [
+  { path: '/data-pools', label: '数据池', icon: DataAnalysis, adminOnly: true },
   { path: '/platform-management', label: '平台管理', icon: Connection, adminOnly: true },
   { path: '/platform-case-generate', label: '生成平台用例', icon: SetUp, adminOnly: true },
   { path: '/platform-cases', label: '平台用例管理', icon: Collection, adminOnly: true },
@@ -144,26 +144,26 @@ watch(
   { immediate: true },
 )
 
+let modelLoadSeq = 0
+
 async function loadDefaultModel() {
+  const seq = ++modelLoadSeq
   try {
     const models = await listModels()
+    if (seq !== modelLoadSeq) return
     defaultModel.value = models.find((m) => m.is_default) || models[0] || null
   } catch {
+    if (seq !== modelLoadSeq) return
     defaultModel.value = null
   }
 }
 
-// The chip must not go stale after the user edits model configuration in
-// /models: reload it on every route change...
-watch(
-  () => route.path,
-  () => {
-    void loadDefaultModel()
-  },
-)
+const MODEL_REFRESH_INTERVAL_MS = 5 * 60_000
+let modelTimer: number | null = null
 
-// ...and on a 60s fallback timer for long-lived views that never navigate.
-const modelTimer = window.setInterval(loadDefaultModel, 60_000)
+function onModelsUpdated() {
+  void loadDefaultModel()
+}
 
 let projectRefreshFlight: Promise<void> | null = null
 let lastProjectRefreshAt = 0
@@ -197,15 +197,26 @@ function onVisibilityChange() {
 
 onMounted(async () => {
   window.addEventListener('focus', onWindowFocus)
+  window.addEventListener(MODELS_UPDATED_EVENT, onModelsUpdated)
   document.addEventListener('visibilitychange', onVisibilityChange)
   setProjectInvalidHandler(() => refreshProjects(true))
+  modelTimer = window.setInterval(() => {
+    if (document.visibilityState === 'visible') {
+      void loadDefaultModel()
+    }
+  }, MODEL_REFRESH_INTERVAL_MS)
   await Promise.all([loadDefaultModel(), projects.load(route.query)])
   await projects.ensureRouteProject(router)
 })
 
 onUnmounted(() => {
-  window.clearInterval(modelTimer)
+  modelLoadSeq += 1
+  if (modelTimer != null) {
+    window.clearInterval(modelTimer)
+    modelTimer = null
+  }
   window.removeEventListener('focus', onWindowFocus)
+  window.removeEventListener(MODELS_UPDATED_EVENT, onModelsUpdated)
   document.removeEventListener('visibilitychange', onVisibilityChange)
   setProjectInvalidHandler(null)
 })
@@ -306,7 +317,7 @@ watch(
           <el-select v-if="projects.state.projects.length" :model-value="projects.state.currentId" class="project-select" aria-label="当前项目" @change="(id: number) => projects.select(id, router)" @visible-change="onProjectSelectVisible">
             <el-option v-for="project in projects.state.projects.filter((item) => item.status === 'active')" :key="project.id" :label="project.name" :value="project.id" />
           </el-select>
-          <div v-if="defaultModel" class="model-chip" title="当前默认模型">
+          <div v-if="defaultModel && route.name !== 'agent-chat'" class="model-chip" title="当前默认模型">
             <span class="model-dot" />
             <span class="model-label">默认模型</span>
             <span class="model-name">{{ defaultModel.name }} · {{ defaultModel.model_name }}</span>
@@ -328,7 +339,10 @@ watch(
       </header>
 
       <el-main class="main-content">
-        <router-view v-if="(route.meta.skipProjectGate || projects.state.loaded) && (route.meta.skipProjectGate || !projects.state.currentId || route.query.project_id)" :key="projects.state.currentId || 'no-project'" />
+        <router-view
+          v-if="(route.meta.skipProjectGate || projects.state.loaded) && (route.meta.skipProjectGate || !projects.state.currentId || route.query.project_id)"
+          :key="route.meta.skipProjectGate ? 'global' : (projects.state.currentId || 'no-project')"
+        />
       </el-main>
     </el-container>
   </el-container>

@@ -40,81 +40,120 @@ function readCookie(name: string): string | null {
   return item ? decodeURIComponent(item.slice(prefix.length)) : null
 }
 
+const GLOBAL_API_PREFIXES = [
+  '/api/health',
+  '/api/auth',
+  '/api/users',
+  '/api/models',
+  '/api/prompts',
+  '/api/dashboard',
+  '/api/knowledge-providers',
+]
+
+const GLOBAL_API_EXACT_PATHS = new Set(['/api/projects'])
+
+function normalizePathname(pathname: string): string {
+  if (pathname.length > 1 && pathname.endsWith('/')) {
+    return pathname.slice(0, -1)
+  }
+  return pathname
+}
+
+export function isGlobalApiPath(pathname: string): boolean {
+  const normalized = normalizePathname(pathname)
+  if (GLOBAL_API_EXACT_PATHS.has(normalized)) return true
+  return GLOBAL_API_PREFIXES.some(
+    (prefix) => normalized === prefix || normalized.startsWith(`${prefix}/`),
+  )
+}
+
 function isUnsafe(method?: string) {
   return !['GET', 'HEAD', 'OPTIONS', 'TRACE'].includes((method || 'GET').toUpperCase())
 }
 
-export async function api<T>(path: string, init?: RequestInit): Promise<T> {
+interface PreparedRequest {
+  url: string
+  headers: Headers
+  requestEpoch: number
+}
+
+function prepareRequest(path: string, init?: RequestInit, jsonContentType = true): PreparedRequest {
   const requestEpoch = authEpoch
   const headers = new Headers(init?.headers)
-  if (init?.body && !(init.body instanceof FormData) && !headers.has("Content-Type")) {
-    headers.set("Content-Type", "application/json")
+  if (
+    jsonContentType &&
+    init?.body &&
+    !(init.body instanceof FormData) &&
+    !(init.body instanceof Blob) &&
+    !headers.has('Content-Type')
+  ) {
+    headers.set('Content-Type', 'application/json')
   }
   if (isUnsafe(init?.method)) {
     const csrf = readCookie('casegen_csrf')
     if (csrf && !headers.has('X-CSRF-Token')) headers.set('X-CSRF-Token', csrf)
   }
-  if (typeof window !== 'undefined') {
-    const searchProjectId = new URLSearchParams(window.location.search).get('project_id')
-    const projectId = searchProjectId || window.localStorage?.getItem('casegen:last-project-id')
-    if (projectId && path.startsWith('/api/')) {
-      const url = new URL(path, window.location.origin)
-      if (!url.searchParams.has('project_id')) url.searchParams.set('project_id', projectId)
-      path = `${url.pathname}${url.search}`
+  let resolvedPath = path
+  if (typeof window !== 'undefined' && path.startsWith('/api/')) {
+    const url = new URL(path, window.location.origin)
+    if (!isGlobalApiPath(url.pathname) && !url.searchParams.has('project_id')) {
+      const searchProjectId = new URLSearchParams(window.location.search).get('project_id')
+      const projectId = searchProjectId || window.localStorage?.getItem('casegen:last-project-id')
+      if (projectId) {
+        url.searchParams.set('project_id', projectId)
+        resolvedPath = `${url.pathname}${url.search}`
+      }
     }
   }
-  const res = await fetch(path, { ...init, headers, credentials: 'include' })
+  return { url: resolvedPath, headers, requestEpoch }
+}
+
+function extractErrorDetail(text: string): string {
+  let detail = text
+  try {
+    const payload = JSON.parse(text)
+    if (typeof payload?.detail === 'string') {
+      detail = payload.detail
+    } else if (Array.isArray(payload?.detail)) {
+      detail = payload.detail
+        .map((item: { msg?: string }) => item.msg || '')
+        .filter(Boolean)
+        .join('；')
+    }
+  } catch {
+    // Non-JSON gateway errors fall through to the status-aware message.
+  }
+  return detail
+}
+
+async function throwApiError(res: Response, path: string, requestEpoch: number): Promise<never> {
+  const text = await res.text()
+  const detail = extractErrorDetail(text)
+  if (res.status === 404 && /Project not found or inactive/i.test(detail)) {
+    void projectInvalidHandler?.()
+  }
+  const translated = translateApiError(detail, res.status)
+  if (res.status === 401 && !path.startsWith('/api/auth/')) {
+    void unauthorizedHandler?.(requestEpoch)
+  }
+  throw new ApiError(res.status, translated)
+}
+
+export async function api<T>(path: string, init?: RequestInit): Promise<T> {
+  const { url, headers, requestEpoch } = prepareRequest(path, init, true)
+  const res = await fetch(url, { ...init, headers, credentials: 'include' })
   if (!res.ok) {
-    const text = await res.text()
-    let detail = text
-    try {
-      const payload = JSON.parse(text)
-      if (typeof payload?.detail === 'string') detail = payload.detail
-      else if (Array.isArray(payload?.detail)) {
-        detail = payload.detail.map((item: { msg?: string }) => item.msg || '').filter(Boolean).join('；')
-      }
-    } catch {
-      // Non-JSON gateway errors fall through to the status-aware message.
-    }
-    if (res.status === 404 && /Project not found or inactive/i.test(detail)) {
-      void projectInvalidHandler?.()
-    }
-    const translated = translateApiError(detail, res.status)
-    if (res.status === 401 && !path.startsWith('/api/auth/')) {
-      void unauthorizedHandler?.(requestEpoch)
-    }
-    throw new ApiError(res.status, translated)
+    await throwApiError(res, url, requestEpoch)
   }
   if (res.status === 204) return undefined as T
   return res.json()
 }
 
 export async function apiBlob(path: string, init?: RequestInit): Promise<Blob> {
-  const requestEpoch = authEpoch
-  const headers = new Headers(init?.headers)
-  if (isUnsafe(init?.method)) {
-    const csrf = readCookie('casegen_csrf')
-    if (csrf && !headers.has('X-CSRF-Token')) headers.set('X-CSRF-Token', csrf)
-  }
-  if (typeof window !== 'undefined') {
-    const searchProjectId = new URLSearchParams(window.location.search).get('project_id')
-    const projectId = searchProjectId || window.localStorage?.getItem('casegen:last-project-id')
-    if (projectId && path.startsWith('/api/')) {
-      const url = new URL(path, window.location.origin)
-      if (!url.searchParams.has('project_id')) url.searchParams.set('project_id', projectId)
-      path = `${url.pathname}${url.search}`
-    }
-  }
-  const res = await fetch(path, { ...init, headers, credentials: 'include' })
+  const { url, headers, requestEpoch } = prepareRequest(path, init, false)
+  const res = await fetch(url, { ...init, headers, credentials: 'include' })
   if (!res.ok) {
-    const text = await res.text()
-    if (res.status === 404 && /Project not found or inactive/i.test(text)) {
-      void projectInvalidHandler?.()
-    }
-    if (res.status === 401 && !path.startsWith('/api/auth/')) {
-      void unauthorizedHandler?.(requestEpoch)
-    }
-    throw new ApiError(res.status, text || `请求失败（HTTP ${res.status}）`)
+    await throwApiError(res, url, requestEpoch)
   }
   return res.blob()
 }
@@ -124,13 +163,39 @@ function translateApiError(detail: string, status: number) {
     [/Unsupported file extension/i, '不支持该文件格式，请上传 md、txt、pdf 或 docx 文件'],
     [/File exceeds max size/i, '文件超过上传大小限制，请压缩或拆分后重试'],
     [/Parse failed|Could not parse|Document path is outside/i, '文档解析失败，请检查文件是否损坏或包含可提取文本'],
-    [/Only pending review items/i, '该审核项已被处理，请刷新列表后查看最新状态'],
-    [/Merge candidates require manual review/i, '合并候选暂不能自动批准，请人工核对冲突内容'],
-    [/Ingest job not found/i, '摄入任务不存在或已被清理，请刷新文档列表'],
-    [/Document not found/i, '文档不存在，请刷新列表后重试'],
-    [/Wiki page not found/i, 'Wiki 页面不存在，可能已被归档或删除'],
-    [/Source chunk not found/i, '原文块不存在，请重新摄入对应文档'],
     [/Another active prompt of this type is already enabled/i, '该类型已有启用中的提示词，请先停用其他模板后再启用这条'],
+    [
+      /Global prompt application is disabled|global mode is disabled|apply.*global.*disabled|only ['"]?task_temp['"]?.*allowed|已禁止修改全局提示词/i,
+      '已禁止在任务内修改全局提示词，修订仅对当前任务临时生效',
+    ],
+    [
+      /Only admin(?:istrator)?s? can set prompt visibility to system/i,
+      '仅管理员可将提示词设为系统预置',
+    ],
+    [
+      /Only admin(?:istrator)?s? can (?:manage|create|edit|update|modify|delete) (?:system )?(?:engine|non-generate) prompts?|Only admin(?:istrator)?s? can create system prompts|Admin (?:permission|privileges?) required for (?:system|engine) prompts?/i,
+      '仅管理员可创建或管理系统预置及引擎类提示词',
+    ],
+    [
+      /Cannot (?:edit|update|modify) (?:another user's|others'|system|this) prompt|Not authorized to (?:edit|update|modify) this prompt|No permission to (?:edit|modify) this prompt|You do not have permission to (?:edit|update|modify)/i,
+      '无权编辑该提示词，请先「复制为我的模板」后再修改',
+    ],
+    [
+      /Cannot delete (?:another user's|others'|system|this) prompt|Not authorized to delete this prompt|No permission to delete this prompt|You do not have permission to delete/i,
+      '无权删除该提示词',
+    ],
+    [
+      /Administrators cannot change another user's shared prompt to (?:private|system)|Cannot (?:change|set|downgrade) another user's (?:shared )?prompt to (?:private|system)|shared prompt.*cannot.*(?:private|system)/i,
+      '不能将他人的团队共享模板修改为私有或系统预置',
+    ],
+    [
+      /System engine prompts must (?:have|keep) visibility|Only generate prompts can be (?:shared|private|forked)|(?:Engine|Non-generate) prompts must (?:have visibility|be) ['"]?system['"]?/i,
+      '引擎类提示词固定为系统预置，仅生成类（generate）提示词支持私有、共享或复制',
+    ],
+    [/Cannot delete the last active (?:system )?prompt/i, '这是该类型最后一个启用的提示词，请先启用同类型的其他模板'],
+    [/Prompt is referenced by task/i, '该提示词已被任务引用，为保留任务可重现性不能删除'],
+    [/Prompt is referenced by revision/i, '该提示词已被 Prompt 修订引用，为保留历史记录不能删除'],
+    [/Prompt(?: template)? not found/i, '提示词不存在或无权访问，请刷新列表'],
   ]
   for (const [pattern, message] of rules) {
     if (pattern.test(detail)) return message
@@ -138,6 +203,7 @@ function translateApiError(detail: string, status: number) {
   if (detail && !detail.startsWith('{') && !detail.startsWith('<')) return detail
   const fallback: Record<number, string> = {
     400: '请求参数不正确，请检查输入后重试',
+    403: '没有权限执行该操作',
     404: '请求的数据不存在，请刷新页面',
     409: '数据状态已变化，请刷新后重试',
     413: '提交内容过大，请缩小文件或输入内容',

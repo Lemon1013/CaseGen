@@ -85,6 +85,34 @@ const selectedCases = computed(() => referenceCases.value.filter((row) => select
 const referenceChars = computed(() => selectedCases.value.reduce((n, row) => n + row.content_md.length, 0) + form.reference_text.length)
 const selectedGranularity = computed(() => granularityOptions.find((item) => item.value === form.generation_granularity) || granularityOptions[1])
 const dimensionSummary = computed(() => form.test_dimensions.map((value) => dimensionLabelMap.get(value) || value).join('、') || '未选择')
+const promptGroups = computed(() => {
+  const groups: Array<{ key: string; label: string; items: PromptTemplate[] }> = [
+    {
+      key: 'system',
+      label: '系统预置',
+      items: prompts.value.filter((row) => row.visibility === 'system' || !row.visibility),
+    },
+    {
+      key: 'private',
+      label: '我的模板',
+      items: prompts.value.filter((row) => row.visibility === 'private'),
+    },
+    {
+      key: 'shared',
+      label: '团队共享',
+      items: prompts.value.filter((row) => row.visibility === 'shared'),
+    },
+  ]
+  return groups.filter((group) => group.items.length > 0)
+})
+
+function formatPromptOptionLabel(row: PromptTemplate) {
+  const base = `${row.name} (v${row.version})`
+  if (row.visibility === 'shared' && row.owner_username) {
+    return `${base} · @${row.owner_username}`
+  }
+  return base
+}
 
 function tags(text: string) { return text.split(/[,，\s]+/).map((x) => x.trim()).filter(Boolean).slice(0, 30) }
 
@@ -104,7 +132,11 @@ async function loadOptions() {
     models.value = modelsRows
     prompts.value = promptRows.filter((row) => row.is_active)
     form.model_id = modelsRows.find((row) => row.is_default)?.id ?? null
-    form.prompt_template_id = prompts.value[0]?.id ?? null
+    const defaultPrompt =
+      prompts.value.find((row) => row.visibility === 'system' || !row.visibility) ??
+      prompts.value[0] ??
+      null
+    form.prompt_template_id = defaultPrompt?.id ?? null
     requirements.value = reqRows
     await searchReferences()
   } catch (e) { ElMessage.error(`加载选项失败：${(e as Error).message}`) }
@@ -307,7 +339,31 @@ onMounted(loadOptions)
             />
           </el-form-item>
           <el-form-item label="模型"><el-select v-model="form.model_id" clearable style="width:100%"><el-option v-for="row in models" :key="row.id" :label="`${row.name} (${row.model_name})`" :value="row.id" /></el-select></el-form-item>
-          <el-form-item label="生成 Prompt"><el-select v-model="form.prompt_template_id" clearable style="width:100%"><el-option v-for="row in prompts" :key="row.id" :label="`${row.name} (v${row.version})`" :value="row.id" /></el-select></el-form-item>
+          <el-form-item label="生成 Prompt">
+            <el-select v-model="form.prompt_template_id" clearable placeholder="请选择生成提示词" style="width:100%">
+              <el-option-group
+                v-for="group in promptGroups"
+                :key="group.key"
+                :label="group.label"
+              >
+                <el-option
+                  v-for="row in group.items"
+                  :key="row.id"
+                  :label="formatPromptOptionLabel(row)"
+                  :value="row.id"
+                >
+                  <div class="prompt-option-row">
+                    <span class="prompt-option-name">
+                      {{ row.name }} <small class="prompt-option-ver">v{{ row.version }}</small>
+                    </span>
+                    <span v-if="row.visibility === 'shared' && row.owner_username" class="prompt-option-author">
+                      @{{ row.owner_username }}
+                    </span>
+                  </div>
+                </el-option>
+              </el-option-group>
+            </el-select>
+          </el-form-item>
           <el-form-item label="生成后自动评审"><el-switch v-model="form.auto_review" /></el-form-item>
         </el-form></el-card>
         <el-card shadow="never" class="block"><template #header>提交摘要</template><el-descriptions :column="1" border size="small"><el-descriptions-item label="粒度">{{ selectedGranularity.label }}</el-descriptions-item><el-descriptions-item label="维度">{{ dimensionSummary }}</el-descriptions-item><el-descriptions-item label="参考">{{ selectedCases.length }} 条库内 + {{ form.reference_text.trim() ? '手动输入' : '无手动输入' }}</el-descriptions-item><el-descriptions-item label="流程">检索确认 → 测试点确认 → 完整用例</el-descriptions-item></el-descriptions><el-button class="submit" type="primary" size="large" :loading="submitting" @click="submit">创建任务并启动检索流水线 →</el-button></el-card>
@@ -600,6 +656,34 @@ small,
   border-color: rgba(16, 185, 129, 0.35);
   background: #ecfdf5;
   color: #065f46;
+}
+
+.prompt-option-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+}
+
+.prompt-option-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.prompt-option-ver {
+  margin-left: 4px;
+  font-family: var(--cg-font-mono);
+  font-size: 11px;
+  color: var(--cg-text-muted);
+}
+
+.prompt-option-author {
+  flex-shrink: 0;
+  font-family: var(--cg-font-mono);
+  font-size: 11.5px;
+  color: var(--cg-text-muted);
 }
 
 .submit {

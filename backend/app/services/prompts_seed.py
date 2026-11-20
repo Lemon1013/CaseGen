@@ -20,6 +20,9 @@ PROMPT_TYPES = (
 # `generate` supports per-task template selection.  Every other type must
 # keep exactly one active row so prompt resolution is deterministic.
 MULTI_ACTIVE_PROMPT_TYPES = frozenset({"generate"})
+USER_MANAGEABLE_PROMPT_TYPES = frozenset({"generate"})
+ADMIN_ONLY_PROMPT_TYPES = frozenset(PROMPT_TYPES) - USER_MANAGEABLE_PROMPT_TYPES
+PROMPT_VISIBILITIES = frozenset({"system", "shared", "private"})
 
 DEFAULT_PROMPTS_DIR = Path(__file__).resolve().parents[1] / "default_prompts"
 
@@ -83,6 +86,7 @@ def seed_default_prompts(session: Session) -> None:
         active_rows = session.exec(
             select(PromptTemplate).where(
                 PromptTemplate.type == ptype,
+                PromptTemplate.visibility == "system",
                 PromptTemplate.is_active == True,  # noqa: E712
             ).order_by(col(PromptTemplate.id).desc())
         ).all()
@@ -106,6 +110,7 @@ def seed_default_prompts(session: Session) -> None:
             if ptype == "test_points" and not session.exec(
                 select(PromptTemplate).where(
                     PromptTemplate.type == ptype,
+                    PromptTemplate.visibility == "system",
                     PromptTemplate.content == content,
                 )
             ).first():
@@ -116,6 +121,8 @@ def seed_default_prompts(session: Session) -> None:
                         content=content,
                         version=_next_version(session, ptype),
                         is_active=False,
+                        owner_user_id=None,
+                        visibility="system",
                     )
                 )
             continue
@@ -144,6 +151,8 @@ def seed_default_prompts(session: Session) -> None:
                 content=content,
                 version=_next_version(session, ptype),
                 is_active=True,
+                owner_user_id=None,
+                visibility="system",
             )
         )
     session.commit()
