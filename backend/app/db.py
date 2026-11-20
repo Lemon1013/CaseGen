@@ -228,6 +228,61 @@ def _migrate_0003_prompt_visibility(engine: Engine) -> None:
         )
 
 
+def _migrate_0004_remove_legacy_wiki_prompts(engine: Engine) -> None:
+    """Remove retired wiki_analyze and wiki_write prompt templates safely."""
+    with engine.begin() as conn:
+        table_exists = conn.execute(
+            text(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'prompt_templates'"
+            )
+        ).first()
+        if not table_exists:
+            return
+
+        retired_rows = conn.execute(
+            text(
+                "SELECT id FROM prompt_templates "
+                "WHERE type IN ('wiki_analyze', 'wiki_write')"
+            )
+        ).fetchall()
+        if not retired_rows:
+            return
+        retired_ids = [int(row[0]) for row in retired_rows]
+
+        referenced_ids: set[int] = set()
+        for ref_table, ref_col in (
+            ("generation_tasks", "prompt_template_id"),
+            ("prompt_revisions", "base_prompt_id"),
+        ):
+            ref_cols = {
+                str(col_row[1])
+                for col_row in conn.execute(
+                    text(f'PRAGMA table_info("{ref_table}")')
+                ).fetchall()
+            }
+            if ref_col in ref_cols:
+                rows = conn.execute(
+                    text(
+                        f'SELECT DISTINCT "{ref_col}" FROM "{ref_table}" '
+                        f'WHERE "{ref_col}" IS NOT NULL'
+                    )
+                ).fetchall()
+                referenced_ids.update(int(r[0]) for r in rows if r[0] is not None)
+
+        for pid in retired_ids:
+            if pid in referenced_ids:
+                conn.execute(
+                    text("UPDATE prompt_templates SET is_active = 0 WHERE id = :pid"),
+                    {"pid": pid},
+                )
+            else:
+                conn.execute(
+                    text("DELETE FROM prompt_templates WHERE id = :pid"),
+                    {"pid": pid},
+                )
+
+
 VERSIONED_MIGRATIONS: tuple[MigrationEntry, ...] = (
     ("0001_v2_refactor_baseline", "Record v2 refactor baseline", _noop_baseline_migration),
     (
@@ -239,6 +294,11 @@ VERSIONED_MIGRATIONS: tuple[MigrationEntry, ...] = (
         "0003_prompt_visibility",
         "Add owner_user_id and visibility columns to prompt_templates",
         _migrate_0003_prompt_visibility,
+    ),
+    (
+        "0004_remove_legacy_wiki_prompts",
+        "Remove retired wiki_analyze and wiki_write prompt templates",
+        _migrate_0004_remove_legacy_wiki_prompts,
     ),
 )
 

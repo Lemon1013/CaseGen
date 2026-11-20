@@ -115,7 +115,11 @@ def list_prompts(
             status_code=422,
             detail=f"Invalid prompt visibility: {visibility}",
         )
-    stmt = select(PromptTemplate).order_by(col(PromptTemplate.id).desc())
+    stmt = (
+        select(PromptTemplate)
+        .where(col(PromptTemplate.type).in_(PROMPT_TYPES))
+        .order_by(col(PromptTemplate.id).desc())
+    )
     if type:
         stmt = stmt.where(PromptTemplate.type == type)
     if visibility:
@@ -212,7 +216,7 @@ def get_prompt(
 ) -> PromptOut:
     row = session.get(PromptTemplate, prompt_id)
     user = current_user(request)
-    if row is None or not can_view_prompt(row, user):
+    if row is None or row.type not in PROMPT_TYPES or not can_view_prompt(row, user):
         raise HTTPException(status_code=404, detail="Prompt not found")
     owner_usernames = _load_owner_usernames(session, [row])
     return _to_prompt_out(row, user, owner_usernames)
@@ -227,7 +231,7 @@ def update_prompt(
 ) -> PromptOut:
     row = session.get(PromptTemplate, prompt_id)
     user = current_user(request)
-    if row is None or not can_view_prompt(row, user):
+    if row is None or row.type not in PROMPT_TYPES or not can_view_prompt(row, user):
         raise HTTPException(status_code=404, detail="Prompt not found")
     if not can_manage_prompt(row, user):
         raise HTTPException(status_code=403, detail="No permission to modify this prompt")
@@ -340,7 +344,7 @@ def delete_prompt(
 
     row = session.get(PromptTemplate, prompt_id)
     user = current_user(request)
-    if row is None or not can_view_prompt(row, user):
+    if row is None or row.type not in PROMPT_TYPES or not can_view_prompt(row, user):
         raise HTTPException(status_code=404, detail="Prompt not found")
     if not can_manage_prompt(row, user):
         raise HTTPException(status_code=403, detail="No permission to delete this prompt")
@@ -404,7 +408,7 @@ def fork_prompt(
 
     row = session.get(PromptTemplate, prompt_id)
     user = current_user(request)
-    if row is None or not can_view_prompt(row, user):
+    if row is None or row.type not in PROMPT_TYPES or not can_view_prompt(row, user):
         raise HTTPException(status_code=404, detail="Prompt not found")
     if row.type not in USER_MANAGEABLE_PROMPT_TYPES:
         raise HTTPException(

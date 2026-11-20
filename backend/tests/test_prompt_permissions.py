@@ -1386,3 +1386,159 @@ def test_prompt_api_hardening_engine_visibility_and_last_system_protection(tmp_a
     assert adopted.json()["owner_user_id"] is not None
     assert adopted.json()["owner_username"] == "admin"
     assert admin.get(f"/api/prompts/{unowned_id}", headers=_origin()).status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# 11. Migration 0004 & API filtering for retired wiki_analyze / wiki_write prompts
+# ---------------------------------------------------------------------------
+
+
+def test_migration_0004_removes_retired_wiki_prompts_and_deactivates_referenced(tmp_app_data):
+    db_path = tmp_app_data / "meta" / "app.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE prompt_templates (
+                id INTEGER PRIMARY KEY,
+                name VARCHAR NOT NULL,
+                type VARCHAR NOT NULL,
+                content VARCHAR NOT NULL,
+                version INTEGER NOT NULL DEFAULT 1,
+                is_active BOOLEAN NOT NULL DEFAULT 1,
+                owner_user_id INTEGER,
+                visibility VARCHAR NOT NULL DEFAULT 'system',
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE generation_tasks (
+                id INTEGER PRIMARY KEY,
+                requirement_id INTEGER NOT NULL,
+                wiki_space_id INTEGER,
+                status VARCHAR NOT NULL,
+                prompt_template_id INTEGER,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE prompt_revisions (
+                id INTEGER PRIMARY KEY,
+                task_id INTEGER NOT NULL,
+                base_prompt_id INTEGER,
+                new_content VARCHAR NOT NULL,
+                status VARCHAR NOT NULL,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO prompt_templates (id, name, type, content, version, is_active, visibility)
+            VALUES
+                (1, 'default_generate', 'generate', 'gen body', 10, 1, 'system'),
+                (2, 'default_review', 'review', 'rev body', 10, 1, 'system'),
+                (3, 'default_wiki_analyze', 'wiki_analyze', 'old analyze', 1, 1, 'system'),
+                (4, 'default_wiki_write', 'wiki_write', 'old write', 1, 1, 'system'),
+                (5, 'ref_wiki_write', 'wiki_write', 'referenced by task', 2, 1, 'system'),
+                (6, 'ref_wiki_analyze', 'wiki_analyze', 'referenced by rev', 2, 1, 'system')
+            """
+        )
+        conn.execute(
+            "INSERT INTO generation_tasks (id, requirement_id, status, prompt_template_id) "
+            "VALUES (10, 1, 'draft', 5)"
+        )
+        conn.execute(
+            "INSERT INTO prompt_revisions (id, task_id, base_prompt_id, new_content, status) "
+            "VALUES (20, 10, 6, 'rev', 'pending')"
+        )
+        conn.commit()
+
+    reset_engine()
+    init_db()
+    # Second init_db must stay idempotent
+    init_db()
+
+    applied = get_applied_migrations(get_engine())
+    assert "0004_remove_legacy_wiki_prompts" in applied
+
+    with sqlite3.connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT id, type, is_active FROM prompt_templates ORDER BY id"
+        ).fetchall()
+    by_id = {int(r[0]): (str(r[1]), int(r[2])) for r in rows}
+    # Valid rows remain intact
+    assert by_id[1] == ("generate", 1)
+    assert by_id[2] == ("review", 1)
+    # Unreferenced retired wiki prompts are deleted
+    assert 3 not in by_id
+    assert 4 not in by_id
+    # Referenced retired wiki prompts are preserved but deactivated for integrity
+    assert by_id[5] == ("wiki_write", 0)
+    assert by_id[6] == ("wiki_analyze", 0)
+
+
+def test_retired_prompt_types_hidden_from_list_and_404_on_single_item_apis(tmp_app_data, monkeypatch):
+    admin, project_id = _setup_auth_env(monkeypatch)
+    alice, _ = _create_user_and_login("alice", project_id)
+
+    # Inject retired / non-PROMPT_TYPES rows directly to verify API-layer defense in depth.
+    retired_ids: list[int] = []
+    with Session(get_engine()) as session:
+        for name, ptype in (
+            ("default_wiki_analyze", "wiki_analyze"),
+            ("default_wiki_write", "wiki_write"),
+            ("legacy_unknown", "retired_legacy_type"),
+        ):
+            row = PromptTemplate(
+                name=name,
+                type=ptype,
+                content="retired content",
+                version=1,
+                is_active=True,
+                owner_user_id=None,
+                visibility="system",
+            )
+            session.add(row)
+            session.flush()
+            retired_ids.append(int(row.id))
+        session.commit()
+
+    for actor_name, client in (("admin", admin), ("alice", alice)):
+        listed = client.get("/api/prompts", headers=_origin())
+        assert listed.status_code == 200
+        returned_types = {item["type"] for item in listed.json()}
+        returned_ids = {item["id"] for item in listed.json()}
+        assert "wiki_analyze" not in returned_types, f"{actor_name} saw wiki_analyze"
+        assert "wiki_write" not in returned_types, f"{actor_name} saw wiki_write"
+        assert "retired_legacy_type" not in returned_types
+        assert not (set(retired_ids) & returned_ids)
+
+        for ptype in ("wiki_analyze", "wiki_write", "retired_legacy_type"):
+            filtered = client.get("/api/prompts", params={"type": ptype}, headers=_origin())
+            assert filtered.status_code == 200
+            assert filtered.json() == []
+
+        for rid in retired_ids:
+            r_get = client.get(f"/api/prompts/{rid}", headers=_origin())
+            assert r_get.status_code == 404
+            assert r_get.json()["detail"] == "Prompt not found"
+
+            r_put = client.put(f"/api/prompts/{rid}", headers=_origin(), json={"content": "edit"})
+            assert r_put.status_code == 404
+            assert r_put.json()["detail"] == "Prompt not found"
+
+            r_del = client.delete(f"/api/prompts/{rid}", headers=_origin())
+            assert r_del.status_code == 404
+            assert r_del.json()["detail"] == "Prompt not found"
+
+            r_fork = client.post(f"/api/prompts/{rid}/fork", headers=_origin(), json={})
+            assert r_fork.status_code == 404
+            assert r_fork.json()["detail"] == "Prompt not found"
