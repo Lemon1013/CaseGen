@@ -1,9 +1,14 @@
-import shutil
 import logging
+import os
+import re
+import shutil
 import sqlite3
+import tempfile
+from collections.abc import Callable, Sequence
+from contextlib import closing
 from pathlib import Path
 
-from sqlalchemy import text
+from sqlalchemy import Engine, text
 from sqlmodel import SQLModel, Session, create_engine
 from app import config
 from app.config import ensure_data_dirs
@@ -11,6 +16,19 @@ from app.config import ensure_data_dirs
 logger = logging.getLogger(__name__)
 
 _engine = None
+
+SCHEMA_MIGRATIONS_TABLE = "schema_migrations"
+MigrationEntry = tuple[str, str, Callable[[Engine], None]]
+
+
+def _noop_baseline_migration(engine: Engine) -> None:
+    """No-op baseline migration marking the v2 refactor starting point."""
+    return None
+
+
+VERSIONED_MIGRATIONS: tuple[MigrationEntry, ...] = (
+    ("0001_v2_refactor_baseline", "Record v2 refactor baseline", _noop_baseline_migration),
+)
 
 
 def get_engine():
@@ -983,11 +1001,143 @@ def _migrate_prompt_single_active(engine, *, create_index: bool = False) -> None
             )
 
 
+def _safe_migration_version(version: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", version.strip()).strip("._-")
+    return cleaned or "unknown"
+
+
+def _has_business_tables(engine: Engine) -> bool:
+    database = engine.url.database
+    if database and database != ":memory:" and not Path(database).is_file():
+        return False
+    with engine.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name NOT LIKE 'sqlite_%' "
+                "AND name <> :migrations_table LIMIT 1"
+            ),
+            {"migrations_table": SCHEMA_MIGRATIONS_TABLE},
+        ).first()
+    return row is not None
+
+
+def get_applied_migrations(engine: Engine | None = None) -> list[str]:
+    """Return applied migration versions ordered by version ascending."""
+    target_engine = engine if engine is not None else get_engine()
+    with target_engine.connect() as conn:
+        exists = conn.execute(
+            text(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=:table_name"
+            ),
+            {"table_name": SCHEMA_MIGRATIONS_TABLE},
+        ).first()
+        if exists is None:
+            return []
+        rows = conn.execute(
+            text(
+                f'SELECT version FROM "{SCHEMA_MIGRATIONS_TABLE}" ORDER BY version ASC'
+            )
+        ).fetchall()
+    return [str(row[0]) for row in rows]
+
+
+def _backup_db_before_versioned_migration(
+    engine: Engine, target_version: str
+) -> Path | None:
+    """Create a non-overwriting SQLite snapshot before running versioned migrations."""
+    database = engine.url.database
+    if not database or database == ":memory:":
+        return None
+    db_path = Path(database)
+    if not db_path.is_file():
+        return None
+    if not _has_business_tables(engine):
+        return None
+
+    safe_version = _safe_migration_version(target_version)
+    backup_path = db_path.with_name(f"{db_path.name}.pre-migration-{safe_version}.bak")
+    backup_path.parent.mkdir(parents=True, exist_ok=True)
+    if backup_path.exists():
+        return backup_path
+
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{backup_path.name}.tmp-",
+        dir=str(backup_path.parent),
+    )
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        with closing(sqlite3.connect(str(db_path), timeout=30.0)) as src, closing(
+            sqlite3.connect(str(tmp_path), timeout=30.0)
+        ) as dst:
+            src.backup(dst)
+        try:
+            os.link(tmp_path, backup_path)
+        except FileExistsError:
+            pass
+    finally:
+        tmp_path.unlink(missing_ok=True)
+    return backup_path
+
+
+def run_versioned_migrations(
+    engine: Engine | None = None,
+    migrations: Sequence[MigrationEntry] | None = None,
+    *,
+    backup: bool = True,
+) -> list[str]:
+    """Ensure schema_migrations exists and execute unapplied migrations in order."""
+    target_engine = engine if engine is not None else get_engine()
+    with target_engine.begin() as conn:
+        conn.execute(
+            text(
+                f"""
+                CREATE TABLE IF NOT EXISTS "{SCHEMA_MIGRATIONS_TABLE}" (
+                    version TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+
+    entries = VERSIONED_MIGRATIONS if migrations is None else migrations
+    applied = set(get_applied_migrations(target_engine))
+    pending = [
+        (version, name, migration_fn)
+        for version, name, migration_fn in entries
+        if version not in applied
+    ]
+    if not pending:
+        return []
+
+    if backup:
+        _backup_db_before_versioned_migration(target_engine, pending[0][0])
+
+    newly_applied: list[str] = []
+    for version, name, migration_fn in pending:
+        # Execute migration first; on any exception, no row is recorded in
+        # schema_migrations so the failed step will be retried on next run.
+        migration_fn(target_engine)
+        with target_engine.begin() as conn:
+            conn.execute(
+                text(
+                    f'INSERT INTO "{SCHEMA_MIGRATIONS_TABLE}" (version, name) '
+                    "VALUES (:version, :name)"
+                ),
+                {"version": version, "name": name},
+            )
+        newly_applied.append(version)
+    return newly_applied
+
+
 def init_db() -> None:
     from app.models import entities  # noqa: F401
     from app.services.wiki_migrate import backup_before_wiki_migration, migrate_wiki_schema
 
     engine = get_engine()
+    is_fresh_db = not _has_business_tables(engine)
     _backup_before_case_migration(engine)
     # Clean legacy duplicate defaults before SQLModel.metadata.create_all
     # attempts to create the partial unique index on an existing database.
@@ -1014,6 +1164,7 @@ def init_db() -> None:
     # Runs after the visibility migration so the conversation table/columns
     # definitely exist; idempotent and offline (never calls DSH).
     _migrate_agent_conversation_models(engine)
+    run_versioned_migrations(engine, backup=not is_fresh_db)
 
 
 def get_session():

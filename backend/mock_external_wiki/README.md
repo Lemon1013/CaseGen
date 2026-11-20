@@ -1,44 +1,78 @@
 # Mock 外部知识库服务（Mock External LLM Wiki）
 
-用于端到端验证 CaseGen 主流程对外部 LLM Wiki 的调用。协议遵循
-`docs/llm-wiki-reference/API_README.md` 中被
-`app/services/external_wiki_client.py` 实际使用的两个端点：
+用于端到端验证 CaseGen 主流程对外部 LLM Wiki 的调用。协议对齐
+`docs/llm-wiki-reference/API_README.md`，支持匿名模式与 Django Session Cookie
+登录鉴权模式（`--require-auth`），提供以下端点：
 
-1. `GET /api/projects/` — 列出外部项目
-2. `POST /api/projects/{project_id}/search/` — 知识切片检索
+1. `GET /health`、`GET /api/health/` — 健康检查
+2. `POST /api/auth/login/`、`GET /api/auth/me/`、`POST /api/auth/logout/` — Session Cookie 鉴权
+3. `GET /api/projects/` — 列出外部项目
+4. `GET /api/projects/{project_id}/files/` — 列出项目源文件清单
+5. `GET /api/projects/{project_id}/file-content/?path=...` — 读取源文件全文
+6. `POST /api/projects/{project_id}/search/` — 知识切片检索
 
-实现只依赖 **Python 标准库**（`http.server`），零第三方依赖，不写盘、不访问外网。
+实现只依赖 **Python 标准库**（`http.server`、`http.cookies`、`secrets`），零第三方依赖，不写盘、不访问外网。
 
 ## 启动
 
 ```bash
 cd backend
+# 匿名模式（默认，与旧版完全兼容）
 python mock_external_wiki/server.py --port 8020 --host 127.0.0.1
+
+# 鉴权模式（除 /health、/api/health/、/api/auth/* 外均校验 sessionid Cookie）
+python mock_external_wiki/server.py --port 8020 --require-auth --username admin --password admin123
 ```
 
 - `--port 0` 会绑定随机空闲端口，并在启动行打印实际端口（便于测试）。
+- `--require-auth` 开启登录校验（默认关闭）；默认账号密码为 `admin` / `admin123`，可通过 `--username`、`--password` 覆盖。
+- 编程式启动测试实例可使用 `create_server(host="127.0.0.1", port=0, require_auth=..., username=..., password=...)`，每个实例拥有独立的 `sessions` 字典与锁，支持同进程多实例隔离并发。
 - `Ctrl+C` 优雅退出（`KeyboardInterrupt` → `server_close()`）。
-- 每个请求会向 stdout 输出一行访问日志（时间、方法、路径、query、返回条数）。
+- 每个请求会向 stdout 输出一行访问日志（时间、方法、路径、结果）。
 
 启动输出示例：
 
 ```text
 Mock external LLM Wiki listening on http://127.0.0.1:8020
+Auth mode: anonymous (use --require-auth to enforce session login)
 Projects: proj-sse-rules (上交所交易规则知识库), proj-fund-rules (基金业务规则知识库)
 Press Ctrl+C to stop.
 ```
 
 ## 端点
 
-### GET /health
+### 健康检查
 
-```json
-{ "status": "ok" }
+- `GET /health` → `200 {"status": "ok"}`
+- `GET /api/health/` → `200 {"portal": "ok"}`
+
+### 鉴权（Session Cookie）
+
+开启 `--require-auth` 时，除 `/health`、`/api/health/`、`/api/auth/login/`、`/api/auth/me/`、`/api/auth/logout/` 外，其余 `/api/*` 请求均须携带有效 `sessionid` Cookie，否则返回 `401 {"error": "需要登录"}`。
+
+- `POST /api/auth/login/`
+  - 请求体：`{"username": "admin", "password": "admin123"}`
+  - 成功 `200`：写入 `Set-Cookie: sessionid=<token>; Path=/; HttpOnly; SameSite=Lax`，返回 `{"authenticated": true, "username": "admin", "isAdmin": true, "isSuperuser": true, "userId": 1}`
+  - 失败 `401`：`{"error": "用户名或密码错误"}`
+- `GET /api/auth/me/`
+  - 已登录 `200`：`{"authenticated": true, "username": "admin", "isAdmin": true, "isSuperuser": true, "userId": 1}`
+  - 未登录/匿名 `200`：`{"authenticated": false, "isAdmin": false, "username": ""}`
+- `POST /api/auth/logout/`
+  - 撤销当前 `sessionid` 并返回清除 Cookie 头 + `200 {"ok": true}`
+
+```bash
+# --require-auth 模式 curl 演示
+curl -i -c cookies.txt -X POST http://127.0.0.1:8020/api/auth/login/ \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"admin123"}'
+curl -s -b cookies.txt http://127.0.0.1:8020/api/projects/
+curl -s -b cookies.txt "http://127.0.0.1:8020/api/projects/proj-sse-rules/files/"
+curl -s -b cookies.txt -X POST http://127.0.0.1:8020/api/auth/logout/
 ```
 
 ### GET /api/projects/
 
-始终返回全部内置项目（与具体项目无关）：
+始终返回全部内置项目：
 
 ```json
 {
@@ -49,6 +83,38 @@ Press Ctrl+C to stop.
 }
 ```
 
+### GET /api/projects/{project_id}/files/
+
+列出项目内置虚拟源文件清单（对应 `MOCK_FILES`）：
+
+```json
+{
+  "items": [
+    { "path": "raw/sources/上海证券交易所交易规则(2023修订).docx", "name": "上海证券交易所交易规则(2023修订).docx" },
+    { "path": "raw/sources/上海证券交易所大宗交易实施细则.docx", "name": "上海证券交易所大宗交易实施细则.docx" }
+  ]
+}
+```
+
+未知 `project_id` 返回 `404 {"error": "project not found"}`。
+
+### GET /api/projects/{project_id}/file-content/?path=...
+
+读取指定虚拟源文件的完整条款正文：
+
+```json
+{
+  "path": "raw/sources/上海证券交易所交易规则(2023修订).docx",
+  "content": "# 上海证券交易所交易规则（2023年修订）\n\n..."
+}
+```
+
+错误：
+
+- 缺失 `path`、包含 `..` / 反斜杠 `\` / 绝对路径前缀 `/` 等非法路径 → `400 {"error": "非法路径"}`
+- 未知 `project_id` → `404 {"error": "project not found"}`
+- 文件不存在 → `404 {"error": "文件不存在"}`
+
 ### POST /api/projects/{project_id}/search/
 
 请求体：
@@ -57,15 +123,17 @@ Press Ctrl+C to stop.
 { "query": "集合竞价 成交价", "limit": 8, "useSynonyms": true }
 ```
 
-成功 200：
+成功 200（每条结果同时包含 `path`、`pageNo` 与兼容字段 `documentPath`）：
 
 ```json
 {
   "results": [
     {
       "chunkId": 101,
+      "path": "raw/sources/上海证券交易所交易规则(2023修订).docx",
       "documentPath": "交易规则/上海证券交易所交易规则(2023修订).docx",
       "headingPath": "第三章 证券买卖 > 第一节 竞价交易 > 集合竞价",
+      "pageNo": 12,
       "title": "集合竞价成交价格的确定",
       "score": 57.7,
       "snippet": "集合竞价时，成交价格的确定原则为：……",
@@ -85,9 +153,9 @@ Press Ctrl+C to stop.
 - 缺少/空 `query` → `400 {"error": "query is required"}`
 - 非法 JSON → `400 {"error": "invalid JSON body"}`
 
-### GET 其他路径
+### 其他未匹配路径
 
-一律 `404 {"error": "not found"}`。
+一律 `404 {"error": "not found"}`（对已知仅支持其他 HTTP 方法的路径返回 `405 {"error": "method not allowed"}`）。
 
 ## 内置切片数据
 
