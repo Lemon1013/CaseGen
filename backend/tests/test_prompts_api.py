@@ -197,8 +197,9 @@ def test_default_prompts_seeded(tmp_app_data):
         "test_points",
         "review",
         "optimize",
-        "wiki_analyze",
-        "wiki_write",
+        "requirement_optimize",
+        "platform_example_render",
+        "data_description_parse",
     }.issubset(types)
     assert all(
         p["version"] >= BUNDLED_PROMPT_VERSION
@@ -401,8 +402,6 @@ def test_bundled_prompts_keep_required_output_contracts(tmp_app_data):
     assert all(token in active["generate"] for token in ("[S#]", "待确认", "只输出 Markdown"))
     assert all(token in active["review"] for token in ('"score"', '"verdict"', '"ready_for_final"'))
     assert "本次需求中的专属" in active["optimize"]
-    assert all(token in active["wiki_analyze"] for token in ("page_operations", "source_anchors", "禁止 merge"))
-    assert all(token in active["wiki_write"] for token in ('"pages"', "replace_existing", "不决定磁盘路径"))
     assert all(
         token in active["test_points"]
         for token in ("model_citation_label", "reference_case_snapshots", "test_point_json_repair_request")

@@ -53,16 +53,12 @@ def tmp_app_data(tmp_path, monkeypatch):
 
     data_dir = tmp_path / "data"
     raw_dir = data_dir / "raw" / "sources"
-    wiki_dir = data_dir / "wiki"
-    wiki_pages_dir = wiki_dir / "pages"
     meta_dir = data_dir / "meta"
     db_path = meta_dir / "app.db"
 
     monkeypatch.setenv("APP_DATA_DIR", str(data_dir))
     monkeypatch.setattr(config, "DATA_DIR", data_dir)
     monkeypatch.setattr(config, "RAW_DIR", raw_dir)
-    monkeypatch.setattr(config, "WIKI_DIR", wiki_dir)
-    monkeypatch.setattr(config, "WIKI_PAGES_DIR", wiki_pages_dir)
     monkeypatch.setattr(config, "META_DIR", meta_dir)
     monkeypatch.setattr(config, "DB_PATH", db_path)
     # Legacy workflow tests predate authentication.  They explicitly use the

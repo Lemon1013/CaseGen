@@ -1,24 +1,21 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { listModels, type ModelConfig } from '../api/models'
 import { listPrompts, type PromptTemplate } from '../api/prompts'
 import { createTask, generateTask, optimizeRequirement } from '../api/tasks'
 import { listCases, type TestCaseItem } from '../api/cases'
-import { listWikiSpaces, type WikiSpace } from '../api/wikiSpaces'
 import { importRequirementDoc, listRequirements, type RequirementItem } from '../api/requirements'
-import { chooseSpace, rememberAndRoute, spaceIdFromQuery } from '../utils/wikiSpace'
+import { useProjectStore } from '../projectStore'
 
 const router = useRouter()
-const route = useRoute()
+const projects = useProjectStore()
 const submitting = ref(false)
 const optimizing = ref(false)
 const loadingReferences = ref(false)
 const models = ref<ModelConfig[]>([])
 const prompts = ref<PromptTemplate[]>([])
-const spaces = ref<WikiSpace[]>([])
-const currentSpace = ref<WikiSpace | null>(null)
 const requirements = ref<RequirementItem[]>([])
 const referenceCases = ref<TestCaseItem[]>([])
 const selectedReferenceIds = ref<number[]>([])
@@ -26,6 +23,7 @@ const referenceSearch = ref('')
 const referenceTab = ref('library')
 const questions = ref<string[]>([])
 const showQuestions = ref(false)
+const knowledgeSourceCount = computed(() => projects.current.value?.knowledge_source_count ?? 0)
 
 type GenerationGranularity = 'compact' | 'standard' | 'detailed'
 
@@ -74,7 +72,7 @@ const dimensionLabelMap = new Map(dimensionOptions)
 const form = reactive({
   title: '', description: '', focusText: '', model_id: null as number | null,
   prompt_template_id: null as number | null, auto_review: false,
-  wiki_space_id: null as number | null, requirement_id: null as number | null,
+  requirement_id: null as number | null,
   generation_granularity: 'standard' as GenerationGranularity,
   test_dimensions: ['positive', 'negative', 'boundary'] as string[], reference_text: '',
   source_filename: null as string | null,
@@ -100,18 +98,14 @@ async function searchReferences() {
 
 async function loadOptions() {
   try {
-    const [modelsRows, promptRows, spaceRows, reqRows] = await Promise.all([
-      listModels(), listPrompts('generate'), listWikiSpaces(), listRequirements().catch(() => [] as RequirementItem[]),
+    const [modelsRows, promptRows, reqRows] = await Promise.all([
+      listModels(), listPrompts('generate'), listRequirements().catch(() => [] as RequirementItem[]),
     ])
     models.value = modelsRows
     prompts.value = promptRows.filter((row) => row.is_active)
     form.model_id = modelsRows.find((row) => row.is_default)?.id ?? null
     form.prompt_template_id = prompts.value[0]?.id ?? null
-    spaces.value = spaceRows
     requirements.value = reqRows
-    currentSpace.value = chooseSpace(spaceRows, spaceIdFromQuery(route.query))
-    form.wiki_space_id = currentSpace.value?.id ?? null
-    if (currentSpace.value && spaceIdFromQuery(route.query) !== currentSpace.value.id) await rememberAndRoute(router, currentSpace.value.id, '/')
     await searchReferences()
   } catch (e) { ElMessage.error(`加载选项失败：${(e as Error).message}`) }
 }
@@ -171,12 +165,6 @@ async function importDoc(file: File) {
   finally { importingDoc.value = false }
 }
 
-function changeSpace(id: number) {
-  currentSpace.value = spaces.value.find((row) => row.id === id) || null
-  form.wiki_space_id = currentSpace.value?.id ?? null
-  void rememberAndRoute(router, id, '/')
-}
-
 async function optimize() {
   if (!form.title.trim() || !form.description.trim()) return ElMessage.warning('请先填写标题和需求描述')
   optimizing.value = true
@@ -190,7 +178,6 @@ async function optimize() {
 
 async function submit() {
   if (!form.title.trim() || !form.description.trim()) return ElMessage.warning('请填写标题和需求描述')
-  if (!form.wiki_space_id || currentSpace.value?.status !== 'active') return ElMessage.warning('请选择活动 Wiki 空间')
   if (!form.test_dimensions.length) return ElMessage.warning('至少选择一个测试维度')
   if (referenceChars.value > 30000) return ElMessage.warning('参考用例快照总长度不能超过 30000 字符')
   submitting.value = true
@@ -200,7 +187,7 @@ async function submit() {
       // Imported source file only applies to a brand-new requirement.
       source_filename: form.requirement_id ? null : (form.source_filename || null),
       focus_tags: tags(form.focusText), model_id: form.model_id, prompt_template_id: form.prompt_template_id,
-      auto_review: form.auto_review, wiki_space_id: form.wiki_space_id, generation_granularity: form.generation_granularity,
+      auto_review: form.auto_review, wiki_space_id: projects.defaultWikiSpaceId.value ?? undefined, generation_granularity: form.generation_granularity,
       test_dimensions: form.test_dimensions, reference_case_ids: selectedReferenceIds.value, reference_text: form.reference_text.trim(),
     })
     await generateTask(task.id, { auto_review: form.auto_review }).catch((e) => ElMessage.warning(`启动生成失败：${(e as Error).message}`))
@@ -307,7 +294,18 @@ onMounted(loadOptions)
             </div>
           </el-form-item>
           <el-form-item label="通用测试维度"><el-checkbox-group v-model="form.test_dimensions" class="dimensions"><el-checkbox v-for="item in dimensionOptions" :key="item[0]" :value="item[0]">{{ item[1] }}</el-checkbox></el-checkbox-group></el-form-item>
-          <el-form-item label="Wiki 空间"><el-select v-model="form.wiki_space_id" style="width:100%" @change="changeSpace"><el-option v-for="row in spaces.filter((item) => item.status === 'active')" :key="row.id" :label="row.name" :value="row.id" /></el-select></el-form-item>
+          <el-form-item label="外部知识库">
+            <div v-if="knowledgeSourceCount > 0" class="knowledge-status-box knowledge-status-box--ready">
+              <span>当前项目已配置 <strong>{{ knowledgeSourceCount }}</strong> 个外部知识库，检索阶段将自动命中并注入引用。</span>
+            </div>
+            <el-alert
+              v-else
+              type="info"
+              :closable="false"
+              show-icon
+              title="当前项目尚未配置外部知识库，可联系管理员在项目管理中添加；仍可纯需求继续生成"
+            />
+          </el-form-item>
           <el-form-item label="模型"><el-select v-model="form.model_id" clearable style="width:100%"><el-option v-for="row in models" :key="row.id" :label="`${row.name} (${row.model_name})`" :value="row.id" /></el-select></el-form-item>
           <el-form-item label="生成 Prompt"><el-select v-model="form.prompt_template_id" clearable style="width:100%"><el-option v-for="row in prompts" :key="row.id" :label="`${row.name} (v${row.version})`" :value="row.id" /></el-select></el-form-item>
           <el-form-item label="生成后自动评审"><el-switch v-model="form.auto_review" /></el-form-item>
@@ -585,6 +583,23 @@ small,
 .dimensions {
   display: grid;
   grid-template-columns: repeat(2, 1fr);
+}
+
+.knowledge-status-box {
+  width: 100%;
+  padding: 10px 12px;
+  border-radius: var(--cg-radius-sm);
+  border: 1px solid var(--cg-border);
+  background: var(--cg-surface-muted);
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--cg-text-secondary);
+}
+
+.knowledge-status-box--ready {
+  border-color: rgba(16, 185, 129, 0.35);
+  background: #ecfdf5;
+  color: #065f46;
 }
 
 .submit {

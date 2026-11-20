@@ -14,6 +14,7 @@ export interface Project {
   status: string
   is_public: boolean
   default_wiki_space_id: number | null
+  knowledge_source_count?: number
   private_spaces: ProjectSpace[]
   shared_spaces: ProjectSpace[]
   created_at: string
@@ -28,7 +29,3 @@ export const updateProject = (projectId: number, body: { name?: string; descript
   api<Project>(`/api/projects/${projectId}?project_id=${projectId}`, { method: 'PUT', body: JSON.stringify(body) })
 export const deleteProject = (projectId: number) =>
   api<void>(`/api/projects/${projectId}?project_id=${projectId}`, { method: 'DELETE' })
-export const bindSharedWiki = (projectId: number, wikiSpaceId: number, priority = 100) =>
-  api<Project>(`/api/projects/${projectId}/shared-wikis/${wikiSpaceId}?project_id=${projectId}`, { method: 'PUT', body: JSON.stringify({ wiki_space_id: wikiSpaceId, priority, enabled: true }) })
-export const unbindSharedWiki = (projectId: number, wikiSpaceId: number) =>
-  api<Project>(`/api/projects/${projectId}/shared-wikis/${wikiSpaceId}?project_id=${projectId}`, { method: 'DELETE' })

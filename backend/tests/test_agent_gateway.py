@@ -511,83 +511,29 @@ def test_stream_prompt_maps_transport_error_to_stream_error():
 # ---------------------------------------------------------------------------
 
 
-def test_knowledge_space_dirs_returns_project_space_path(tmp_app_data):
-    from pathlib import Path
-
-    from sqlmodel import Session
-
-    from app import config
-    from app.db import get_engine, init_db
-    from app.models.entities import AgentConversation, Project, WikiSpace
+def test_knowledge_prompt_block_excludes_local_wiki_and_formats_attachments(tmp_app_data):
     from app.services import agent_turn
 
-    init_db()
-    with Session(get_engine()) as session:
-        project = Project(name="KB Owner", slug="kb-owner", status="active")
-        session.add(project)
-        session.flush()
-        space = WikiSpace(
-            name="KB Alpha",
-            slug="kb-alpha",
-            scope="project",
-            status="active",
-            project_id=int(project.id),
-        )
-        session.add(space)
-        session.flush()
-        project.default_wiki_space_id = int(space.id)
-        session.add(project)
-        session.add(
-            AgentConversation(
-                id="conv-knowledge-1",
-                project_id=str(project.id),
-                title="知识会话",
-            )
-        )
-        session.commit()
-        project_id = str(project.id)
+    assert not hasattr(agent_turn, "_knowledge_space_dirs")
+    assert agent_turn._knowledge_prompt_block([]) == ""
 
-    dirs = agent_turn._knowledge_space_dirs(project_id)
-    assert len(dirs) == 1
-    root = Path(dirs[0])
-    assert root.is_absolute()
-    assert root == (Path(config.WIKI_DIR) / "spaces" / "kb-alpha").resolve()
-    assert root.is_dir()
-    assert (root / "pages").is_dir()
+    block = agent_turn._knowledge_prompt_block(
+        [{"filename": "需求.docx", "char_count": 120, "parsed_path": "/tmp/att/需求.txt"}]
+    )
+    assert "data/wiki" not in block
+    assert "需求.docx" in block
+    assert "/tmp/att/需求.txt" in block
+    assert "本轮附件" in block
 
-
-def test_knowledge_prompt_block_and_build_prompt_order(tmp_app_data):
-    from app.services import agent_turn
-
-    block = agent_turn._knowledge_prompt_block(["/tmp/kb-a", "/tmp/kb-b"])
-    assert "/tmp/kb-a" in block
-    assert "/tmp/kb-b" in block
-    assert "只读" in block
-    assert "glob / grep / read" in block
-    assert "不要凭空编造" in block
-    assert "只允许" in block
-    assert "其他知识空间" in block
-    assert "目录之外" in block
-
-    prompt = agent_turn._build_prompt("帮我查规则", None, ["/tmp/kb-a"])
-    assert "[知识空间]" in prompt
-    assert "/tmp/kb-a" in prompt
-    assert prompt.index("[知识空间]") < prompt.index("帮我查规则")
-
-    # An empty user text still yields a non-empty prompt when a knowledge block
-    # exists, so the turn body must guard on the raw user text (checked below).
-    assert agent_turn._build_prompt("", None, ["/tmp/kb-a"]).strip() != ""
+    prompt = agent_turn._build_prompt(
+        "帮我查规则",
+        None,
+        [{"filename": "需求.docx", "char_count": 120, "parsed_path": "/tmp/att/需求.txt"}],
+    )
+    assert "[本轮附件]" in prompt
+    assert prompt.index("[本轮附件]") < prompt.index("帮我查规则")
     assert agent_turn._build_prompt("", None, []) == ""
     assert agent_turn._build_prompt("x", None) == "x"
-
-
-def test_knowledge_space_dirs_unknown_project_is_empty(tmp_app_data):
-    from app.db import init_db
-    from app.services import agent_turn
-
-    init_db()
-    assert agent_turn._knowledge_space_dirs("999999") == []
-    assert agent_turn._knowledge_space_dirs("not-a-number") == []
 
 
 def test_update_session_model_sends_put_with_provider_and_model(tmp_app_data):

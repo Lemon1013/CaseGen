@@ -5,8 +5,6 @@ export type PromptType =
   | 'test_points'
   | 'review'
   | 'optimize'
-  | 'wiki_analyze'
-  | 'wiki_write'
 
 export interface PromptTemplate {
   id: number
@@ -62,6 +60,4 @@ export const PROMPT_TYPE_OPTIONS: { value: PromptType; label: string }[] = [
   { value: 'test_points', label: '测试点生成 (test_points)' },
   { value: 'review', label: '评审 (review)' },
   { value: 'optimize', label: '优化 (optimize)' },
-  { value: 'wiki_analyze', label: 'Wiki 分析 (wiki_analyze)' },
-  { value: 'wiki_write', label: 'Wiki 写入 (wiki_write)' },
 ]

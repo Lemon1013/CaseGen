@@ -41,7 +41,7 @@ const currentSkillInfo = computed(() => {
 })
 
 const quickPrompts = [
-  '请阅读当前项目知识空间文档，帮我拆解核心业务与非功能/架构瓶颈测试点清单',
+  '请结合当前项目需求、附件与外部知识库，帮我拆解核心业务与非功能/架构瓶颈测试点清单',
   '针对并发请求、幂等性与超时重试场景，设计一组高优先级（P0/P1）边界测试用例',
   '请把刚才讨论的测试点按 CaseGen 标准 JSON 契约输出结构化测试用例，以便转存草稿',
 ]
@@ -195,7 +195,7 @@ const composerDisabled = computed(() =>
           </div>
           <div class="welcome-title">开始第一轮测试设计对话</div>
           <p class="welcome-subtitle">
-            你可以直接描述测试需求、投喂需求文档，或让 Agent 查阅当前项目的知识空间，按「先拆解测试点 → 再生成结构化用例」两步协同产出高覆盖率用例。
+            你可以直接描述测试需求、上传需求文档与附件，或结合外部知识库，按「先拆解测试点 → 再生成结构化用例」两步协同产出高覆盖率用例。
           </p>
           <div v-if="currentSkillInfo" class="welcome-skill-pill">
             <el-icon><MagicStick /></el-icon>

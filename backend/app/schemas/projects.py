@@ -44,6 +44,7 @@ class ProjectOut(BaseModel):
     status: str
     is_public: bool = True
     default_wiki_space_id: Optional[int] = None
+    knowledge_source_count: int = 0
     private_spaces: list[ProjectSpaceOut] = Field(default_factory=list)
     shared_spaces: list[ProjectSpaceOut] = Field(default_factory=list)
     created_at: datetime

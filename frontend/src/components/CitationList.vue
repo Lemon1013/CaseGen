@@ -1,11 +1,9 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import { useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
-import { Document, View } from '@element-plus/icons-vue'
+import { View } from '@element-plus/icons-vue'
 import MarkdownView from './MarkdownView.vue'
-import { getWikiPage, type WikiPage } from '../api/wiki'
-import { api } from '../api/client'
+import { readKnowledgeSourceFile } from '../api/knowledgeSources'
+import { useProjectStore } from '../projectStore'
 
 export interface CitationItem {
   id?: number | null
@@ -16,10 +14,13 @@ export interface CitationItem {
   wiki_page_id?: number | null
   citation_type?: string
   source_chunk_id?: number | null
+  knowledge_source_id?: number | null
+  file_path?: string | null
+  external_metadata?: Record<string, unknown>
   content_excerpt?: string
   clause_ids?: string[]
   anchor_clause?: string | null
-  heading_path?: string
+  heading_path?: string | null
   headingPath?: string
   evidence_snippet?: string
   evidenceSnippet?: string
@@ -28,35 +29,27 @@ export interface CitationItem {
   legacy_reason?: string | null
 }
 
-interface SourceChunkDetail {
-  id: number
-  document_id: number
-  chunk_index: number
-  title: string
-  text: string
-  start_char: number
-  end_char: number
-}
-
 const props = withDefaults(
   defineProps<{
     citations?: CitationItem[]
     count?: number
-    spaceId?: number
+    projectId?: number | null
   }>(),
   {
     citations: () => [],
     count: 0,
+    projectId: null,
   },
 )
 
-const router = useRouter()
+const projects = useProjectStore()
 const drawerVisible = ref(false)
 const loading = ref(false)
 const activeIndex = ref(0)
 const activeCitation = ref<CitationItem | null>(null)
-const pageDetail = ref<WikiPage | null>(null)
-const chunkDetail = ref<SourceChunkDetail | null>(null)
+const externalContent = ref('')
+const externalContentNotice = ref('')
+let fetchSeq = 0
 
 const total = computed(() => props.count || props.citations.length)
 
@@ -64,61 +57,51 @@ function isExternal(c: CitationItem | null | undefined) {
   return c?.citation_type === 'external'
 }
 
-function isSource(c: CitationItem | null | undefined) {
-  if (isExternal(c)) return false
-  return (c?.citation_type || 'wiki') === 'source' || !!c?.source_chunk_id
-}
-
 function typeLabel(c: CitationItem) {
   if (c.legacy) return '历史引用'
   if (isExternal(c)) return '外部知识'
-  return isSource(c) ? '原文' : 'Wiki'
+  return '知识引用'
 }
 
 function typeTagType(c: CitationItem): 'success' | 'primary' | 'warning' {
   if (c.legacy) return 'warning'
   if (isExternal(c)) return 'warning'
-  return isSource(c) ? 'success' : 'primary'
+  return 'primary'
 }
 
 async function openCitation(c: CitationItem, idx: number) {
+  const seq = ++fetchSeq
   activeIndex.value = idx
   activeCitation.value = c
   drawerVisible.value = true
-  pageDetail.value = null
-  chunkDetail.value = null
-  if (isExternal(c)) {
+  externalContent.value = ''
+  externalContentNotice.value = ''
+  loading.value = false
+
+  if (!isExternal(c)) {
     return
   }
+
+  const pid = props.projectId ?? projects.state.currentId
+  if (!pid || c.knowledge_source_id == null || !c.file_path) {
+    externalContentNotice.value = '该外部引用未包含远端文件标识，以下展示检索摘要。'
+    return
+  }
+
   loading.value = true
   try {
-    if (isSource(c)) {
-      if (c.source_chunk_id != null) {
-        chunkDetail.value = await api<SourceChunkDetail>(
-          `/api/source-chunks/${c.source_chunk_id}?space_id=${props.spaceId || ''}`,
-        )
-      }
-    } else if (c.wiki_page_id != null) {
-      pageDetail.value = await getWikiPage(c.wiki_page_id, props.spaceId)
+    const fileRes = await readKnowledgeSourceFile(pid, c.knowledge_source_id, c.file_path)
+    if (seq !== fetchSeq) return
+    externalContent.value = fileRes.content || ''
+    if (!externalContent.value) {
+      externalContentNotice.value = '远端文件内容为空，以下展示检索摘要。'
     }
   } catch (e) {
-    ElMessage.error(`加载引用详情失败：${(e as Error).message}`)
+    if (seq !== fetchSeq) return
+    externalContentNotice.value = `暂无法拉取远端文件完整正文，以下回退展示检索摘要（${(e as Error).message}）`
   } finally {
-    loading.value = false
+    if (seq === fetchSeq) loading.value = false
   }
-}
-
-function goWikiPage() {
-  const id = pageDetail.value?.id ?? activeCitation.value?.wiki_page_id
-  if (id == null) {
-    ElMessage.warning('该引用没有可跳转的 Wiki 页面')
-    return
-  }
-  drawerVisible.value = false
-  void router.push({
-    path: '/wiki',
-    query: { page: String(id), space_id: String(props.spaceId || '') },
-  })
 }
 
 function scoreText(score?: number) {
@@ -127,20 +110,17 @@ function scoreText(score?: number) {
 }
 
 const bodyText = computed(() => {
-  if (activeCitation.value && isExternal(activeCitation.value)) {
-    return (
-      activeCitation.value.evidence_snippet ||
-      activeCitation.value.evidenceSnippet ||
-      activeCitation.value.content_excerpt ||
-      activeCitation.value.snippet ||
-      ''
-    )
+  if (!activeCitation.value) return ''
+  if (isExternal(activeCitation.value) && externalContent.value) {
+    return externalContent.value
   }
-  if (chunkDetail.value?.text) return chunkDetail.value.text
-  if (pageDetail.value?.content) return pageDetail.value.content
-  if (activeCitation.value?.content_excerpt) return activeCitation.value.content_excerpt
-  if (activeCitation.value?.snippet) return activeCitation.value.snippet
-  return ''
+  return (
+    activeCitation.value.evidence_snippet ||
+    activeCitation.value.evidenceSnippet ||
+    activeCitation.value.content_excerpt ||
+    activeCitation.value.snippet ||
+    ''
+  )
 })
 </script>
 
@@ -159,7 +139,6 @@ const bodyText = computed(() => {
         :key="c.id ?? `${c.path}-${idx}`"
         type="button"
         class="item"
-        :class="{ 'item-source': isSource(c) }"
         @click="openCitation(c, idx)"
       >
         <div class="item-top">
@@ -190,13 +169,13 @@ const bodyText = computed(() => {
             {{ cid }}
           </el-tag>
         </div>
-        <div v-if="c.path" class="item-path">{{ c.path }}</div>
+        <div v-if="c.file_path || c.path" class="item-path">{{ c.file_path || c.path }}</div>
         <div v-if="c.snippet || c.content_excerpt" class="item-snippet">
           {{ c.content_excerpt || c.snippet }}
         </div>
         <div class="item-action">
           <el-icon :size="14"><View /></el-icon>
-          <span>{{ c.legacy ? '点击查看历史摘录' : isExternal(c) ? '点击查看外部知识详情' : isSource(c) ? '点击查看原文块' : '点击查看 Wiki 全文' }}</span>
+          <span>{{ c.legacy ? '点击查看历史摘录' : isExternal(c) ? '点击查看外部知识正文' : '点击查看引用详情' }}</span>
         </div>
       </button>
     </div>
@@ -216,6 +195,14 @@ const bodyText = computed(() => {
       destroy-on-close
     >
       <div v-loading="loading" class="drawer-body">
+        <el-alert
+          v-if="externalContentNotice"
+          :title="externalContentNotice"
+          type="info"
+          :closable="false"
+          show-icon
+        />
+
         <div v-if="activeCitation" class="meta-block">
           <div class="meta-row">
             <span class="meta-label">类型</span>
@@ -234,7 +221,7 @@ const bodyText = computed(() => {
           />
           <div class="meta-row">
             <span class="meta-label">路径</span>
-            <span class="meta-value mono">{{ activeCitation.path || '—' }}</span>
+            <span class="meta-value mono">{{ activeCitation.file_path || activeCitation.path || '—' }}</span>
           </div>
           <div class="meta-row">
             <span class="meta-label">相关分</span>
@@ -266,33 +253,6 @@ const bodyText = computed(() => {
               </el-tag>
             </span>
           </div>
-          <div v-if="chunkDetail" class="meta-row">
-            <span class="meta-label">定位</span>
-            <span class="meta-value mono">
-              文档 #{{ chunkDetail.document_id }} · 块 #{{ chunkDetail.chunk_index }} ·
-              chars {{ chunkDetail.start_char }}–{{ chunkDetail.end_char }}
-            </span>
-          </div>
-          <div v-if="pageDetail" class="meta-row">
-            <span class="meta-label">页类型</span>
-            <span class="meta-value">
-              <el-tag size="small" effect="plain">{{ pageDetail.page_type || '—' }}</el-tag>
-            </span>
-          </div>
-          <div v-if="pageDetail?.tags?.length" class="meta-row">
-            <span class="meta-label">标签</span>
-            <span class="meta-value tags">
-              <el-tag
-                v-for="tag in pageDetail.tags"
-                :key="tag"
-                size="small"
-                type="info"
-                effect="plain"
-              >
-                {{ tag }}
-              </el-tag>
-            </span>
-          </div>
           <div v-if="isExternal(activeCitation)" class="meta-row">
             <span class="meta-label">章节路径</span>
             <span class="meta-value">{{ activeCitation.heading_path || activeCitation.headingPath || '—' }}</span>
@@ -306,27 +266,13 @@ const bodyText = computed(() => {
               {{ activeCitation.evidence_snippet || activeCitation.evidenceSnippet }}
             </span>
           </div>
-          <div v-if="!isSource(activeCitation) && !isExternal(activeCitation)" class="meta-actions">
-            <el-button
-              type="primary"
-              plain
-              :disabled="!(pageDetail?.id || activeCitation.wiki_page_id)"
-              @click="goWikiPage"
-            >
-              <el-icon style="margin-right: 4px"><Document /></el-icon>
-              在 Wiki 页打开
-            </el-button>
-          </div>
         </div>
 
         <div class="content-box">
           <div class="section-label">
-            {{ isExternal(activeCitation) ? '外部知识内容' : isSource(activeCitation) ? '原文内容（无损摘录）' : '页面正文' }}
+            {{ isExternal(activeCitation) ? (externalContent ? '外部知识完整正文' : '外部知识摘要') : '引用内容' }}
           </div>
-          <template v-if="bodyText">
-            <pre v-if="isSource(activeCitation)" class="source-text">{{ bodyText }}</pre>
-            <MarkdownView v-else :content="bodyText" />
-          </template>
+          <MarkdownView v-if="bodyText" :content="bodyText" />
           <el-empty v-else-if="!loading" description="无正文内容" :image-size="64" />
         </div>
       </div>
@@ -397,11 +343,6 @@ const bodyText = computed(() => {
   border-color: rgba(16, 185, 129, 0.45);
   box-shadow: 0 4px 14px rgba(16, 185, 129, 0.1);
   transform: translateY(-1px);
-}
-
-.item-source:hover {
-  border-color: rgba(16, 185, 129, 0.5);
-  box-shadow: 0 4px 14px rgba(16, 185, 129, 0.12);
 }
 
 .item-top {
@@ -516,16 +457,6 @@ const bodyText = computed(() => {
   font-size: 12px;
 }
 
-.meta-value.tags {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-
-.meta-actions {
-  margin-top: 10px;
-}
-
 .section-label {
   font-size: 12px;
   font-weight: 700;
@@ -540,15 +471,5 @@ const bodyText = computed(() => {
   border-radius: 10px;
   padding: 12px 14px;
   background: #fff;
-}
-
-.source-text {
-  margin: 0;
-  white-space: pre-wrap;
-  word-break: break-word;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Microsoft YaHei", monospace;
-  font-size: 13px;
-  line-height: 1.65;
-  color: var(--cg-text, #0f172a);
 }
 </style>

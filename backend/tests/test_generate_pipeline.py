@@ -2,37 +2,67 @@ import json
 from pathlib import Path
 
 from fastapi.testclient import TestClient
-from sqlmodel import Session
+from sqlmodel import Session, select
 
 from app.db import get_engine, init_db
 from app.main import create_app
-from app.models.entities import WikiPageRow
+from app.models.entities import Project
+from app.models.external_wiki import ProjectKnowledgeSource
+from app.services.knowledge_providers import KnowledgeHit, ProjectKnowledgeSearchResult
 import time
 
 
-def _seed_wiki_page(title: str = "余额规则", content: str = "余额不足应拒绝下单。") -> None:
-    """Insert a WikiPageRow + on-disk markdown so retrieve can score it."""
+def _seed_external_knowledge(
+    monkeypatch,
+    title: str = "余额规则",
+    content: str = "余额不足应拒绝下单。",
+) -> int:
+    """Seed one external knowledge source and stub search_project_knowledge."""
     init_db()
-    from app import config
-
-    config.WIKI_PAGES_DIR.mkdir(parents=True, exist_ok=True)
-    rel_path = f"pages/{title}.md"
-    file_path = config.WIKI_DIR / rel_path
-    file_path.parent.mkdir(parents=True, exist_ok=True)
-    file_path.write_text(
-        f"---\ntitle: {title}\ntype: business\ntags: [\"余额\", \"下单\"]\n---\n{content}\n",
-        encoding="utf-8",
-    )
     with Session(get_engine()) as session:
-        session.add(
-            WikiPageRow(
-                path=rel_path,
-                title=title,
-                page_type="business",
-                tags_json=json.dumps(["余额", "下单"], ensure_ascii=False),
-            )
+        project = session.exec(select(Project).where(Project.slug == "default")).first()
+        assert project is not None and project.id is not None
+        source = ProjectKnowledgeSource(
+            project_id=int(project.id),
+            name="测试外部知识库",
+            provider_type="llm_wiki_django",
+            base_url="http://127.0.0.1:8091",
+            auth_type="none",
+            config_json=json.dumps({"external_project_id": "proj-test"}),
+            enabled=True,
         )
+        session.add(source)
         session.commit()
+        session.refresh(source)
+        source_id = int(source.id)
+
+    def _fake_search(session, project_id: int, query: str, *, top_k=None):
+        return ProjectKnowledgeSearchResult(
+            configured=True,
+            empty_reason="none",
+            message="",
+            hits=[
+                KnowledgeHit(
+                    source_id=source_id,
+                    source_name="测试外部知识库",
+                    provider_type="llm_wiki_django",
+                    chunk_id=101,
+                    title=title,
+                    file_path=f"raw/sources/{title}.docx",
+                    document_path=f"raw/sources/{title}.docx",
+                    heading_path=f"业务规则 > {title}",
+                    page_no=3,
+                    score=0.95,
+                    weighted_score=0.95,
+                    snippet=content,
+                    evidence_snippet=content,
+                )
+            ],
+            warnings=[],
+        )
+
+    monkeypatch.setattr("app.services.task_pipeline.search_project_knowledge", _fake_search)
+    return source_id
 
 
 def _create_model(client: TestClient) -> int:
@@ -146,7 +176,7 @@ def test_generate_creates_draft(tmp_app_data, monkeypatch):
     from app.services.task_stream import task_stream
 
     client = TestClient(create_app())
-    _seed_wiki_page()
+    source_id = _seed_external_knowledge(monkeypatch)
     mid = _create_model(client)
 
     fake_md = """# 用例：余额不足下单
@@ -218,7 +248,10 @@ def test_generate_creates_draft(tmp_app_data, monkeypatch):
     assert cite["path"]
     assert "score" in cite
     assert "snippet" in cite
-    assert "wiki_page_id" in cite
+    assert cite["citation_type"] == "external"
+    assert cite["knowledge_source_id"] == source_id
+    assert cite["file_path"] == "raw/sources/余额规则.docx"
+    assert cite["heading_path"] == "业务规则 > 余额规则"
 
     events = client.get(f"/api/tasks/{tid}/events").json()
     assert len(events) >= 2
@@ -249,7 +282,7 @@ def test_generate_fails_without_model(tmp_app_data, monkeypatch):
     from app.services.task_stream import task_stream
 
     client = TestClient(create_app())
-    _seed_wiki_page()
+    _seed_external_knowledge(monkeypatch)
 
     def fake_chat(**kwargs):
         return "# 用例：x\n"
@@ -280,7 +313,7 @@ def test_generate_discards_partial_output_when_primary_and_lean_calls_fail(
     from app.services.task_stream import task_stream
 
     client = TestClient(create_app())
-    _seed_wiki_page()
+    source_id = _seed_external_knowledge(monkeypatch)
     mid = _create_model(client)
     calls = {"n": 0}
 
@@ -341,7 +374,7 @@ def test_review_failure_does_not_replace_completed_generation_stream(
     from app.services.task_stream import task_stream
 
     client = TestClient(create_app())
-    _seed_wiki_page()
+    source_id = _seed_external_knowledge(monkeypatch)
     mid = _create_model(client)
     monkeypatch.setattr(
         "app.api.tasks._GENERATE_CHAT_FN",
@@ -375,7 +408,8 @@ def test_generate_lean_fallback_on_primary_llm_error(tmp_app_data, monkeypatch):
     from app.services.llm import LLMError
 
     client = TestClient(create_app())
-    _seed_wiki_page(
+    _seed_external_knowledge(
+        monkeypatch,
         title="集合竞价撤单",
         content="9:20-9:25 开盘集合竞价不接受撤单。",
     )

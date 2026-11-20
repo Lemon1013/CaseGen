@@ -745,19 +745,12 @@ def test_dashboard_aggregates_counts_across_projects(tmp_app_data, monkeypatch):
         "public": 3,
         "new_30d": 3,
     }
-    assert counts["documents"]["total"] == 3
-    assert counts["documents"]["pending_ingest"] == 2
-    assert _status_map(counts["documents"]["by_status"]) == {
-        "failed": 1,
-        "pending": 1,
-        "ready": 1,
-    }
-    assert counts["wiki"]["pages"] == 3
-    assert counts["wiki"]["pending_reviews"] == 2
-    assert _status_map(counts["wiki"]["by_status"]) == {
-        "archived": 1,
-        "published": 2,
-    }
+    assert counts["documents"]["total"] == 0
+    assert counts["documents"]["pending_ingest"] == 0
+    assert counts["documents"]["by_status"] == []
+    assert counts["wiki"]["pages"] == 0
+    assert counts["wiki"]["pending_reviews"] == 0
+    assert counts["wiki"]["by_status"] == []
     assert counts["tasks"]["total"] == 13
     assert {
         item["group"]: item["count"] for item in counts["tasks"]["by_group"]
@@ -867,10 +860,10 @@ def test_dashboard_trend_zero_fills_fourteen_utc_days(tmp_app_data, monkeypatch)
     assert by_date[(today - timedelta(days=2)).isoformat()]["tasks"] == 1
     assert by_date[(today - timedelta(days=3)).isoformat()]["tasks"] == 2
     assert by_date[(today - timedelta(days=5)).isoformat()]["cases"] == 1
-    assert by_date[(today - timedelta(days=9)).isoformat()]["documents"] == 1
+    assert by_date[(today - timedelta(days=9)).isoformat()]["documents"] == 0
     assert sum(point["tasks"] for point in trend) == 4
     assert sum(point["cases"] for point in trend) == 1
-    assert sum(point["documents"] for point in trend) == 1
+    assert sum(point["documents"] for point in trend) == 0
 
 
 def test_dashboard_recent_activity_limit_order_and_resolution(
@@ -944,32 +937,27 @@ def test_dashboard_recent_activity_limit_order_and_resolution(
 
     assert response.status_code == 200, response.text
     activity = response.json()["recent_activity"]
-    assert len(activity) == 6
+    assert len(activity) == 4
     assert [item["type"] for item in activity] == [
         "task",
-        "review",
-        "review",
-        "document",
         "case",
         "task",
+        "case",
     ]
     assert [item["created_at"] for item in activity] == sorted(
         [item["created_at"] for item in activity], reverse=True
     )
     assert {item["type"] for item in activity} == {
         "task",
-        "document",
-        "review",
         "case",
     }
     assert activity[0]["title"] == "Recent task one"
     assert activity[0]["project_id"] == project_id
     assert activity[0]["project_name"] == "dashboard-recent"
-    assert activity[1]["title"] == "Review Page"
+    assert activity[1]["title"] == "Recent case"
+    assert activity[1]["id"] == case_id
     assert activity[1]["project_id"] == project_id
-    assert activity[2]["title"] == "review-reason-only"
-    assert activity[3]["title"] == "recent-document.txt"
+    assert activity[2]["title"] == "Recent task two"
+    assert activity[2]["project_id"] == project_id
+    assert activity[3]["title"] == "Older case"
     assert activity[3]["project_id"] == project_id
-    assert activity[4]["title"] == "Recent case"
-    assert activity[4]["id"] == case_id
-    assert activity[4]["project_id"] == project_id

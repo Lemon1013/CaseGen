@@ -60,12 +60,6 @@ const projectId = computed<number | null>(() => {
   return Number.isInteger(stored) && stored > 0 ? stored : null
 })
 
-const spaceId = computed<number | undefined>(() => {
-  const raw = Array.isArray(route.query.space_id) ? route.query.space_id[0] : route.query.space_id
-  const value = Number(raw)
-  return Number.isInteger(value) && value > 0 ? value : undefined
-})
-
 const conversations = computed(() => store.conversations)
 const current = computed(() => store.currentConversation)
 
@@ -637,7 +631,7 @@ onUnmounted(() => {
           正在载入引用溯源…
         </div>
         <div v-else-if="citations.length" class="citation-block">
-          <CitationList :citations="citations" :count="citations.length" :space-id="spaceId" />
+          <CitationList :citations="citations" :count="citations.length" :project-id="projectId" />
         </div>
       </div>
     </el-drawer>

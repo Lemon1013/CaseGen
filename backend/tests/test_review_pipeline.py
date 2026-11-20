@@ -9,36 +9,62 @@ from app.main import create_app
 from app.models.entities import (
     CaseDraft,
     GenerationTask,
+    Project,
     PromptRevision,
     Requirement,
     TaskCitation,
-    WikiPageRow,
 )
+from app.models.external_wiki import ProjectKnowledgeSource
+from app.services.knowledge_providers import KnowledgeHit, ProjectKnowledgeSearchResult
 from app.services.task_pipeline import _build_review_messages
 
 
-def _seed_wiki_page(title: str = "余额规则", content: str = "余额不足应拒绝下单。") -> None:
+def _seed_external_knowledge(
+    monkeypatch,
+    title: str = "余额规则",
+    content: str = "余额不足应拒绝下单。",
+) -> None:
     init_db()
-    from app import config
-
-    config.WIKI_PAGES_DIR.mkdir(parents=True, exist_ok=True)
-    rel_path = f"pages/{title}.md"
-    file_path = config.WIKI_DIR / rel_path
-    file_path.parent.mkdir(parents=True, exist_ok=True)
-    file_path.write_text(
-        f"---\ntitle: {title}\ntype: business\ntags: [\"余额\", \"下单\"]\n---\n{content}\n",
-        encoding="utf-8",
-    )
     with Session(get_engine()) as session:
-        session.add(
-            WikiPageRow(
-                path=rel_path,
-                title=title,
-                page_type="business",
-                tags_json=json.dumps(["余额", "下单"], ensure_ascii=False),
-            )
+        project = session.exec(select(Project).where(Project.slug == "default")).first()
+        assert project is not None and project.id is not None
+        source = ProjectKnowledgeSource(
+            project_id=int(project.id),
+            name="测试外部知识库",
+            provider_type="llm_wiki_django",
+            base_url="http://127.0.0.1:8091",
+            auth_type="none",
+            config_json=json.dumps({"external_project_id": "proj-review"}),
+            enabled=True,
         )
+        session.add(source)
         session.commit()
+        session.refresh(source)
+        source_id = int(source.id)
+
+    def _fake_search(session, project_id: int, query: str, *, top_k=None):
+        return ProjectKnowledgeSearchResult(
+            configured=True,
+            empty_reason="none",
+            hits=[
+                KnowledgeHit(
+                    source_id=source_id,
+                    source_name="测试外部知识库",
+                    provider_type="llm_wiki_django",
+                    chunk_id=101,
+                    title=title,
+                    file_path=f"raw/sources/{title}.docx",
+                    document_path=f"raw/sources/{title}.docx",
+                    heading_path=f"业务规则 > {title}",
+                    score=0.95,
+                    weighted_score=0.95,
+                    snippet=content,
+                    evidence_snippet=content,
+                )
+            ],
+        )
+
+    monkeypatch.setattr("app.services.task_pipeline.search_project_knowledge", _fake_search)
 
 
 def _create_model(client: TestClient) -> int:
@@ -132,7 +158,7 @@ def _confirm_test_points(client: TestClient, task_id: int, prefix: str) -> None:
 
 def test_review_optimize_apply_regenerate_finalize(tmp_app_data, monkeypatch):
     client = TestClient(create_app())
-    _seed_wiki_page()
+    _seed_external_knowledge(monkeypatch)
     mid = _create_model(client)
 
     draft_v1 = """# 用例：余额不足下单
@@ -295,7 +321,7 @@ def test_review_optimize_apply_regenerate_finalize(tmp_app_data, monkeypatch):
 
 def test_finalize_from_generated(tmp_app_data, monkeypatch):
     client = TestClient(create_app())
-    _seed_wiki_page()
+    _seed_external_knowledge(monkeypatch)
     mid = _create_model(client)
 
     def fake_chat(**kwargs):
@@ -366,14 +392,26 @@ def test_apply_prompt_accepts_manual_edit_before_confirmation(tmp_app_data):
     assert repeated.status_code == 400
 
 
-def test_review_messages_preserve_wiki_and_source_labels():
+def test_review_messages_preserve_external_wiki_and_source_labels():
     requirement = Requirement(
         title="集合竞价撤单",
         description="核验不可撤单时段",
         focus_tags_json='["撤单"]',
     )
-    draft = CaseDraft(task_id=1, content_md="## TC-001\n关联知识：[1] [S1]")
+    draft = CaseDraft(task_id=1, content_md="## TC-001\n关联知识：[E1] [1] [S1]")
     citations = [
+        TaskCitation(
+            task_id=1,
+            citation_type="external",
+            knowledge_source_id=5,
+            title="集合竞价撤单外部规则",
+            path="raw/sources/rule.docx",
+            file_path="raw/sources/rule.docx",
+            heading_path="第三章 > 集合竞价",
+            snippet="外部摘录",
+            content_excerpt="9:20 至 9:25 外部规则全文摘录。",
+            score=12.5,
+        ),
         TaskCitation(
             task_id=1,
             citation_type="wiki",
@@ -399,6 +437,10 @@ def test_review_messages_preserve_wiki_and_source_labels():
         item["content"]
         for item in _build_review_messages("评审系统", requirement, draft, citations)
     )
+    assert "[E1] 集合竞价撤单外部规则 (raw/sources/rule.docx)" in joined
+    assert "heading=第三章 > 集合竞价" in joined
+    assert "source_id=5" in joined
+    assert "9:20 至 9:25 外部规则全文摘录" in joined
     assert "[1] 撤单规则" in joined
     assert "[S1] 交易规则原文" in joined
     assert "source_chunk_id=12" in joined

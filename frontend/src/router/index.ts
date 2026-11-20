@@ -107,40 +107,16 @@ const router = createRouter({
           meta: { title: '上传至测试平台', description: '查看并下载生成产物，等待后续连接器推送', adminOnly: true },
         },
         {
-          path: 'documents',
-          name: 'documents',
-          component: () => import('../views/DocumentsView.vue'),
-          meta: { title: '文档摄入', description: '上传业务文档、检查解析质量并摄入当前 Wiki 空间', adminOnly: true },
-        },
-        {
-          path: 'wiki',
-          name: 'wiki',
-          component: () => import('../views/WikiView.vue'),
-          meta: { title: '知识浏览', description: '检索与预览当前 Wiki 空间的知识页面和原文依据', adminOnly: true },
-        },
-        {
-          path: 'wiki/reviews',
-          name: 'wiki-reviews',
-          component: () => import('../views/WikiReviewView.vue'),
-          meta: { title: '变更审核', description: '审核 Wiki 候选变更、来源证据、历史版本与回滚记录', adminOnly: true },
-        },
-        {
-          path: 'wiki-spaces',
-          name: 'wiki-spaces',
-          component: () => import('../views/WikiSpacesView.vue'),
-          meta: { title: '知识空间', description: '按项目管理隔离的 Wiki 文档、页面、审核与检索边界', adminOnly: true },
-        },
-        {
           path: 'spaces',
           name: 'space-management',
           component: () => import('../views/SpaceManagementView.vue'),
-          meta: { title: '空间管理', description: '管理全站项目空间及其生命周期', adminOnly: true },
+          meta: { title: '项目管理', description: '管理项目与多外部知识库连接配置', adminOnly: true },
         },
         {
           path: 'prompts',
           name: 'prompts',
           component: () => import('../views/PromptsView.vue'),
-          meta: { title: '提示词管理', description: '维护生成 / 评审 / Wiki 等提示词模板' },
+          meta: { title: '提示词管理', description: '维护生成 / 测试点 / 评审等提示词模板' },
         },
         {
           path: 'models',

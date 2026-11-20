@@ -44,14 +44,12 @@ import {
   editTestPoints,
   confirmTestPoints,
   getTaskCoverage,
-  saveKnowledgeDecision,
   type RetrievalCheckpoint,
   type TestPointCheckpoint,
   type TestPointItem,
   type CoverageSummary,
 } from '../api/tasks'
 import { listModels, type ModelConfig } from '../api/models'
-import { proposeWikiUpdate } from '../api/wiki'
 
 const route = useRoute()
 const router = useRouter()
@@ -67,8 +65,6 @@ const citations = ref<TaskCitation[]>([])
 const checkpoint = ref<RetrievalCheckpoint | null>(null)
 const selectedCitationIds = ref<number[]>([])
 const supplementalText = ref('')
-const knowledgeChoices = ref<Record<string, number>>({})
-const knowledgeScopes = ref<Record<string, boolean>>({})
 const confirmingCheckpoint = ref(false)
 const expandedCitations = reactive(new Set<number>())
 
@@ -290,8 +286,6 @@ function hydrateRetrievalEditor(fresh: RetrievalCheckpoint) {
     ? [...fresh.selected_citation_ids]
     : fresh.candidate_citations.map((item) => item.id)
   supplementalText.value = fresh.supplemental_text || ''
-  knowledgeChoices.value = {}
-  knowledgeScopes.value = {}
 }
 
 function hydrateTestPointEditor(fresh: TestPointCheckpoint) {
@@ -371,27 +365,28 @@ async function loadAll() {
   }
 }
 
+const allowEmptyRetrievalConfirm = computed(() => {
+  if (!checkpoint.value) return false
+  return (
+    checkpoint.value.candidate_citations.length === 0 ||
+    (checkpoint.value.knowledge_status != null && checkpoint.value.knowledge_status !== 'ready')
+  )
+})
+
 async function confirmCheckpoint() {
   if (!task.value || !checkpoint.value || confirmingCheckpoint.value) return
-  if (!selectedCitationIds.value.length && !supplementalText.value.trim()) {
+  if (!allowEmptyRetrievalConfirm.value && !selectedCitationIds.value.length && !supplementalText.value.trim()) {
     ElMessage.warning('至少选择一条引用或填写补充上下文')
-    return
-  }
-  const unresolved = checkpoint.value.conflict_groups.filter((item) => !knowledgeChoices.value[item.conflict_key])
-  if (unresolved.length) {
-    ElMessage.warning('请先为每组知识冲突选择采用项')
     return
   }
   confirmingCheckpoint.value = true
   try {
-    for (const conflict of checkpoint.value.conflict_groups) {
-      await saveKnowledgeDecision(task.value.id, checkpoint.value.id, checkpoint.value.version, conflict.conflict_key, knowledgeChoices.value[conflict.conflict_key], knowledgeScopes.value[conflict.conflict_key] ? 'project' : 'once')
-    }
     const updated = await confirmRetrievalCheckpoint(task.value.id, {
       selected_citation_ids: selectedCitationIds.value,
       supplemental_text: supplementalText.value,
       expected_version: checkpoint.value.version,
       idempotency_key: `task-${task.value.id}-checkpoint-${checkpoint.value.id}-v${checkpoint.value.version}`,
+      allow_empty_context: selectedCitationIds.value.length === 0,
     })
     applyTaskUpdate(updated)
     await refreshLight(true)
@@ -399,28 +394,6 @@ async function confirmCheckpoint() {
     ElMessage.error(`确认失败：${(err as Error).message}`)
   } finally {
     confirmingCheckpoint.value = false
-  }
-}
-
-function chooseKnowledge(conflictKey: string, pageId: number) {
-  if (!checkpoint.value) return
-  const conflict = checkpoint.value.conflict_groups.find((item) => item.conflict_key === conflictKey)
-  const pageIds = new Set((conflict?.candidates || []).map((item) => item.id))
-  const competingCitationIds = new Set(checkpoint.value.candidate_citations.filter((item) => item.wiki_page_id != null && pageIds.has(item.wiki_page_id)).map((item) => item.id))
-  selectedCitationIds.value = selectedCitationIds.value.filter((id) => !competingCitationIds.has(id))
-  const selectedCitation = checkpoint.value.candidate_citations.find((item) => item.wiki_page_id === pageId)
-  if (selectedCitation) selectedCitationIds.value.push(selectedCitation.id)
-}
-
-async function proposeConflictUpdate(pageId: number | null, spaceId: number | null | undefined) {
-  if (!pageId || !spaceId) return
-  try {
-    const { value } = await ElMessageBox.prompt('请输入建议采用的新结论；提交后进入现有审核流程，不会直接覆盖正式知识。', '提交知识修订', { inputValidator: (value) => !!value.trim() || '请输入新结论' })
-    await proposeWikiUpdate(pageId, spaceId, value)
-    ElMessage.success('已创建知识修订审核项')
-    await router.push({ path: '/wiki/reviews', query: { ...route.query, space_id: String(spaceId) } })
-  } catch (error) {
-    if (error !== 'cancel' && error !== 'close') ElMessage.error(`提交修订失败：${(error as Error).message}`)
   }
 }
 
@@ -1239,28 +1212,60 @@ onUnmounted(() => {
 
     <el-alert
       v-if="showEmptyCitationBanner"
-      type="warning"
+      type="info"
       show-icon
       :closable="false"
-      title="检索未命中任何 Wiki 页面"
-      description="生成已完成但 citations 为空，用例可能缺少知识库依据。建议先编译相关文档，再重新生成。"
+      title="未关联外部知识引用"
+      description="当前任务未命中外部知识库条目，用例基于需求描述与补充上下文生成。如需知识依据，可联系管理员配置外部知识库或补充需求背景后再重新生成。"
       style="margin-bottom: 16px"
     />
 
     <el-card v-if="task?.status === 'awaiting_confirmation' && checkpoint" shadow="never" class="block checkpoint-card">
       <template #header>检索结果确认</template>
-      <p class="meta">请确认将用于生成的知识引用，可取消不相关条目。</p>
-      <el-alert v-for="conflict in checkpoint.conflict_groups" :key="conflict.conflict_key" type="warning" :closable="false" :title="`知识冲突：${conflict.canonical_topic}`">
-        <el-radio-group v-model="knowledgeChoices[conflict.conflict_key]" @change="(pageId: string | number | boolean | undefined) => chooseKnowledge(conflict.conflict_key, Number(pageId))">
-          <el-radio v-for="candidate in conflict.candidates" :key="candidate.id || candidate.title" :value="candidate.id || 0">
-            {{ candidate.space_scope === 'shared' ? '公共' : '项目' }} · {{ candidate.space_name }}：{{ candidate.assertion_summary }}
-            <el-button link type="primary" @click.stop="proposeConflictUpdate(candidate.id, candidate.space_id)">{{ candidate.space_scope === 'shared' ? '提交公共库更新' : '更新项目库' }}</el-button>
-          </el-radio>
-        </el-radio-group>
-        <el-checkbox v-model="knowledgeScopes[conflict.conflict_key]">记住为当前项目默认选择</el-checkbox>
+      <p class="meta">请确认将用于生成的知识引用，可取消不相关条目；也可补充背景上下文后继续。</p>
+
+      <el-alert
+        v-if="checkpoint.knowledge_status === 'not_configured'"
+        type="warning"
+        show-icon
+        :closable="false"
+        class="checkpoint-status-alert"
+        title="该项目未配置知识库，可联系管理员添加"
+        :description="checkpoint.knowledge_message || '确认后仍可继续后续测试点生成，您也可以在下方填写补充背景上下文。'"
+      />
+      <el-alert
+        v-else-if="checkpoint.knowledge_status === 'no_hits'"
+        type="info"
+        show-icon
+        :closable="false"
+        class="checkpoint-status-alert"
+        title="未检索到相关内容"
+        :description="checkpoint.knowledge_message || '外部知识库未命中相关条目，可填写补充背景或直接确认继续生成测试点。'"
+      />
+      <el-alert
+        v-if="checkpoint.knowledge_status === 'source_error' || checkpoint.source_warnings?.length"
+        type="warning"
+        show-icon
+        :closable="false"
+        class="checkpoint-status-alert"
+        :title="checkpoint.knowledge_status === 'source_error' ? '外部知识库检索异常' : '部分外部知识库检索告警'"
+      >
+        <template #default>
+          <p v-if="checkpoint.knowledge_message" class="checkpoint-alert-msg">{{ checkpoint.knowledge_message }}</p>
+          <ul v-if="checkpoint.source_warnings?.length" class="checkpoint-warnings-list">
+            <li v-for="(warn, idx) in checkpoint.source_warnings" :key="`${warn.source_id ?? 's'}-${idx}`">
+              <strong v-if="warn.source_name">{{ warn.source_name }}</strong>
+              <span v-if="warn.category">（{{ warn.category }}）</span>
+              <span v-if="warn.source_name || warn.category">：</span>
+              {{ warn.message }}
+            </li>
+          </ul>
+          <p class="checkpoint-alert-msg">您仍可基于已有命中结果或补充上下文确认并继续生成测试点。</p>
+        </template>
       </el-alert>
-      <el-checkbox-group v-model="selectedCitationIds" class="checkpoint-list">
-        <el-checkbox v-for="item in checkpoint.candidate_citations" :key="item.id" :label="item.id" class="checkpoint-item">
+
+      <el-checkbox-group v-if="checkpoint.candidate_citations.length" v-model="selectedCitationIds" class="checkpoint-list">
+        <el-checkbox v-for="item in checkpoint.candidate_citations" :key="item.id" :value="item.id" class="checkpoint-item">
           <span class="checkpoint-title">
             <el-tag
               v-if="item.citation_type === 'external'"
@@ -1272,26 +1277,17 @@ onUnmounted(() => {
               外部知识
             </el-tag>
             <el-tag
-              v-else-if="item.citation_type === 'source'"
-              size="small"
-              type="success"
-              effect="plain"
-              style="margin-right: 6px"
-            >
-              原文
-            </el-tag>
-            <el-tag
               v-else
               size="small"
               type="primary"
               effect="plain"
               style="margin-right: 6px"
             >
-              Wiki
+              知识引用
             </el-tag>
             {{ item.title }}
           </span>
-          <span class="checkpoint-meta">{{ item.citation_type === 'external' ? '外部知识' : item.citation_type }} · score {{ item.score.toFixed(3) }} · {{ item.path }}</span>
+          <span class="checkpoint-meta">{{ item.citation_type === 'external' ? '外部知识' : (item.citation_type || '知识') }} · score {{ item.score.toFixed(3) }} · {{ item.file_path || item.path }}</span>
           <span class="checkpoint-snippet" :class="{ expanded: expandedCitations.has(item.id) }">{{ item.snippet || item.content_excerpt }}</span>
           <el-button
             v-if="(item.snippet || item.content_excerpt || '').length >= 120"
@@ -1305,7 +1301,16 @@ onUnmounted(() => {
         </el-checkbox>
       </el-checkbox-group>
       <el-input v-model="supplementalText" type="textarea" :rows="4" maxlength="10000" show-word-limit placeholder="补充上下文（可选）" />
-      <el-button type="primary" :loading="confirmingCheckpoint" :disabled="!selectedCitationIds.length && !supplementalText.trim()" @click="confirmCheckpoint">确认并生成</el-button>
+      <div class="checkpoint-actions">
+        <el-button
+          type="primary"
+          :loading="confirmingCheckpoint"
+          :disabled="!allowEmptyRetrievalConfirm && !selectedCitationIds.length && !supplementalText.trim()"
+          @click="confirmCheckpoint"
+        >
+          确认并继续生成测试点
+        </el-button>
+      </div>
     </el-card>
 
     <el-card v-if="(task?.status === 'awaiting_test_point_confirmation' || task?.status === 'generating_test_points') && testPointCheckpoint" shadow="never" class="block checkpoint-card test-point-card">
@@ -1394,10 +1399,6 @@ onUnmounted(() => {
               <span class="meta">更新于 {{ formatTime(task?.updated_at || '') }}</span>
             </div>
           </template>
-          <div v-if="task" class="space-banner">
-            <span class="meta">Wiki 空间</span>
-            <el-tag type="info" effect="plain">{{ task.wiki_space_name || `空间 #${task.wiki_space_id}` }}</el-tag>
-          </div>
           <div class="req-desc">{{ task?.description || '-' }}</div>
           <div v-if="task?.focus_tags?.length" class="tags">
             <el-tag
@@ -1678,7 +1679,7 @@ onUnmounted(() => {
           <CitationList
             :citations="citations"
             :count="citations.length || task?.citation_count || 0"
-            :space-id="task?.wiki_space_id"
+            :project-id="task?.project_id ?? projectId"
           />
         </el-card>
 
@@ -1813,6 +1814,27 @@ onUnmounted(() => {
   overflow-x: hidden;
   margin: 12px 0;
   min-width: 0;
+}
+
+.checkpoint-status-alert {
+  margin: 10px 0 12px;
+}
+
+.checkpoint-alert-msg {
+  margin: 4px 0 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+.checkpoint-warnings-list {
+  margin: 6px 0;
+  padding-left: 18px;
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+
+.checkpoint-actions {
+  margin-top: 12px;
 }
 
 .checkpoint-item {

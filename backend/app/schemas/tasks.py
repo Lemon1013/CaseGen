@@ -2,7 +2,6 @@ from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from app.schemas.wiki import KnowledgeConflict
 
 
 class TaskCreate(BaseModel):
@@ -134,6 +133,10 @@ class TaskCitationOut(BaseModel):
     content_excerpt: str = ""
     clause_ids: List[str] = Field(default_factory=list)
     anchor_clause: Optional[str] = None
+    knowledge_source_id: Optional[int] = None
+    file_path: Optional[str] = None
+    heading_path: Optional[str] = None
+    external_metadata: Dict[str, Any] = Field(default_factory=dict)
     available: bool = True
     legacy: bool = False
     legacy_reason: Optional[str] = None
@@ -153,7 +156,10 @@ class RetrievalCheckpointOut(BaseModel):
     idempotency_key: Optional[str] = None
     created_at: datetime
     updated_at: datetime
-    conflict_groups: List[KnowledgeConflict] = Field(default_factory=list)
+    conflict_groups: List[Dict[str, Any]] = Field(default_factory=list)
+    knowledge_status: str = "ready"
+    knowledge_message: str = ""
+    source_warnings: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class RetrievalCheckpointConfirm(BaseModel):
@@ -161,6 +167,7 @@ class RetrievalCheckpointConfirm(BaseModel):
     supplemental_text: str = Field(default="", max_length=10000)
     expected_version: int = Field(ge=1)
     idempotency_key: str = Field(min_length=1, max_length=200)
+    allow_empty_context: bool = False
 
 
 class TaskReferenceCaseOut(BaseModel):

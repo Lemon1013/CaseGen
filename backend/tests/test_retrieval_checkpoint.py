@@ -11,6 +11,7 @@ from sqlmodel import Session
 from app.db import get_engine
 from app.main import create_app
 from app.models.entities import CaseDraft, GenerationTask, TaskRetrievalCheckpoint
+from app.services.knowledge_providers import KnowledgeHit, ProjectKnowledgeSearchResult
 
 
 def _model(client: TestClient) -> int:
@@ -38,13 +39,42 @@ def _task(client: TestClient, model_id: int | None = None) -> int:
 
 
 def _retrieve_hits(*_args, **_kwargs):
-    return {
-        "wiki_hits": [
-            {"id": 101, "title": "同名规则", "path": "pages/a.md", "content": "A 规则内容", "score": 0.9},
-            {"id": 102, "title": "同名规则", "path": "pages/b.md", "content": "B 规则内容", "score": 0.8},
+    return ProjectKnowledgeSearchResult(
+        configured=True,
+        empty_reason="none",
+        message="",
+        hits=[
+            KnowledgeHit(
+                source_id=1,
+                source_name="外部库A",
+                provider_type="llm_wiki_django",
+                chunk_id=101,
+                title="同名规则",
+                file_path="raw/sources/a.docx",
+                document_path="raw/sources/a.docx",
+                heading_path="规则 > A",
+                score=0.9,
+                weighted_score=0.9,
+                snippet="A 规则内容",
+                evidence_snippet="A 规则内容",
+            ),
+            KnowledgeHit(
+                source_id=1,
+                source_name="外部库A",
+                provider_type="llm_wiki_django",
+                chunk_id=102,
+                title="同名规则",
+                file_path="raw/sources/b.docx",
+                document_path="raw/sources/b.docx",
+                heading_path="规则 > B",
+                score=0.8,
+                weighted_score=0.8,
+                snippet="B 规则内容",
+                evidence_snippet="B 规则内容",
+            ),
         ],
-        "source_hits": [],
-    }
+        warnings=[],
+    )
 
 
 def _install_point_chat(monkeypatch):
@@ -122,7 +152,7 @@ def test_retrieval_stops_before_chat_and_get_restores_checkpoint(tmp_app_data, m
         chat_calls["count"] += 1
         return "# 用例\n生成完成"
 
-    monkeypatch.setattr("app.services.hybrid_retrieve.hybrid_retrieve", retrieve)
+    monkeypatch.setattr("app.services.task_pipeline.search_project_knowledge", retrieve)
     monkeypatch.setattr("app.api.tasks._GENERATE_CHAT_FN", chat)
     monkeypatch.setattr("app.services.task_pipeline._GENERATE_CHAT_FN", chat)
     response = client.post(f"/api/tasks/{task_id}/generate")
@@ -150,7 +180,7 @@ def test_confirm_subset_and_supplemental_resumes_once_without_retrieve(tmp_app_d
         calls["messages"].append(kwargs["messages"])
         return "# 已确认用例\n生成完成"
 
-    monkeypatch.setattr("app.services.hybrid_retrieve.hybrid_retrieve", retrieve)
+    monkeypatch.setattr("app.services.task_pipeline.search_project_knowledge", retrieve)
     monkeypatch.setattr("app.api.tasks._GENERATE_CHAT_FN", chat)
     monkeypatch.setattr("app.services.task_pipeline._GENERATE_CHAT_FN", chat)
     assert client.post(f"/api/tasks/{task_id}/generate").json()["status"] == "awaiting_confirmation"
@@ -176,7 +206,7 @@ def test_duplicate_titles_use_distinct_citation_identity(tmp_app_data, monkeypat
     task_id = _task(client, model_id)
     messages: list[str] = []
 
-    monkeypatch.setattr("app.services.hybrid_retrieve.hybrid_retrieve", lambda *a, **k: _retrieve_hits())
+    monkeypatch.setattr("app.services.task_pipeline.search_project_knowledge", lambda *a, **k: _retrieve_hits())
     monkeypatch.setattr(
         "app.api.tasks._GENERATE_CHAT_FN",
         lambda **kwargs: messages.append("\n".join(x["content"] for x in kwargs["messages"])) or "# 完成",
@@ -197,7 +227,7 @@ def test_checkpoint_validation_idempotency_and_cross_task(tmp_app_data, monkeypa
     model_id = _model(client)
     first = _task(client, model_id)
     second = _task(client, model_id)
-    monkeypatch.setattr("app.services.hybrid_retrieve.hybrid_retrieve", lambda *a, **k: _retrieve_hits())
+    monkeypatch.setattr("app.services.task_pipeline.search_project_knowledge", lambda *a, **k: _retrieve_hits())
     monkeypatch.setattr("app.api.tasks._GENERATE_CHAT_FN", lambda **kwargs: "# 完成")
     client.post(f"/api/tasks/{first}/generate")
     client.post(f"/api/tasks/{second}/generate")
@@ -227,7 +257,7 @@ def test_no_model_fails_before_retrieval_or_checkpoint(tmp_app_data, monkeypatch
     client = TestClient(create_app())
     task_id = _task(client)
     called = {"retrieve": False}
-    monkeypatch.setattr("app.services.hybrid_retrieve.hybrid_retrieve", lambda *a, **k: called.__setitem__("retrieve", True))
+    monkeypatch.setattr("app.services.task_pipeline.search_project_knowledge", lambda *a, **k: called.__setitem__("retrieve", True))
     response = client.post(f"/api/tasks/{task_id}/generate")
     assert response.json()["status"] == "failed"
     assert called["retrieve"] is False
@@ -238,7 +268,7 @@ def test_auto_review_is_persisted_on_pending_checkpoint(tmp_app_data, monkeypatc
     client = TestClient(create_app())
     model_id = _model(client)
     task_id = _task(client, model_id)
-    monkeypatch.setattr("app.services.hybrid_retrieve.hybrid_retrieve", lambda *a, **k: _retrieve_hits())
+    monkeypatch.setattr("app.services.task_pipeline.search_project_knowledge", lambda *a, **k: _retrieve_hits())
     monkeypatch.setattr("app.api.tasks._GENERATE_CHAT_FN", lambda **kwargs: "# 完成")
     response = client.post(f"/api/tasks/{task_id}/generate?auto_review=true")
     assert response.json()["status"] == "awaiting_confirmation"
@@ -255,7 +285,7 @@ def test_concurrent_confirm_schedules_one_job(tmp_app_data, monkeypatch):
     client = TestClient(create_app())
     model_id = _model(client)
     task_id = _task(client, model_id)
-    monkeypatch.setattr("app.services.hybrid_retrieve.hybrid_retrieve", lambda *a, **k: _retrieve_hits())
+    monkeypatch.setattr("app.services.task_pipeline.search_project_knowledge", lambda *a, **k: _retrieve_hits())
     monkeypatch.setattr("app.api.tasks._GENERATE_CHAT_FN", lambda **kwargs: "# 完成")
     monkeypatch.setattr("app.services.task_pipeline._GENERATE_CHAT_FN", lambda **kwargs: "# 完成")
     assert client.post(f"/api/tasks/{task_id}/generate").json()["status"] == "awaiting_confirmation"
@@ -410,3 +440,52 @@ def test_heartbeat_keeps_running_lease_and_old_finish_cannot_overwrite_new_owner
         assert checkpoint is not None
         assert checkpoint.resume_claim_token == "token-b"
         assert checkpoint.resume_status == "running"
+
+
+def test_unconfigured_and_no_hits_external_knowledge_allow_empty_context_confirm(tmp_app_data, monkeypatch):
+    client = TestClient(create_app())
+    model_id = _model(client)
+    monkeypatch.setattr("app.api.tasks._GENERATE_CHAT_FN", lambda **kwargs: "# 用例\n生成完成")
+    monkeypatch.setattr("app.services.task_pipeline._GENERATE_CHAT_FN", lambda **kwargs: "# 用例\n生成完成")
+
+    # 1. Project has no external knowledge source configured -> not_configured
+    task1 = _task(client, model_id)
+    res1 = client.post(f"/api/tasks/{task1}/generate")
+    assert res1.status_code == 200
+    assert res1.json()["status"] == "awaiting_confirmation"
+    cp1 = client.get(f"/api/tasks/{task1}/retrieval-checkpoint").json()
+    assert cp1["knowledge_status"] == "not_configured"
+    assert cp1["knowledge_message"] == "该项目未配置知识库，可联系管理员添加"
+    assert cp1["candidate_citations"] == []
+
+    # Without allow_empty_context and without supplemental_text -> 422
+    blocked = _confirm(client, task1, [], monkeypatch=monkeypatch)
+    assert blocked.status_code == 422
+
+    # With allow_empty_context=True -> confirms and generates test points & draft
+    confirmed1 = _confirm(client, task1, [], monkeypatch=monkeypatch, allow_empty_context=True)
+    assert confirmed1.status_code == 200
+    assert confirmed1.json()["status"] == "generated"
+
+    # 2. Project has external source configured but search returns 0 hits -> no_hits
+    monkeypatch.setattr(
+        "app.services.task_pipeline.search_project_knowledge",
+        lambda *_a, **_k: ProjectKnowledgeSearchResult(
+            configured=True,
+            empty_reason="no_hits",
+            message="未检索到相关内容",
+            hits=[],
+            warnings=[],
+        ),
+    )
+    task2 = _task(client, model_id)
+    res2 = client.post(f"/api/tasks/{task2}/generate")
+    assert res2.status_code == 200
+    cp2 = client.get(f"/api/tasks/{task2}/retrieval-checkpoint").json()
+    assert cp2["knowledge_status"] == "no_hits"
+    assert cp2["knowledge_message"] == "未检索到相关内容"
+    assert cp2["candidate_citations"] == []
+
+    confirmed2 = _confirm(client, task2, [], monkeypatch=monkeypatch, allow_empty_context=True)
+    assert confirmed2.status_code == 200
+    assert confirmed2.json()["status"] == "generated"

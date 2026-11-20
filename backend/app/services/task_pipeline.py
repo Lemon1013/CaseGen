@@ -19,17 +19,19 @@ from app.models.entities import (
     ModelConfig,
     PromptRevision,
     PromptTemplate,
-    ProjectKnowledgeDecision,
     Requirement,
     ReviewResult,
     TaskCitation,
     TaskRetrievalCheckpoint,
     TaskTestPointCheckpoint,
     TestPoint,
+    WikiSpace,
+)
+from app.services.knowledge_providers import (
+    ProjectKnowledgeSearchResult,
+    search_project_knowledge,
 )
 from app.services.llm import LLMError, chat_completion
-from app.services.retrieve import load_all_wiki_pages, rank_pages
-from app.services.source_chunks_store import load_all_source_chunks, rank_source_chunks
 from app.services.review_parse import parse_review_payload
 from app.services.case_management import (
     CASE_HEADING_RE,
@@ -40,7 +42,6 @@ from app.services.case_management import (
 from app.services.task_events import append_event
 from app.services.task_state import InvalidTransition, transition
 from app.services.task_stream import task_stream
-from app.services.wiki_spaces import resolve_space_id
 from app.services.test_points import (
     citation_label_map_from_context,
     create_checkpoint as create_test_point_checkpoint,
@@ -94,9 +95,37 @@ def _focus_tags(requirement: Requirement) -> list[str]:
     return [str(t) for t in tags]
 
 
-def _build_query(requirement: Requirement) -> str:
-    from app.services.retrieve import clean_retrieve_query
+_QUERY_NOISE_RE = re.compile(
+    r"(生成|编写|输出|给出|请).{0,12}(正常|边界|异常|正例|反例)?.{0,8}"
+    r"(测试用例|用例|案例|场景)[。．\.！!？?]*",
+    re.I,
+)
+_CLAUSE_ID_RE = re.compile(r"(?<![\d.])([1-9]\d*(?:\.\d+){1,2})(?![\d.])")
 
+
+def clean_retrieve_query(query: str) -> str:
+    """Drop generation-instruction tails so domain terms dominate search."""
+    q = (query or "").strip()
+    if not q:
+        return ""
+    q = _QUERY_NOISE_RE.sub(" ", q)
+    return re.sub(r"\s+", " ", q).strip(" ，,。．")
+
+
+def _extract_clause_ids(text: str) -> list[str]:
+    if not text:
+        return []
+    found: list[str] = []
+    seen: set[str] = set()
+    for match in _CLAUSE_ID_RE.finditer(text):
+        cid = match.group(1)
+        if cid not in seen:
+            seen.add(cid)
+            found.append(cid)
+    return found
+
+
+def _build_query(requirement: Requirement) -> str:
     tags = _focus_tags(requirement)
     parts = [requirement.title or "", requirement.description or ""]
     if tags:
@@ -294,9 +323,7 @@ def _context_source_group(hit: Mapping[str, Any]) -> str:
 
 
 def _context_explicit_clauses(query: str) -> list[str]:
-    from app.services.clause_index import extract_clause_ids
-
-    return list(dict.fromkeys(extract_clause_ids(query or "")))
+    return _extract_clause_ids(query or "")
 
 
 def _normalise_context_hits(
@@ -394,9 +421,7 @@ def _context_excerpt(
     if len(text) <= limit:
         return text, 0, len(text)
 
-    from app.services.clause_index import extract_clause_ids
-
-    terms = extract_clause_ids(query or "")
+    terms = _extract_clause_ids(query or "")
     terms += re.findall(r"[A-Za-z0-9_]{2,}", query or "")
     cjk_runs = re.findall(r"[\u4e00-\u9fff]{2,}", query or "")
     terms += cjk_runs
@@ -588,32 +613,65 @@ def assemble_task_context(
     ) if raw_external else ([], 0)
 
     has_external = bool(external)
-    if has_external:
-        ratios = [float(wiki_ratio), float(source_ratio), float(external_ratio), float(index_ratio)]
+    has_legacy_groups = bool(wiki or source)
+    if max_chars is not None:
+        total = int(max_chars)
+    elif hasattr(config, "MAX_WIKI_CONTEXT_CHARS") and hasattr(config, "MAX_SOURCE_CONTEXT_CHARS"):
+        total = max(
+            int(round(config.MAX_WIKI_CONTEXT_CHARS / _WIKI_CONTEXT_RATIO)),
+            int(round(config.MAX_SOURCE_CONTEXT_CHARS / _SOURCE_CONTEXT_RATIO)),
+            1,
+        )
     else:
-        ratios = [float(wiki_ratio), float(source_ratio), float(index_ratio)]
-
-    if any(r < 0 for r in ratios) or sum(ratios) <= 0:
-        raise ValueError("context ratios must be non-negative and not all zero")
-    total = int(max_chars) if max_chars is not None else max(
-        int(round(config.MAX_WIKI_CONTEXT_CHARS / _WIKI_CONTEXT_RATIO)),
-        int(round(config.MAX_SOURCE_CONTEXT_CHARS / _SOURCE_CONTEXT_RATIO)),
-        1,
-    )
+        total = max(int(getattr(config, "MAX_CONTEXT_CHARS", 18000)), 1)
     total = max(0, total)
-    ratio_sum = sum(ratios)
-    budgets = [int(total * ratio / ratio_sum) for ratio in ratios]
-    for index in range(total - sum(budgets)):
-        budgets[index % len(budgets)] += 1
 
-    wiki_budget = budgets[0]
-    source_budget = budgets[1]
-    if has_external:
-        external_budget = budgets[2]
-        index_budget = budgets[3]
+    if not has_legacy_groups:
+        if float(index_ratio) < 0:
+            raise ValueError("context ratios must be non-negative and not all zero")
+        wiki_budget = 0
+        source_budget = 0
+        if has_external:
+            safe_index_ratio = min(0.25, max(0.0, float(index_ratio)))
+            index_budget = int(total * safe_index_ratio)
+            external_budget = max(0, total - index_budget)
+        else:
+            external_budget = 0
+            index_budget = 0
+        ratio_denom = float(total) if total > 0 else 1.0
+        ratio_map = {
+            "wiki": 0.0,
+            "source": 0.0,
+            "external": external_budget / ratio_denom,
+            "index": index_budget / ratio_denom,
+        }
     else:
-        external_budget = 0
-        index_budget = budgets[2]
+        if has_external:
+            ratios = [float(wiki_ratio), float(source_ratio), float(external_ratio), float(index_ratio)]
+        else:
+            ratios = [float(wiki_ratio), float(source_ratio), float(index_ratio)]
+
+        if any(r < 0 for r in ratios) or sum(ratios) <= 0:
+            raise ValueError("context ratios must be non-negative and not all zero")
+        ratio_sum = sum(ratios)
+        budgets = [int(total * ratio / ratio_sum) for ratio in ratios]
+        for index in range(total - sum(budgets)):
+            budgets[index % len(budgets)] += 1
+
+        wiki_budget = budgets[0]
+        source_budget = budgets[1]
+        if has_external:
+            external_budget = budgets[2]
+            index_budget = budgets[3]
+        else:
+            external_budget = 0
+            index_budget = budgets[2]
+        ratio_map = {
+            "wiki": ratios[0] / ratio_sum,
+            "source": ratios[1] / ratio_sum,
+            "external": (ratios[2] / ratio_sum) if has_external else 0.0,
+            "index": (ratios[3] if has_external else ratios[2]) / ratio_sum,
+        }
 
     citations: list[dict[str, Any]] = []
     for index, hit in enumerate(wiki, start=1):
@@ -681,6 +739,16 @@ def assemble_task_context(
     for index, hit in enumerate(external, start=1):
         text = hit.get("_context_content") or ""
         snippet, _, _ = _context_excerpt(text, query, 320, fallback=str(hit.get("snippet") or ""))
+        file_path = str(hit.get("file_path") or hit.get("path") or hit.get("document_path") or "")
+        heading_path = str(hit.get("heading_path") or hit.get("headingPath") or "")
+        raw_ext_meta = hit.get("external_metadata")
+        if not isinstance(raw_ext_meta, Mapping):
+            raw_ext_meta = {
+                "page_no": hit.get("page_no") or hit.get("pageNo"),
+                "chunk_id": hit.get("chunk_id") or hit.get("id"),
+                "source_name": hit.get("source_name") or "",
+                "provider_type": hit.get("provider_type") or "",
+            }
         citations.append(
             {
                 "citation_type": "external",
@@ -689,9 +757,12 @@ def assemble_task_context(
                 "wiki_page_id": None,
                 "page_key": None,
                 "source_chunk_id": None,
+                "knowledge_source_id": hit.get("knowledge_source_id"),
+                "file_path": file_path,
                 "title": hit.get("title") or f"外部知识{index}",
-                "path": hit.get("path") or hit.get("document_path") or "",
-                "heading_path": hit.get("heading_path") or hit.get("headingPath") or "",
+                "path": file_path,
+                "heading_path": heading_path,
+                "external_metadata": dict(raw_ext_meta),
                 "evidence_snippet": hit.get("evidence_snippet") or hit.get("evidenceSnippet") or "",
                 "score": float(hit.get("score") or 0),
                 "snippet": snippet,
@@ -740,17 +811,23 @@ def assemble_task_context(
 
     index_context = _build_context_index(citations, index_budget)
 
-    text_blocks = [
-        "# Wiki 结构化知识\n" + (wiki_context or "（无匹配 Wiki 页面）"),
-    ]
-    if has_external:
-        text_blocks.append(
-            "# 外部知识参考 (External Knowledge [E#])\n" + (external_context or "（无匹配外部知识）")
-        )
-    text_blocks.extend([
-        "# 原文证据\n" + (source_context or "（无匹配原文块）"),
-        "# 关联索引\n" + (index_context or "（无命中索引）"),
-    ])
+    if has_legacy_groups:
+        text_blocks = [
+            "# Wiki 结构化知识\n" + (wiki_context or "（无匹配 Wiki 页面）"),
+        ]
+        if has_external:
+            text_blocks.append(
+                "# 外部知识参考 (External Knowledge [E#])\n" + (external_context or "（无匹配外部知识）")
+            )
+        text_blocks.extend([
+            "# 原文证据\n" + (source_context or "（无匹配原文块）"),
+            "# 关联索引\n" + (index_context or "（无命中索引）"),
+        ])
+    else:
+        text_blocks = [
+            "# 外部知识参考 (External Knowledge [E#])\n" + (external_context or "（无匹配外部知识）"),
+            "# 关联索引\n" + (index_context or "（无命中索引）"),
+        ]
     result: dict[str, Any] = {
         "text": "\n\n".join(text_blocks),
         "wiki_context": wiki_context,
@@ -775,12 +852,7 @@ def assemble_task_context(
             "source_chars": source_budget,
             "external_chars": external_budget,
             "index_chars": index_budget,
-            "ratios": {
-                "wiki": ratios[0] / ratio_sum,
-                "source": ratios[1] / ratio_sum,
-                "external": (ratios[2] / ratio_sum) if has_external else 0.0,
-                "index": (ratios[3] if has_external else ratios[2]) / ratio_sum,
-            },
+            "ratios": ratio_map,
         },
     }
     if include_explain:
@@ -862,18 +934,17 @@ def _build_messages(
     ]
     if tags:
         user_parts.append(f"关注标签：{', '.join(tags)}")
-    user_parts.append("")
-    user_parts.append("# Wiki 结构化知识（摘要/规则卡片）")
-    user_parts.append(wiki_context if wiki_context.strip() else "（无匹配 Wiki 页面）")
-    if external_context.strip():
+    if wiki_context.strip():
         user_parts.append("")
-        user_parts.append("# 外部知识参考 (External Knowledge [E#])")
-        user_parts.append(external_context)
+        user_parts.append("# Wiki 结构化知识（摘要/规则卡片）")
+        user_parts.append(wiki_context)
     user_parts.append("")
-    user_parts.append("# 原文摘录（Source Chunks，请优先引用可核对的原句）")
-    user_parts.append(
-        source_context if source_context.strip() else "（无匹配原文块）"
-    )
+    user_parts.append("# 外部知识参考 (External Knowledge [E#])")
+    user_parts.append(external_context if external_context.strip() else "（无匹配外部知识）")
+    if source_context.strip():
+        user_parts.append("")
+        user_parts.append("# 原文摘录（Source Chunks，请优先引用可核对的原句）")
+        user_parts.append(source_context)
     user_parts.append("")
     user_parts.append("# 关联索引（命中元数据）")
     user_parts.append(index_context if index_context.strip() else "（无命中索引）")
@@ -934,10 +1005,17 @@ def _citations_for_point(session: Session, task_id: int, point: TestPoint) -> st
     if not rows:
         return ""
     parts: list[str] = []
+    external_index = 0
     for r in rows:
         title = r.title or "引用"
-        body = (r.snippet or r.content_excerpt or "").strip()
-        parts.append(f"[{r.citation_type}] {title} ({r.path})\n{body}")
+        if r.citation_type == "external":
+            external_index += 1
+            label = f"[E{external_index}]"
+            body = (r.content_excerpt or r.snippet or "").strip()
+        else:
+            label = f"[{r.citation_type}]"
+            body = (r.snippet or r.content_excerpt or "").strip()
+        parts.append(f"{label} {title} ({r.path})\n{body}")
     return "\n\n".join(parts)
 
 
@@ -1344,6 +1422,7 @@ def _build_review_messages(
     cite_lines: list[str] = []
     wiki_index = 0
     source_index = 0
+    external_index = 0
     for citation in citations:
         if citation.citation_type == "source":
             source_index += 1
@@ -1358,14 +1437,24 @@ def _build_review_messages(
             elif isinstance(clauses, list) and clauses:
                 metadata.append(f"含条款={','.join(str(item) for item in clauses[:8])}")
             excerpt = citation.content_excerpt or citation.snippet or ""
+        elif citation.citation_type == "external":
+            external_index += 1
+            label = f"[E{external_index}]"
+            metadata = []
+            if getattr(citation, "heading_path", None):
+                metadata.append(f"heading={citation.heading_path}")
+            if getattr(citation, "knowledge_source_id", None) is not None:
+                metadata.append(f"source_id={citation.knowledge_source_id}")
+            excerpt = citation.content_excerpt or citation.snippet or ""
         else:
             wiki_index += 1
             label = f"[{wiki_index}]"
             metadata = [f"wiki_page_id={citation.wiki_page_id}"]
             excerpt = citation.snippet or citation.content_excerpt or ""
+        meta_suffix = f" {' '.join(metadata)}" if metadata else ""
         cite_lines.append(
             f"{label} {citation.title} ({citation.path}) "
-            f"score={citation.score} {' '.join(metadata)}\n{excerpt}"
+            f"score={citation.score}{meta_suffix}\n{excerpt}"
         )
     user_parts = [
         "# 需求",
@@ -1375,7 +1464,7 @@ def _build_review_messages(
     if tags:
         user_parts.append(f"关注标签：{', '.join(tags)}")
     user_parts.append("")
-    user_parts.append("# 引用证据（Wiki [n] / 原文 [S#]，标签与生成阶段一致）")
+    user_parts.append("# 引用证据（外部知识 [E#] / Wiki [n] / 原文 [S#]，标签与生成阶段一致）")
     user_parts.append("\n\n".join(cite_lines) if cite_lines else "（无引用）")
     user_parts.append("")
     user_parts.append(f"# 用例草稿 v{draft.version}")
@@ -1828,7 +1917,7 @@ def run_generate(
         if task.status in ("draft", "failed", "regenerating"):
             _set_status(task, "retrieving")
             session.add(task)
-            append_event(session, task.id, "retrieve", "开始混合检索（Wiki + 原文块）")
+            append_event(session, task.id, "retrieve", "开始检索外部知识库")
             session.commit()
             session.refresh(task)
         elif not resume_confirmed and task.status != "retrieving":
@@ -1857,41 +1946,85 @@ def run_generate(
             )
             supplemental_text = checkpoint.supplemental_text or ""
         else:
-            task_stream.status(stream_task_id, status="retrieving", message="正在检索 Wiki 与原文证据")
+            task_stream.status(stream_task_id, status="retrieving", message="正在检索外部知识库")
             query = _build_query(requirement)
-            resolved_space_id = resolve_space_id(session, task.wiki_space_id)
-            if task.wiki_space_id is None:
-                task.wiki_space_id = resolved_space_id
-                session.add(task)
-                session.commit()
-            from app.services.hybrid_retrieve import hybrid_retrieve, project_hybrid_retrieve
-            retrieve_fn = project_hybrid_retrieve if task.project_id is not None else hybrid_retrieve
-            retrieve_scope = ({"project_id": task.project_id, "private_space_id": resolved_space_id} if task.project_id is not None else {"space_id": resolved_space_id})
-            retrieved = retrieve_fn(
-                session, query,
-                wiki_k=config.RETRIEVE_WIKI_TOP_K,
-                source_k=config.RETRIEVE_SOURCE_TOP_K,
-                top_k=config.RETRIEVE_WIKI_TOP_K + config.RETRIEVE_SOURCE_TOP_K,
-                **retrieve_scope,
-            )
-            decisions = {
-                row.conflict_key: row
-                for row in session.exec(select(ProjectKnowledgeDecision).where(ProjectKnowledgeDecision.project_id == task.project_id)).all()
-            } if task.project_id is not None else {}
-            unresolved = []
-            for conflict in retrieved.get("conflict_groups") or []:
-                decision = decisions.get(conflict.get("conflict_key"))
-                selected = next((item for item in conflict.get("candidates") or [] if decision and item.get("id") == decision.selected_page_id and item.get("revision") == decision.selected_revision), None)
-                if selected is None:
-                    unresolved.append(conflict)
-                    continue
-                candidate_ids = {item.get("id") for item in conflict.get("candidates") or []}
-                retrieved["wiki_hits"] = [item for item in retrieved.get("wiki_hits") or [] if item.get("id") not in candidate_ids or item.get("id") == selected.get("id")]
-            retrieved["conflict_groups"] = unresolved
+            if task.wiki_space_id is None and task.project_id is not None:
+                project_row = session.get(Project, task.project_id) if "Project" in globals() else None
+                if project_row is None:
+                    from app.models.entities import Project as _Project
+                    project_row = session.get(_Project, task.project_id)
+                fallback_space_id = project_row.default_wiki_space_id if project_row else None
+                if fallback_space_id is None:
+                    first_space = session.exec(
+                        select(WikiSpace)
+                        .where(WikiSpace.project_id == task.project_id, WikiSpace.scope == "project", WikiSpace.status == "active")
+                        .order_by(WikiSpace.id.asc())
+                    ).first()
+                    fallback_space_id = first_space.id if first_space else None
+                if fallback_space_id is not None:
+                    task.wiki_space_id = int(fallback_space_id)
+                    session.add(task)
+                    session.commit()
+
+            if task.project_id is not None:
+                search_res = search_project_knowledge(session, int(task.project_id), query)
+            else:
+                search_res = ProjectKnowledgeSearchResult(
+                    configured=False,
+                    empty_reason="not_configured",
+                    message="该项目未配置知识库，可联系管理员添加",
+                    hits=[],
+                    warnings=[],
+                )
+
+            status_map = {
+                "none": "ready",
+                "not_configured": "not_configured",
+                "no_hits": "no_hits",
+                "all_sources_failed": "source_error",
+            }
+            knowledge_status = status_map.get(search_res.empty_reason, "no_hits")
+            if knowledge_status == "not_configured":
+                knowledge_message = "该项目未配置知识库，可联系管理员添加"
+            elif knowledge_status == "no_hits":
+                knowledge_message = "未检索到相关内容"
+            elif knowledge_status == "source_error":
+                knowledge_message = search_res.message or "外部知识库检索失败"
+            else:
+                knowledge_message = ""
+            source_warnings = [w.model_dump() for w in search_res.warnings]
+
+            raw_external_hits = [
+                {
+                    "id": hit.chunk_id,
+                    "chunk_id": hit.chunk_id,
+                    "knowledge_source_id": hit.source_id,
+                    "source_name": hit.source_name,
+                    "provider_type": hit.provider_type,
+                    "title": hit.title,
+                    "path": hit.file_path or hit.document_path,
+                    "file_path": hit.file_path or hit.document_path,
+                    "document_path": hit.document_path,
+                    "heading_path": hit.heading_path,
+                    "page_no": hit.page_no,
+                    "score": hit.weighted_score or hit.score,
+                    "snippet": hit.snippet,
+                    "evidence_snippet": hit.evidence_snippet,
+                    "highlight_terms": hit.highlight_terms,
+                    "external_metadata": {
+                        "page_no": hit.page_no,
+                        "chunk_id": hit.chunk_id,
+                        "source_name": hit.source_name,
+                        "provider_type": hit.provider_type,
+                    },
+                }
+                for hit in search_res.hits
+            ]
+
             context = assemble_task_context(
-                retrieved.get("wiki_hits") or [],
-                retrieved.get("source_hits") or [],
-                external_hits=retrieved.get("external_hits") or [],
+                [],
+                [],
+                external_hits=raw_external_hits,
                 query=query,
                 include_explain=True,
             )
@@ -1902,62 +2035,84 @@ def run_generate(
             citation_rows = []
             for citation in context["citations"]:
                 cids = list(citation.get("clause_ids") or [])
+                ext_meta = citation.get("external_metadata") or {}
                 row = TaskCitation(
                     task_id=task.id,
-                    citation_type=citation.get("citation_type") or "wiki",
+                    citation_type=citation.get("citation_type") or "external",
                     wiki_page_id=citation.get("wiki_page_id"),
                     source_chunk_id=citation.get("source_chunk_id"),
-                    title=citation.get("title") or "", path=citation.get("path") or "",
-                    score=float(citation.get("score") or 0.0), snippet=citation.get("snippet") or "",
+                    title=citation.get("title") or "",
+                    path=citation.get("path") or "",
+                    score=float(citation.get("score") or 0.0),
+                    snippet=citation.get("snippet") or "",
                     content_excerpt=citation.get("content_excerpt") or "",
-                    clause_ids_json=json.dumps(cids, ensure_ascii=False), anchor_clause=citation.get("anchor_clause"),
+                    clause_ids_json=json.dumps(cids, ensure_ascii=False),
+                    anchor_clause=citation.get("anchor_clause"),
+                    knowledge_source_id=citation.get("knowledge_source_id"),
+                    file_path=citation.get("file_path") or citation.get("path") or None,
+                    heading_path=citation.get("heading_path") or None,
+                    external_metadata_json=(
+                        json.dumps(ext_meta, ensure_ascii=False)
+                        if (citation.get("citation_type") == "external" and ext_meta)
+                        else None
+                    ),
                 )
                 session.add(row)
                 citation_rows.append(row)
             session.flush()
             for citation, row in zip(context["citations"], citation_rows):
                 citation["task_citation_id"] = row.id
-            # ``assemble_task_context`` preserves the normalized hit order:
-            # Wiki hits first, followed by source hits, then external hits. Assign IDs by that
-            # deterministic order, never by title/snippet (duplicates are
-            # valid and must remain independently selectable).
-            wiki_count = len(wiki_hits)
-            source_count = len(source_hits)
-            for index, hit in enumerate(wiki_hits):
+            for index, hit in enumerate(external_hits):
                 if index < len(context["citations"]):
                     hit["task_citation_id"] = context["citations"][index].get("task_citation_id")
-            for index, hit in enumerate(source_hits):
-                citation_index = wiki_count + index
-                if citation_index < len(context["citations"]):
-                    hit["task_citation_id"] = context["citations"][citation_index].get("task_citation_id")
-            for index, hit in enumerate(external_hits):
-                citation_index = wiki_count + source_count + index
-                if citation_index < len(context["citations"]):
-                    hit["task_citation_id"] = context["citations"][citation_index].get("task_citation_id")
             hit_count = len(context["citations"])
             explicit_anchors = context["explicit_anchor_clause_ids"]
             append_event(
                 session,
                 task.id,
                 "retrieve",
-                f"检索完成：Wiki {len(wiki_hits)} + 原文 {len(source_hits)}"
-                + (f" + 外部 {len(external_hits)}" if external_hits else ""),
-                detail={"query": query, "hit_count": hit_count, "context_budgets": context["budgets"], "context_explain": context.get("explain")},
+                f"检索完成：外部知识 {len(external_hits)} 条",
+                detail={
+                    "query": query,
+                    "hit_count": hit_count,
+                    "knowledge_status": knowledge_status,
+                    "source_warnings": source_warnings,
+                    "context_budgets": context["budgets"],
+                    "context_explain": context.get("explain"),
+                },
             )
             if hit_count == 0:
-                append_event(session, task.id, "retrieve", "警告：未检索到 Wiki、外部知识或原文块，将仅基于需求生成")
+                append_event(
+                    session,
+                    task.id,
+                    "retrieve",
+                    knowledge_message or "未检索到外部知识，用户确认后可继续生成",
+                )
             # Store the lossless retrieval/context snapshot before asking for a decision.
             attempt = (session.exec(select(func.max(TaskRetrievalCheckpoint.attempt)).where(TaskRetrievalCheckpoint.task_id == task.id)).one() or 0) + 1
-            conflicts = checkpoint_conflicts(
-                retrieved.get("conflict_groups") or [],
-                context.get("wiki_hits") or [],
-            )
-            snapshot = {"context": context, "conflict_groups": conflicts, "requires_knowledge_decision": bool(conflicts)}
+            snapshot = {
+                "context": context,
+                "conflict_groups": [],
+                "requires_knowledge_decision": False,
+                "knowledge_status": knowledge_status,
+                "knowledge_message": knowledge_message,
+                "source_warnings": source_warnings,
+            }
             snapshot_json = json.dumps(snapshot, ensure_ascii=False, default=str)
             checkpoint = TaskRetrievalCheckpoint(task_id=task.id, attempt=int(attempt), status="pending", auto_review=auto_review, query=query, retrieval_json=snapshot_json, candidate_citation_ids_json=json.dumps([r.id for r in citation_rows]), version=1)
             session.add(checkpoint)
             _set_status(task, "awaiting_confirmation")
-            append_event(session, task.id, "retrieve", "发现知识冲突，等待选择" if conflicts else "检索完成，等待人工确认", detail={"requires_knowledge_decision": bool(conflicts), "conflict_count": len(conflicts)})
+            append_event(
+                session,
+                task.id,
+                "retrieve",
+                "检索完成，等待人工确认",
+                detail={
+                    "knowledge_status": knowledge_status,
+                    "requires_knowledge_decision": False,
+                    "conflict_count": 0,
+                },
+            )
             session.commit()
             session.refresh(task)
             task_stream.status(stream_task_id, status="awaiting_confirmation", message="检索完成，请确认引用后继续生成")
@@ -2125,10 +2280,9 @@ def run_generate(
             except LLMError as primary_exc:
                 # Gateway instability on long finance prompts: retry with the same
                 # fair allocation contract and a smaller total budget.
-                lean_cap = min(4500, max(2000, config.MAX_WIKI_CONTEXT_CHARS // 2))
                 lean_total = min(
-                    context["budgets"]["total_chars"],
-                    lean_cap + min(2500, config.MAX_SOURCE_CONTEXT_CHARS // 2 or 2500) + 500,
+                    int(context["budgets"]["total_chars"]),
+                    7500,
                 )
                 lean_context = assemble_task_context(
                     wiki_hits,

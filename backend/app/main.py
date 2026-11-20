@@ -8,18 +8,17 @@ from fastapi.responses import JSONResponse
 from sqlmodel import Session
 from starlette.responses import FileResponse
 
-from app.api.documents import router as documents_router
 from app.api.auth import router as auth_router
 from app.api.cases import router as cases_router
 from app.api.models_cfg import router as models_router
 from app.api.prompts import router as prompts_router
 from app.api.requirements import router as requirements_router
 from app.api.tasks import router as tasks_router
-from app.api.wiki import router as wiki_router
 from app.api.wiki_spaces import router as wiki_spaces_router
 from app.api.platform_data import router as platform_data_router
 from app.api.projects import router as projects_router
 from app.api.external_wikis import router as external_wikis_router
+from app.api.knowledge_sources import router as knowledge_sources_router
 from app.api.agent_chat import router as agent_chat_router
 from app.api.users import router as users_router
 from app.api.dashboard import router as dashboard_router
@@ -29,7 +28,6 @@ from app.db import get_engine, init_db
 from app.services.auth import get_user_for_token
 from app.services.permissions import current_user, is_admin, snapshot_user
 from app.services.prompts_seed import seed_default_prompts
-from app.services.wiki_jobs import recover_ingest_jobs
 from app.services.task_jobs import recover_generation_jobs
 from app.services.projects import (
     is_project_scoped_path,
@@ -67,10 +65,6 @@ def create_app() -> FastAPI:
     init_db()
     with Session(get_engine()) as session:
         seed_default_prompts(session)
-    # The durable Job table is the queue.  Recovery is idempotent and the
-    # scheduler itself has one worker, so repeated app construction does not
-    # create a second concurrent Wiki ingest worker.
-    recover_ingest_jobs()
     recover_generation_jobs()
 
     app = FastAPI(title="CaseGen API", version="0.1.0")
@@ -215,18 +209,17 @@ def create_app() -> FastAPI:
     def health():
         return {"status": "ok"}
 
-    app.include_router(documents_router)
     app.include_router(auth_router)
     app.include_router(cases_router)
     app.include_router(models_router)
     app.include_router(prompts_router)
     app.include_router(requirements_router)
     app.include_router(tasks_router)
-    app.include_router(wiki_router)
     app.include_router(wiki_spaces_router)
     app.include_router(platform_data_router)
     app.include_router(projects_router)
     app.include_router(external_wikis_router)
+    app.include_router(knowledge_sources_router)
     app.include_router(users_router)
     app.include_router(dashboard_router)
     # Agent plane (line A).  Registered last so its /api/agent prefix can never

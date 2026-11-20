@@ -16,6 +16,7 @@ from app.models.entities import (
     TestPoint as PointRow,
     TestPointCaseLink as PointCaseLink,
 )
+from app.services.knowledge_providers import KnowledgeHit, ProjectKnowledgeSearchResult
 from app.services.task_pipeline import run_generate
 
 
@@ -35,27 +36,42 @@ def _model(client: TestClient) -> int:
 
 
 def _hits(*_args, **_kwargs):
-    return {
-        "wiki_hits": [
-            {
-                "id": 101,
-                "title": "余额规则",
-                "path": "pages/balance.md",
-                "content": "余额不足时拒绝下单。",
-                "score": 0.9,
-            }
+    return ProjectKnowledgeSearchResult(
+        configured=True,
+        empty_reason="none",
+        message="",
+        hits=[
+            KnowledgeHit(
+                source_id=1,
+                source_name="外部知识库",
+                provider_type="llm_wiki_django",
+                chunk_id=101,
+                title="余额规则",
+                file_path="raw/sources/balance.docx",
+                document_path="raw/sources/balance.docx",
+                heading_path="规则 > 余额",
+                score=0.9,
+                weighted_score=0.9,
+                snippet="余额不足时拒绝下单。",
+                evidence_snippet="余额不足时拒绝下单。",
+            ),
+            KnowledgeHit(
+                source_id=1,
+                source_name="外部知识库",
+                provider_type="llm_wiki_django",
+                chunk_id=201,
+                title="余额原文",
+                file_path="raw/sources/rules.docx",
+                document_path="raw/sources/rules.docx",
+                heading_path="规则 > 原文",
+                score=0.8,
+                weighted_score=0.8,
+                snippet="原文规定余额不足不得提交订单。",
+                evidence_snippet="原文规定余额不足不得提交订单。",
+            ),
         ],
-        "source_hits": [
-            {
-                "source_chunk_id": 201,
-                "document_id": 99,
-                "title": "余额原文",
-                "path": "documents/rules.md",
-                "content": "原文规定余额不足不得提交订单。",
-                "score": 0.8,
-            }
-        ],
-    }
+        warnings=[],
+    )
 
 
 def _markdown(*, strict: bool = False) -> str:
@@ -162,7 +178,7 @@ def _start_to_points(
         markdown=markdown or _markdown(),
     )
     monkeypatch.setattr(
-        "app.services.hybrid_retrieve.hybrid_retrieve", _hits
+        "app.services.task_pipeline.search_project_knowledge", _hits
     )
     body = {
         "title": "余额不足下单",
@@ -412,7 +428,7 @@ def test_new_task_strict_finalize_and_deterministic_coverage(tmp_app_data, monke
         client,
         monkeypatch,
         model_id=model_id,
-        point_payload=_point_payload(two_points=True, citations=["1", "S1"]),
+        point_payload=_point_payload(two_points=True, citations=["E1", "E2"]),
         markdown=_markdown(strict=True),
     )
     _confirm_points(client, task_id, checkpoint, f"coverage-confirm-{task_id}")
@@ -615,7 +631,7 @@ def test_legacy_finalize_and_old_generating_recovery(tmp_app_data, monkeypatch):
     ).json()
     point = _point_payload()
     _install_hooks(monkeypatch, point_payload=point, markdown=_markdown())
-    monkeypatch.setattr("app.services.hybrid_retrieve.hybrid_retrieve", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not retrieve")))
+    monkeypatch.setattr("app.services.task_pipeline.search_project_knowledge", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not retrieve")))
     with Session(get_engine()) as session:
         row = session.get(GenerationTask, task["id"])
         assert row is not None

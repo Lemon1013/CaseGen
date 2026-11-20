@@ -59,7 +59,7 @@ export interface TaskCreate {
   prompt_template_id?: number | null
   auto_review?: boolean
   run_generate?: boolean
-  wiki_space_id?: number
+  wiki_space_id?: number | null
   generation_granularity?: 'compact' | 'standard' | 'detailed'
   test_dimensions?: string[]
   reference_case_ids?: number[]
@@ -145,6 +145,11 @@ export interface TaskCitation {
   wiki_page_id: number | null
   citation_type?: string
   source_chunk_id?: number | null
+  knowledge_source_id?: number | null
+  file_path?: string | null
+  heading_path?: string | null
+  external_metadata?: Record<string, unknown>
+  evidence_snippet?: string
   content_excerpt?: string
   clause_ids?: string[]
   anchor_clause?: string | null
@@ -152,6 +157,15 @@ export interface TaskCitation {
   legacy?: boolean
   legacy_reason?: string | null
 }
+
+export interface RetrievalSourceWarning {
+  source_id?: number
+  source_name?: string
+  category?: string
+  message: string
+}
+
+export type RetrievalKnowledgeStatus = 'ready' | 'not_configured' | 'no_hits' | 'source_error'
 
 export interface RetrievalCheckpoint {
   id: number
@@ -166,7 +180,18 @@ export interface RetrievalCheckpoint {
   idempotency_key: string | null
   created_at: string
   updated_at: string
-  conflict_groups: KnowledgeConflict[]
+  knowledge_status?: RetrievalKnowledgeStatus
+  knowledge_message?: string
+  source_warnings?: RetrievalSourceWarning[]
+  conflict_groups?: KnowledgeConflict[]
+}
+
+export interface RetrievalCheckpointConfirm {
+  selected_citation_ids: number[]
+  supplemental_text: string
+  expected_version: number
+  idempotency_key: string
+  allow_empty_context?: boolean
 }
 
 export interface KnowledgeConflictCandidate {
@@ -389,17 +414,10 @@ export function getRetrievalCheckpoint(id: number, projectId?: number | null) {
   return api<RetrievalCheckpoint>(`/api/tasks/${id}/retrieval-checkpoint${_projectQuery(projectId)}`)
 }
 
-export function confirmRetrievalCheckpoint(id: number, body: { selected_citation_ids: number[]; supplemental_text: string; expected_version: number; idempotency_key: string }) {
+export function confirmRetrievalCheckpoint(id: number, body: RetrievalCheckpointConfirm) {
   return api<TaskItem>(`/api/tasks/${id}/retrieval-checkpoint/confirm`, {
     method: 'POST',
     body: JSON.stringify(body),
-  })
-}
-
-export function saveKnowledgeDecision(taskId: number, checkpointId: number, checkpointVersion: number, conflictKey: string, selectedPageId: number, decisionScope: 'once' | 'project') {
-  return api(`/api/tasks/${taskId}/knowledge-decisions/${encodeURIComponent(conflictKey)}`, {
-    method: 'PUT',
-    body: JSON.stringify({ checkpoint_id: checkpointId, checkpoint_version: checkpointVersion, conflict_key: conflictKey, selected_page_id: selectedPageId, decision_scope: decisionScope }),
   })
 }
 

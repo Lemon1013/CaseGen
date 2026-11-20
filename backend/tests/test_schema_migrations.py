@@ -8,6 +8,7 @@ import pytest
 from sqlalchemy import create_engine, text
 
 from app.db import (
+    VERSIONED_MIGRATIONS,
     _backup_db_before_versioned_migration,
     get_applied_migrations,
     get_engine,
@@ -17,13 +18,20 @@ from app.db import (
 )
 
 
+def _expected_builtin_versions() -> list[str]:
+    return sorted(version for version, _, _ in VERSIONED_MIGRATIONS)
+
+
 def test_fresh_init_db_records_baseline_without_backup(tmp_app_data):
     db_path = tmp_app_data / "meta" / "app.db"
     assert not db_path.exists()
 
     init_db()
 
-    assert get_applied_migrations(get_engine()) == ["0001_v2_refactor_baseline"]
+    applied = get_applied_migrations(get_engine())
+    assert applied == _expected_builtin_versions()
+    assert "0001_v2_refactor_baseline" in applied
+    assert "0002_project_knowledge_sources" in applied
     assert list(db_path.parent.glob("*.pre-migration-*.bak")) == []
 
 
@@ -36,11 +44,12 @@ def test_repeated_init_db_is_idempotent(tmp_app_data):
     reset_engine()
     init_db()
 
-    assert get_applied_migrations(get_engine()) == ["0001_v2_refactor_baseline"]
+    expected = _expected_builtin_versions()
+    assert get_applied_migrations(get_engine()) == expected
     assert list(db_path.parent.glob("*.pre-migration-*.bak")) == []
     with sqlite3.connect(db_path) as conn:
         count = conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0]
-    assert count == 1
+    assert count == len(expected)
 
 
 def test_custom_migration_creates_backup_runs_once_and_preserves_pre_state(tmp_app_data):
@@ -62,19 +71,16 @@ def test_custom_migration_creates_backup_runs_once_and_preserves_pre_state(tmp_a
             conn.execute(text("ALTER TABLE legacy_items ADD COLUMN note TEXT DEFAULT 'v2'"))
 
     migrations = (
-        ("0001_v2_refactor_baseline", "Record v2 refactor baseline", lambda _e: None),
-        ("0002_test_add_col", "Add note column to legacy_items", _add_col_migration),
+        *VERSIONED_MIGRATIONS,
+        ("9901_test_add_col", "Add note column to legacy_items", _add_col_migration),
     )
 
     applied = run_versioned_migrations(engine, migrations=migrations)
-    assert applied == ["0002_test_add_col"]
+    assert applied == ["9901_test_add_col"]
     assert calls == 1
-    assert get_applied_migrations(engine) == [
-        "0001_v2_refactor_baseline",
-        "0002_test_add_col",
-    ]
+    assert get_applied_migrations(engine) == sorted([*_expected_builtin_versions(), "9901_test_add_col"])
 
-    backup_path = db_path.with_name(f"{db_path.name}.pre-migration-0002_test_add_col.bak")
+    backup_path = db_path.with_name(f"{db_path.name}.pre-migration-9901_test_add_col.bak")
     assert backup_path.is_file()
 
     # Backup must reflect pre-migration state (without note column)
@@ -108,15 +114,15 @@ def test_failed_migration_does_not_record_version_and_keeps_backup(tmp_app_data)
         raise RuntimeError("boom during migration")
 
     migrations = (
-        ("0001_v2_refactor_baseline", "Record v2 refactor baseline", lambda _e: None),
-        ("0003_failing_step", "Broken migration", _failing_migration),
+        *VERSIONED_MIGRATIONS,
+        ("9902_failing_step", "Broken migration", _failing_migration),
     )
 
     with pytest.raises(RuntimeError, match="boom during migration"):
         run_versioned_migrations(engine, migrations=migrations)
 
-    assert get_applied_migrations(engine) == ["0001_v2_refactor_baseline"]
-    backup_path = db_path.with_name(f"{db_path.name}.pre-migration-0003_failing_step.bak")
+    assert get_applied_migrations(engine) == _expected_builtin_versions()
+    backup_path = db_path.with_name(f"{db_path.name}.pre-migration-9902_failing_step.bak")
     assert backup_path.is_file()
 
 

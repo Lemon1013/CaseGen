@@ -34,7 +34,7 @@ from sqlmodel import Session, col, select
 
 from app import config
 from app.db import get_engine
-from app.models.entities import AgentConversation, AgentMessage, Project, WikiSpace
+from app.models.entities import AgentConversation, AgentMessage, Project
 from app.services import agent_gateway
 from app.services.agent_gateway import (
     AgentGatewayError,
@@ -43,8 +43,6 @@ from app.services.agent_gateway import (
 )
 from app.services.agent_skills import skill_prompt_prefix
 from app.services.agent_stream import agent_stream
-from app.services.projects import project_space_ids
-from app.services.wiki_spaces import ensure_space_dirs, space_root
 
 logger = logging.getLogger(__name__)
 
@@ -360,97 +358,31 @@ def _release_conversation(conversation_id: str) -> None:
         session.commit()
 
 
-def _knowledge_space_dirs(project_id: str) -> list[str]:
-    """Return absolute Wiki space dirs visible to this project (one short DB session)."""
-    try:
-        pid = int(str(project_id).strip())
-    except (TypeError, ValueError):
-        return []
-    try:
-        with Session(get_engine()) as session:
-            project = session.get(Project, pid)
-            try:
-                space_ids = project_space_ids(session, pid)
-            except Exception:
-                # Project deleted / inactive must not break the chat turn.
-                space_ids = []
-
-            ordered_sids: list[int] = []
-            if project is not None and project.default_wiki_space_id is not None:
-                try:
-                    pref_id = int(project.default_wiki_space_id)
-                    pref_space = session.get(WikiSpace, pref_id)
-                    if pref_space is not None and getattr(pref_space, "status", "active") == "active":
-                        ordered_sids.append(pref_id)
-                except (TypeError, ValueError):
-                    pass
-
-            for sid in space_ids:
-                try:
-                    s_id = int(sid)
-                    if s_id not in ordered_sids:
-                        ordered_sids.append(s_id)
-                except (TypeError, ValueError):
-                    pass
-
-            dirs: list[str] = []
-            for sid in ordered_sids:
-                space = session.get(WikiSpace, int(sid))
-                if space is None or getattr(space, "status", "active") != "active":
-                    continue
-                try:
-                    root = ensure_space_dirs(space)
-                except (OSError, ValueError):
-                    root = space_root(space)
-                if root.is_dir() and str(root) not in dirs:
-                    dirs.append(str(root))
-            return dirs
-    except Exception:
-        # Knowledge lookup is best-effort: never let it fail a chat turn.
-        return []
-
-
-def _knowledge_prompt_block(dirs: list[str], attachments: list[dict[str, Any]] | None = None) -> str:
+def _knowledge_prompt_block(attachments: list[dict[str, Any]] | None = None) -> str:
     attachments = attachments or []
-    blocks: list[str] = []
-    if dirs:
-        lines = "\n".join(f"- {p}" for p in dirs)
-        restriction = (
-            "严格限制：只允许在上述列出的目录及本轮附件路径内检索和阅读，不要访问其他知识空间目录（包括 data/wiki/spaces/ 下的其它空间），不要读取上述允许范围之外的任何文件，也不要把检索范围扩大到整个项目或磁盘。\n\n"
-            if attachments else
-            "严格限制：只允许在上述列出的目录内检索和阅读，不要访问其他知识空间目录（包括 data/wiki/spaces/ 下的其它空间），不要读取这些目录之外的任何文件，也不要把检索范围扩大到整个项目或磁盘。\n\n"
-        )
-        blocks.append(
-            "[知识空间]\n"
-            "本项目的知识库以 Markdown 文件存放在以下目录（只读）：\n"
-            f"{lines}\n"
-            "需要背景资料时，请自行用文件检索工具（glob / grep / read）在这些目录内查阅相关文档，不要凭空编造。\n"
-            f"{restriction}"
-        )
-    if attachments:
-        lines = "\n".join(f"- 文件名：{item.get('filename', '')}（{item.get('char_count', 0)} 字）\n  解析文本路径：{item.get('parsed_path', '')}" for item in attachments)
-        attachment_restriction = (
-            "除上述知识目录和本轮附件路径外，不得读取其它目录、整个项目或磁盘。"
-            if dirs else
-            "除本轮附件路径外，不得读取其它目录、整个项目或磁盘。"
-        )
-        blocks.append(
-            "[本轮附件]\n以下附件已上传到当前工作区，允许读取：\n"
-            + lines
-            + "\n需要时请使用文件读取工具读取上述路径；不要仅凭文件名猜测内容。"
-            + attachment_restriction
-            + "\n\n"
-        )
-    return "".join(blocks)
+    if not attachments:
+        return ""
+    lines = "\n".join(
+        f"- 文件名：{item.get('filename', '')}（{item.get('char_count', 0)} 字）\n"
+        f"  解析文本路径：{item.get('parsed_path', '')}"
+        for item in attachments
+    )
+    return (
+        "[本轮附件]\n以下附件已上传到当前工作区，允许读取：\n"
+        + lines
+        + "\n需要时请使用文件读取工具读取上述路径；不要仅凭文件名猜测内容。"
+        + "除本轮附件路径外，不得读取其它目录、整个项目或磁盘。\n\n"
+    )
 
 
 def _build_prompt(
-    user_text: str, skill_name: Optional[str], knowledge_dirs: Optional[list[str]] = None,
+    user_text: str,
+    skill_name: Optional[str],
     attachments: Optional[list[dict[str, Any]]] = None,
 ) -> str:
     return (
         skill_prompt_prefix(skill_name or "")
-        + _knowledge_prompt_block(knowledge_dirs or [], attachments or [])
+        + _knowledge_prompt_block(attachments or [])
         + ("请先阅读本轮附件，再协助进行测试设计。\n" if attachments and not (user_text or "").strip() else "")
         + (user_text or "")
     )
@@ -569,9 +501,8 @@ def run_turn(
 
         raw_user_text = inputs["prompt"] or ""
         attachments = inputs.get("attachments") or []
-        knowledge_dirs = _knowledge_space_dirs(str(inputs.get("project_id") or ""))
         prompt = (
-            _build_prompt(raw_user_text, inputs.get("skill_name"), knowledge_dirs, attachments)
+            _build_prompt(raw_user_text, inputs.get("skill_name"), attachments)
             if raw_user_text.strip() or attachments
             else ""
         )

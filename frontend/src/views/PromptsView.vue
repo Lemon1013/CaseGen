@@ -199,7 +199,7 @@ onMounted(load)
     <div class="page-header">
       <div>
         <h1 class="page-title">提示词管理</h1>
-        <p class="page-subtitle">维护生成、测试点、评审与 Wiki 编译相关模板；generate 可同时启用多条供任务选择，其他类型仅保留一条启用</p>
+        <p class="page-subtitle">维护生成、测试点、评审与优化相关模板；generate 可同时启用多条供任务选择，其他类型仅保留一条启用</p>
       </div>
       <div class="page-actions">
         <el-select

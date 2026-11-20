@@ -7,9 +7,7 @@ from app.models.entities import (
     CaseDraft,
     DataPool,
     DataPoolRevision,
-    Document,
     GenerationTask,
-    IngestJob,
     PlatformArtifact,
     PlatformRenderRun,
     Project,
@@ -18,9 +16,6 @@ from app.models.entities import (
     TestCase,
     TestCaseOperationLog,
     User,
-    WikiPageRow,
-    WikiReviewItem,
-    WikiSpace,
 )
 from app.schemas.dashboard import (
     CaseCountsOut,
@@ -182,33 +177,11 @@ def _project_counts(session: Session, now: datetime) -> ProjectCountsOut:
 
 
 def _document_counts(session: Session) -> DocumentCountsOut:
-    rows = _group_counts(session, Document.status)
-    pending_ingest = _scalar_count(
-        session,
-        select(func.count(IngestJob.id)).where(
-            IngestJob.status.in_(("queued", "running"))
-        ),
-    )
-    return DocumentCountsOut(
-        total=sum(count for _, count in rows),
-        pending_ingest=pending_ingest,
-        by_status=_status_counts(rows),
-    )
+    return DocumentCountsOut(total=0, pending_ingest=0, by_status=[])
 
 
 def _wiki_counts(session: Session) -> WikiCountsOut:
-    rows = _group_counts(session, WikiPageRow.status)
-    pending_reviews = _scalar_count(
-        session,
-        select(func.count(WikiReviewItem.id)).where(
-            WikiReviewItem.status == "pending"
-        ),
-    )
-    return WikiCountsOut(
-        pages=sum(count for _, count in rows),
-        pending_reviews=pending_reviews,
-        by_status=_status_counts(rows),
-    )
+    return WikiCountsOut(pages=0, pending_reviews=0, by_status=[])
 
 
 def _task_counts(session: Session) -> TaskCountsOut:
@@ -310,7 +283,6 @@ def _trend(session: Session, now: datetime) -> list[TrendPointOut]:
     cutoff = datetime.combine(start_date, time.min)
     tasks = _counts_by_date(session, GenerationTask, cutoff)
     cases = _counts_by_date(session, TestCase, cutoff)
-    documents = _counts_by_date(session, Document, cutoff)
     points: list[TrendPointOut] = []
     for offset in range(14):
         date_value = (start_date + timedelta(days=offset)).isoformat()
@@ -319,7 +291,7 @@ def _trend(session: Session, now: datetime) -> list[TrendPointOut]:
                 date=date_value,
                 tasks=tasks.get(date_value, 0),
                 cases=cases.get(date_value, 0),
-                documents=documents.get(date_value, 0),
+                documents=0,
             )
         )
     return points
@@ -368,54 +340,6 @@ def _recent_activity(session: Session) -> list[RecentActivityOut]:
             }
         )
 
-    document_rows = session.exec(
-        select(
-            Document.id,
-            Document.filename,
-            Document.status,
-            Document.space_id,
-            Document.created_at,
-        )
-        .order_by(Document.created_at.desc(), Document.id.desc())
-        .limit(6)
-    ).all()
-    for document_id, filename, status, space_id, created_at in document_rows:
-        candidates.append(
-            {
-                "type": "document",
-                "id": int(document_id),
-                "title": str(filename or ""),
-                "status": str(status or ""),
-                "space_id": int(space_id) if space_id is not None else None,
-                "created_at": created_at,
-            }
-        )
-
-    review_rows = session.exec(
-        select(
-            WikiReviewItem.id,
-            WikiReviewItem.reason,
-            WikiPageRow.title,
-            WikiReviewItem.status,
-            WikiReviewItem.space_id,
-            WikiReviewItem.created_at,
-        )
-        .outerjoin(WikiPageRow, WikiReviewItem.page_id == WikiPageRow.id)
-        .order_by(WikiReviewItem.created_at.desc(), WikiReviewItem.id.desc())
-        .limit(6)
-    ).all()
-    for review_id, reason, page_title, status, space_id, created_at in review_rows:
-        candidates.append(
-            {
-                "type": "review",
-                "id": int(review_id),
-                "title": str(page_title or reason or ""),
-                "status": str(status or ""),
-                "space_id": int(space_id) if space_id is not None else None,
-                "created_at": created_at,
-            }
-        )
-
     case_rows = session.exec(
         select(
             TestCase.id,
@@ -441,26 +365,6 @@ def _recent_activity(session: Session) -> list[RecentActivityOut]:
                 "created_at": created_at,
             }
         )
-
-    space_ids = {
-        item["space_id"]
-        for item in candidates
-        if item.get("space_id") is not None
-    }
-    space_projects: dict[int, int | None] = {}
-    if space_ids:
-        for space_id, project_id in session.exec(
-            select(WikiSpace.id, WikiSpace.project_id).where(
-                WikiSpace.id.in_(space_ids)
-            )
-        ).all():
-            space_projects[int(space_id)] = (
-                int(project_id) if project_id is not None else None
-            )
-
-    for item in candidates:
-        if "space_id" in item:
-            item["project_id"] = space_projects.get(item["space_id"])
 
     project_ids = {
         item["project_id"]

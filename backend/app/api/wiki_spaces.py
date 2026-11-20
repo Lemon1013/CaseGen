@@ -7,7 +7,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from app.db import get_session
-from app.models.entities import Document, IngestJob, Project, WikiPageRow, WikiReviewItem, WikiSpace
+from app.models.entities import Project, WikiSpace
 from app.schemas.wiki_spaces import (
     WikiSpaceCreate,
     WikiSpaceOut,
@@ -19,7 +19,6 @@ from app.services.wiki_spaces import (
     ACTIVE_SPACE_STATUS,
     ARCHIVED_SPACE_STATUS,
     DEFAULT_SPACE_SLUG,
-    ensure_space_dirs,
     get_default_space,
     normalize_space_slug,
     slug_from_name,
@@ -57,22 +56,6 @@ def _set_status(
                 status_code=409,
                 detail="The default Wiki space cannot be archived",
             )
-        active_job = session.exec(
-            select(IngestJob)
-            .where(
-                IngestJob.space_id == row.id,
-                IngestJob.status.in_(["queued", "running"]),
-            )
-            .order_by(IngestJob.id.desc())
-        ).first()
-        if active_job is not None:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"Wiki space has active ingest job #{active_job.id}; "
-                    "cancel it before archiving"
-                ),
-            )
         if row.scope == "project" and row.project_id is not None:
             project = session.get(Project, row.project_id)
             if project is not None and project.status == "active" and project.default_wiki_space_id == row.id:
@@ -80,9 +63,7 @@ def _set_status(
                     status_code=409,
                     detail="An active project's default Wiki space cannot be archived",
                 )
-    elif next_status == ACTIVE_SPACE_STATUS:
-        ensure_space_dirs(row)
-    else:  # The request schema should reject this; keep the service boundary strict.
+    elif next_status != ACTIVE_SPACE_STATUS:
         raise HTTPException(status_code=422, detail="Unsupported Wiki space status")
 
     row.status = next_status
@@ -170,7 +151,6 @@ def create_wiki_space(
         session.rollback()
         raise HTTPException(status_code=409, detail="Wiki space slug already exists") from exc
     session.refresh(row)
-    ensure_space_dirs(row)
     return _out(session, row)
 
 

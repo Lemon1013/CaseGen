@@ -5,14 +5,10 @@ import {
   Collection,
   Cpu,
   ChatDotRound,
-  CircleCheck,
-  Document,
   EditPen,
-  FolderOpened,
   DataAnalysis,
   Connection,
   List,
-  Reading,
   ArrowDown,
   ArrowRight,
   UserFilled,
@@ -61,25 +57,15 @@ const platformItems = [
 ]
 
 const systemItems = [
-  { path: '/spaces', label: '空间管理', icon: Grid, adminOnly: true },
+  { path: '/spaces', label: '项目管理', icon: Grid, adminOnly: true },
   { path: '/prompts', label: '提示词管理', icon: EditPen },
   { path: '/models', label: '模型配置', icon: Cpu, adminOnly: true },
   { path: '/users', label: '用户管理', icon: UserFilled, adminOnly: true },
 ]
 
-const wikiItems = [
-  { path: '/wiki', label: '知识浏览', icon: Reading, adminOnly: true },
-  { path: '/documents', label: '文档摄入', icon: Document, adminOnly: true },
-  { path: '/wiki/reviews', label: '变更审核', icon: CircleCheck, adminOnly: true },
-  { path: '/wiki-spaces', label: '知识库管理', icon: FolderOpened, adminOnly: true },
-]
-
-const wikiPaths = wikiItems.map((item) => item.path)
 const platformPaths = [...platformItems.map((item) => item.path), '/platform-adapters']
-const activeWikiPaths = computed(() => (showWikiGroup.value ? wikiPaths : []))
 const activePlatformPaths = computed(() => (showPlatformGroup.value ? platformPaths : []))
 
-const wikiExpanded = ref(false)
 const platformExpanded = ref(false)
 
 const navCollapsed = ref(localStorage.getItem('casegen:nav-collapsed') === '1')
@@ -105,15 +91,12 @@ function visible<T extends { adminOnly?: boolean }>(items: T[]): T[] {
 
 const visibleUseCaseItems = computed(() => visible(useCaseItems))
 const visiblePlatformItems = computed(() => visible(platformItems))
-const visibleWikiItems = computed(() => visible(wikiItems))
 const visibleSystemItems = computed(() => visible(systemItems))
 const showPlatformGroup = computed(() => visiblePlatformItems.value.length > 0)
-const showWikiGroup = computed(() => visibleWikiItems.value.length > 0)
 
 const allMenuItems = computed(() => [
   ...visibleUseCaseItems.value,
   ...visiblePlatformItems.value,
-  ...visibleWikiItems.value,
   ...visibleSystemItems.value,
 ])
 
@@ -134,16 +117,10 @@ const pageDescription = computed(() => {
 
 function isActive(path: string): boolean {
   if (path === '/') return route.path === '/'
-  if (path === '/wiki') return route.path === '/wiki'
   return route.path === path || route.path.startsWith(path + '/')
 }
 
-const isWikiActive = computed(() => activeWikiPaths.value.some((path) => isActive(path)))
 const isPlatformActive = computed(() => activePlatformPaths.value.some((path) => isActive(path)))
-
-function toggleWiki() {
-  wikiExpanded.value = !wikiExpanded.value
-}
 
 function togglePlatform() {
   platformExpanded.value = !platformExpanded.value
@@ -159,24 +136,9 @@ function onPlatformGroupClick() {
   togglePlatform()
 }
 
-function onWikiGroupClick() {
-  if (navCollapsed.value) {
-    navCollapsed.value = false
-    localStorage.setItem('casegen:nav-collapsed', '0')
-    wikiExpanded.value = true
-    return
-  }
-  toggleWiki()
-}
-
 watch(
   () => route.path,
   (path) => {
-    const isWikiRoute = wikiPaths.some((wikiPath) => {
-      if (wikiPath === '/wiki') return path === '/wiki'
-      return path === wikiPath || path.startsWith(wikiPath + '/')
-    })
-    if (isWikiRoute) wikiExpanded.value = true
     if (platformPaths.some((platformPath) => path === platformPath || path.startsWith(platformPath + '/'))) platformExpanded.value = true
   },
   { immediate: true },
@@ -294,39 +256,6 @@ watch(
           </div>
         </section>
 
-        <section v-if="showWikiGroup" class="nav-group wiki-group">
-          <button
-            type="button"
-            class="nav-group-toggle"
-            :class="{ active: isWikiActive }"
-            :aria-expanded="wikiExpanded"
-            aria-controls="wiki-submenu"
-            title="Wiki 知识库"
-            @click="onWikiGroupClick"
-          >
-            <el-icon class="nav-icon" :size="18"><Reading /></el-icon>
-            <span>Wiki 知识库</span>
-            <el-icon class="nav-chevron" :size="14">
-              <ArrowDown v-if="wikiExpanded" />
-              <ArrowRight v-else />
-            </el-icon>
-          </button>
-          <div v-show="wikiExpanded" id="wiki-submenu" class="nav-submenu">
-            <router-link
-              v-for="item in visibleWikiItems"
-              :key="item.path"
-              :to="{ path: item.path, query: projectQuery }"
-              class="nav-item nav-subitem"
-              :class="{ active: isActive(item.path) }"
-            >
-              <el-icon class="nav-icon" :size="17">
-                <component :is="item.icon" />
-              </el-icon>
-              <span>{{ item.label }}</span>
-            </router-link>
-          </div>
-        </section>
-
         <section class="nav-group">
           <div class="nav-group-title">系统配置</div>
           <router-link
@@ -358,7 +287,7 @@ watch(
 
       <div class="sidebar-footer">
         <div class="footer-label">Quality First</div>
-        <div class="footer-hint">文档 → Wiki → 生成 → 评审</div>
+        <div class="footer-hint">需求 → 检索 → 生成 → 评审</div>
       </div>
     </el-aside>
 

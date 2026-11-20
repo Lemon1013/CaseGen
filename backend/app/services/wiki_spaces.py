@@ -1,24 +1,16 @@
-"""Domain helpers for Wiki Space resolution and filesystem boundaries."""
+"""Domain helpers for compatibility Wiki Space shell resolution."""
 
 from __future__ import annotations
 
 import re
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import func, or_
+from sqlalchemy import or_
 from sqlmodel import Session, select
 
-from app import config
-from app.models.entities import (
-    Document,
-    Project,
-    WikiPageRow,
-    WikiReviewItem,
-    WikiSpace,
-)
+from app.models.entities import Project, WikiSpace
 
 DEFAULT_SPACE_SLUG = "default"
 DEFAULT_SPACE_NAME = "默认空间"
@@ -132,75 +124,12 @@ def space_scope_clause(session: Session, column: Any, space_id: int):
     return column == int(space_id)
 
 
-def space_root(space: WikiSpace | int | str) -> Path:
-    """Return a validated space directory below ``data/wiki/spaces``."""
-
-    slug = space.slug if isinstance(space, WikiSpace) else str(space)
-    slug = normalize_space_slug(slug)
-    root = (Path(config.WIKI_DIR) / "spaces").resolve()
-    candidate = (root / slug).resolve()
-    try:
-        candidate.relative_to(root)
-    except ValueError as exc:
-        raise ValueError("Wiki space path escapes configured Wiki root") from exc
-    return candidate
-
-
-def ensure_space_dirs(space: WikiSpace) -> Path:
-    root = space_root(space)
-    for path in (root, root / "pages", root / "sources", root / "rules", root / "entities", root / "scenarios", root / "regressions", root / "synthesis"):
-        path.mkdir(parents=True, exist_ok=True)
-    for filename, heading in (("index.md", "# Wiki Index"), ("overview.md", "# Wiki Overview"), ("log.md", "# Wiki Log")):
-        path = root / filename
-        if not path.exists():
-            path.write_text(heading + "\n\n", encoding="utf-8")
-    return root
-
-
 def space_statistics(session: Session, space: WikiSpace) -> dict[str, Any]:
-    if space.id is None:
-        return {
-            "document_count": 0,
-            "page_count": 0,
-            "pending_review_count": 0,
-            "last_updated_at": space.updated_at,
-        }
-    sid = int(space.id)
-    document_count = int(
-        session.exec(
-            select(func.count(Document.id)).where(
-                Document.space_id == sid,
-                Document.status != "deleted",
-            )
-        ).one()
-        or 0
-    )
-    page_count = int(
-        session.exec(select(func.count(WikiPageRow.id)).where(WikiPageRow.space_id == sid)).one()
-        or 0
-    )
-    pending_review_count = int(
-        session.exec(
-            select(func.count(WikiReviewItem.id)).where(
-                WikiReviewItem.space_id == sid,
-                WikiReviewItem.status == "pending",
-            )
-        ).one()
-        or 0
-    )
-    latest_values = [space.updated_at]
-    for model in (Document, WikiPageRow, WikiReviewItem):
-        column = getattr(model, "updated_at")
-        value = session.exec(
-            select(func.max(column)).where(getattr(model, "space_id") == sid)
-        ).one()
-        if value:
-            latest_values.append(value)
     return {
-        "document_count": document_count,
-        "page_count": page_count,
-        "pending_review_count": pending_review_count,
-        "last_updated_at": max(latest_values),
+        "document_count": 0,
+        "page_count": 0,
+        "pending_review_count": 0,
+        "last_updated_at": space.updated_at,
     }
 
 
@@ -226,14 +155,12 @@ __all__ = [
     "DEFAULT_SPACE_NAME",
     "DEFAULT_SPACE_SLUG",
     "SPACE_STATUSES",
-    "ensure_space_dirs",
     "get_default_space",
     "normalize_space_slug",
     "resolve_space",
     "resolve_space_id",
     "space_scope_clause",
     "slug_from_name",
-    "space_root",
     "space_statistics",
     "space_to_dict",
     "validate_space_status",
