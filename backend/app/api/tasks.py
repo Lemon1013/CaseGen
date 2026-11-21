@@ -1,16 +1,15 @@
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import re
 import secrets
-import time
 from datetime import datetime, timezone
-from typing import AsyncIterator, List, Optional
+from typing import List, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
+from sqlalchemy import and_, func
 from sqlmodel import Session, col, select
 
 from app.db import get_engine, get_session
@@ -95,9 +94,15 @@ from app.services.test_points import (
     validate_point_inputs,
     write_points,
 )
+from app.services.stream_broker import build_sse_streaming_response
 from app.services.task_state import InvalidTransition, transition
-from app.services.task_stream import encode_sse, task_stream
-from app.services.wiki_spaces import resolve_space, resolve_space_id
+from app.services.task_stream import task_stream
+from app.services.wiki_spaces import (
+    SPACE_STATUSES,
+    get_default_space,
+    resolve_space,
+    resolve_space_id,
+)
 
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
 
@@ -526,6 +531,228 @@ def to_task_out(
     )
 
 
+def _batch_to_task_out(
+    session: Session,
+    tasks: list[GenerationTask],
+    *,
+    user: Identity | None = None,
+) -> list[TaskOut]:
+    """Batch-load task relations in O(1) queries to eliminate list_tasks N+1."""
+    if not tasks:
+        return []
+
+    task_ids = [int(t.id) for t in tasks if t.id is not None]
+    requirement_ids = list({int(t.requirement_id) for t in tasks if t.requirement_id is not None})
+    wiki_space_ids = list({int(t.wiki_space_id) for t in tasks if t.wiki_space_id is not None})
+    prompt_template_ids = list(
+        {int(t.prompt_template_id) for t in tasks if t.prompt_template_id is not None}
+    )
+    finalized_draft_by_task = {
+        int(t.id): int(t.finalized_draft_id)
+        for t in tasks
+        if t.id is not None and t.finalized_draft_id is not None
+    }
+
+    req_map: dict[int, Requirement] = (
+        {
+            int(row.id): row
+            for row in session.exec(
+                select(Requirement).where(Requirement.id.in_(requirement_ids))
+            ).all()
+            if row.id is not None
+        }
+        if requirement_ids
+        else {}
+    )
+
+    space_map: dict[int, WikiSpace] = {}
+    if wiki_space_ids:
+        for row in session.exec(
+            select(WikiSpace).where(WikiSpace.id.in_(wiki_space_ids))
+        ).all():
+            if row.id is not None and row.status in SPACE_STATUSES:
+                space_map[int(row.id)] = row
+    default_space: WikiSpace | None = None
+    if any(t.wiki_space_id is None for t in tasks):
+        candidate = get_default_space(session, create=True)
+        if candidate is not None and candidate.status in SPACE_STATUSES:
+            default_space = candidate
+
+    citation_counts: dict[int, int] = (
+        {
+            int(tid): int(cnt)
+            for tid, cnt in session.exec(
+                select(TaskCitation.task_id, func.count(TaskCitation.id))
+                .where(TaskCitation.task_id.in_(task_ids))
+                .group_by(TaskCitation.task_id)
+            ).all()
+        }
+        if task_ids
+        else {}
+    )
+
+    latest_draft_map: dict[int, CaseDraft] = {}
+    if task_ids:
+        draft_subq = (
+            select(
+                CaseDraft.task_id,
+                func.max(CaseDraft.version).label("max_version"),
+            )
+            .where(CaseDraft.task_id.in_(task_ids))
+            .group_by(CaseDraft.task_id)
+            .subquery()
+        )
+        for row in session.exec(
+            select(CaseDraft).join(
+                draft_subq,
+                and_(
+                    CaseDraft.task_id == draft_subq.c.task_id,
+                    CaseDraft.version == draft_subq.c.max_version,
+                ),
+            )
+        ).all():
+            latest_draft_map[int(row.task_id)] = row
+
+    latest_review_map: dict[int, ReviewResult] = {}
+    if task_ids:
+        review_subq = (
+            select(
+                ReviewResult.task_id,
+                func.max(ReviewResult.id).label("max_id"),
+            )
+            .where(ReviewResult.task_id.in_(task_ids))
+            .group_by(ReviewResult.task_id)
+            .subquery()
+        )
+        for row in session.exec(
+            select(ReviewResult).join(
+                review_subq,
+                ReviewResult.id == review_subq.c.max_id,
+            )
+        ).all():
+            latest_review_map[int(row.task_id)] = row
+
+    ref_counts: dict[int, int] = (
+        {
+            int(tid): int(cnt)
+            for tid, cnt in session.exec(
+                select(TaskReferenceCase.task_id, func.count(TaskReferenceCase.id))
+                .where(TaskReferenceCase.task_id.in_(task_ids))
+                .group_by(TaskReferenceCase.task_id)
+            ).all()
+        }
+        if task_ids
+        else {}
+    )
+
+    test_point_counts: dict[int, int] = {}
+    if task_ids:
+        tp_cp_subq = (
+            select(
+                TaskTestPointCheckpoint.task_id,
+                func.max(TaskTestPointCheckpoint.attempt).label("max_attempt"),
+            )
+            .where(TaskTestPointCheckpoint.task_id.in_(task_ids))
+            .group_by(TaskTestPointCheckpoint.task_id)
+            .subquery()
+        )
+        test_point_counts = {
+            int(tid): int(cnt)
+            for tid, cnt in session.exec(
+                select(TaskTestPointCheckpoint.task_id, func.count(TestPoint.id))
+                .join(
+                    tp_cp_subq,
+                    and_(
+                        TaskTestPointCheckpoint.task_id == tp_cp_subq.c.task_id,
+                        TaskTestPointCheckpoint.attempt == tp_cp_subq.c.max_attempt,
+                    ),
+                )
+                .join(TestPoint, TestPoint.checkpoint_id == TaskTestPointCheckpoint.id)
+                .group_by(TaskTestPointCheckpoint.task_id)
+            ).all()
+        }
+
+    imported_case_ids_map: dict[int, list[int]] = {}
+    if finalized_draft_by_task:
+        for case_id, source_task_id, source_draft_id in session.exec(
+            select(TestCase.id, TestCase.source_task_id, TestCase.source_draft_id)
+            .where(TestCase.source_task_id.in_(list(finalized_draft_by_task.keys())))
+            .order_by(col(TestCase.case_key).asc(), col(TestCase.id).asc())
+        ).all():
+            if case_id is None or source_task_id is None:
+                continue
+            if finalized_draft_by_task.get(int(source_task_id)) == source_draft_id:
+                imported_case_ids_map.setdefault(int(source_task_id), []).append(int(case_id))
+
+    prompt_visibility: dict[int, bool] = {}
+    if prompt_template_ids:
+        prompt_rows = {
+            int(row.id): row
+            for row in session.exec(
+                select(PromptTemplate).where(PromptTemplate.id.in_(prompt_template_ids))
+            ).all()
+            if row.id is not None
+        }
+        for pid in prompt_template_ids:
+            row = prompt_rows.get(pid)
+            prompt_visibility[pid] = True if row is None else can_view_prompt(row, user)
+
+    results: list[TaskOut] = []
+    for task in tasks:
+        tid = int(task.id or 0)
+        requirement = req_map.get(int(task.requirement_id))
+        draft = latest_draft_map.get(tid)
+        snippet = (draft.content_md or "")[:240] if draft is not None else None
+        version = draft.version if draft is not None else None
+        review_row = latest_review_map.get(tid)
+        latest_review = _review_to_out(review_row) if review_row is not None else None
+        imported_ids = imported_case_ids_map.get(tid, [])
+        space = (
+            default_space
+            if task.wiki_space_id is None
+            else space_map.get(int(task.wiki_space_id))
+        )
+        visible_prompt_template_id = (
+            task.prompt_template_id
+            if (
+                task.prompt_template_id is None
+                or prompt_visibility.get(int(task.prompt_template_id), True)
+            )
+            else None
+        )
+        results.append(
+            TaskOut(
+                id=task.id,
+                requirement_id=task.requirement_id,
+                project_id=task.project_id,
+                wiki_space_id=int(space.id if space and space.id is not None else task.wiki_space_id or 0),
+                wiki_space_name=space.name if space else "",
+                status=task.status,
+                model_id=task.model_id,
+                prompt_template_id=visible_prompt_template_id,
+                error_message=task.error_message,
+                title=requirement.title if requirement else None,
+                description=requirement.description if requirement else None,
+                focus_tags=_tags_list(requirement),
+                citation_count=citation_counts.get(tid, 0),
+                latest_draft_snippet=snippet,
+                latest_draft_version=version,
+                latest_review=latest_review,
+                finalized_draft_id=task.finalized_draft_id,
+                finalized_at=task.finalized_at,
+                imported_case_ids=imported_ids,
+                imported_case_count=len(imported_ids),
+                generation_granularity=getattr(task, "generation_granularity", None) or "standard",
+                test_dimensions=task_dimensions(task),
+                reference_case_count=ref_counts.get(tid, 0),
+                test_point_count=test_point_counts.get(tid, 0),
+                created_at=task.created_at,
+                updated_at=task.updated_at,
+            )
+        )
+    return results
+
+
 @router.post("/requirement-optimize", response_model=RequirementOptimizeOut)
 def optimize_requirement_route(
     body: RequirementOptimizeRequest,
@@ -761,13 +988,8 @@ def list_tasks(
     statement = select(GenerationTask)
     if project_id is not None:
         statement = statement.where(GenerationTask.project_id == project_id)
-    rows = session.exec(statement.order_by(col(GenerationTask.id).desc())).all()
-    user = _request_user(request)
-    visibility_cache: dict[int, bool] = {}
-    return [
-        to_task_out(session, r, user=user, prompt_visibility_cache=visibility_cache)
-        for r in rows
-    ]
+    rows = list(session.exec(statement.order_by(col(GenerationTask.id).desc())).all())
+    return _batch_to_task_out(session, rows, user=_request_user(request))
 
 
 @router.get("/{task_id}/stream")
@@ -818,64 +1040,12 @@ def stream_task(task_id: int) -> StreamingResponse:
             "terminal": durable_terminal,
         }
 
-    async def event_stream() -> AsyncIterator[str]:
-        sequence = int(snapshot["sequence"])
-        stream_id = int(snapshot.get("stream_id") or 0)
-        next_heartbeat_at = time.monotonic() + _STREAM_HEARTBEAT_SEC
-        yield encode_sse("snapshot", snapshot, sequence=sequence)
-
-        if snapshot["terminal"] in {"completed", "failed"}:
-            return
-
-        # The snapshot is authoritative on every connection.  Starting after
-        # it avoids replaying deltas already represented by ``snapshot.text``;
-        # EventSource's Last-Event-ID is therefore naturally superseded by the
-        # snapshot when a client reconnects.
-        while True:
-            result = task_stream.poll_after(
-                task_id,
-                sequence,
-                stream_id=stream_id,
-            )
-            if result.kind == "missing":
-                # Eviction, expiry, deletion/recreation, or another lifecycle
-                # replacement. Closing lets EventSource reconnect and the UI's
-                # existing polling fallback remains authoritative.
-                return
-            if result.kind == "timeout":
-                now = time.monotonic()
-                if now >= next_heartbeat_at:
-                    yield ": keep-alive\n\n"
-                    next_heartbeat_at = now + _STREAM_HEARTBEAT_SEC
-                # Async polling avoids holding a Starlette worker thread while
-                # the model is generating. No database session remains open.
-                await asyncio.sleep(_STREAM_POLL_INTERVAL_SEC)
-                continue
-            if result.kind == "snapshot":
-                current = result.snapshot
-                if current is None:
-                    return
-                sequence = int(current["sequence"])
-                stream_id = int(current.get("stream_id") or stream_id)
-                yield encode_sse("snapshot", current, sequence=sequence)
-                if current.get("terminal") in {"completed", "failed"}:
-                    return
-                continue
-
-            for item in result.events:
-                sequence = item.sequence
-                yield encode_sse(item.event, item.payload, sequence=sequence)
-                if item.event in {"completed", "failed"}:
-                    return
-
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-store",
-            "X-Content-Type-Options": "nosniff",
-            "X-Accel-Buffering": "no",
-        },
+    return build_sse_streaming_response(
+        task_stream,
+        task_id,
+        initial_snapshot=snapshot,
+        poll_interval_sec=_STREAM_POLL_INTERVAL_SEC,
+        heartbeat_sec=_STREAM_HEARTBEAT_SEC,
     )
 
 

@@ -471,15 +471,16 @@ def test_generate_lean_fallback_on_primary_llm_error(tmp_app_data, monkeypatch):
 
 
 def test_strip_yaml_frontmatter_for_wiki_context():
-    from app.services.task_pipeline import _strip_yaml_frontmatter, _truncate_wiki_context
+    from app.services.task_pipeline import _strip_yaml_frontmatter, assemble_task_context
 
     raw = "---\ntitle: t\ntype: business\n---\n正文规则：9:20不可撤单\n"
     assert _strip_yaml_frontmatter(raw).startswith("正文规则")
     assert "title:" not in _strip_yaml_frontmatter(raw)
 
-    ctx = _truncate_wiki_context(
-        [{"title": "t", "path": "p.md", "content": raw}],
+    ctx = assemble_task_context(
+        [{"id": 1, "title": "t", "path": "p.md", "content": raw}],
+        [],
         max_chars=500,
     )
-    assert "正文规则" in ctx
-    assert "type: business" not in ctx
+    assert "正文规则" in ctx["wiki_context"]
+    assert "type: business" not in ctx["wiki_context"]

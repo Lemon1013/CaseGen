@@ -21,13 +21,11 @@ matching rule as defence in depth.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import shutil
-import time
 from pathlib import Path
-from typing import AsyncIterator, Optional
+from typing import Optional
 
 import httpx
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
@@ -57,7 +55,8 @@ from app.schemas.agent import (
 )
 from app.services import agent_draft, agent_attachments, agent_gateway, agent_skills, agent_turn
 from app.services.agent_gateway import AgentGatewayError
-from app.services.agent_stream import agent_stream, encode_sse
+from app.services.agent_stream import agent_stream
+from app.services.stream_broker import build_sse_streaming_response
 from app.services.case_management import CaseDraftParseError
 from app.services.permissions import current_user
 from app.services.projects import request_project_id
@@ -730,50 +729,12 @@ def stream_conversation(
             "truncated": False,
         }
 
-    async def event_stream() -> AsyncIterator[str]:
-        sequence = int(snapshot.get("sequence") or 0)
-        stream_id = int(snapshot.get("stream_id") or 0)
-        next_heartbeat_at = time.monotonic() + _STREAM_HEARTBEAT_SEC
-        yield encode_sse("snapshot", dict(snapshot), sequence=sequence)
-        if snapshot.get("terminal") in {"completed", "failed"}:
-            return
-        while True:
-            result = agent_stream.poll_after(
-                conversation_id, sequence, stream_id=stream_id
-            )
-            if result.kind == "missing":
-                # Evicted or expired: close the stream and let EventSource
-                # reconnect, where the durable status is authoritative again.
-                return
-            if result.kind == "timeout":
-                now = time.monotonic()
-                if now >= next_heartbeat_at:
-                    yield ": keep-alive\n\n"
-                    next_heartbeat_at = now + _STREAM_HEARTBEAT_SEC
-                await asyncio.sleep(_STREAM_POLL_INTERVAL_SEC)
-                continue
-            if result.kind == "snapshot":
-                current = result.snapshot or {}
-                sequence = int(current.get("sequence") or sequence)
-                stream_id = int(current.get("stream_id") or stream_id)
-                yield encode_sse("snapshot", dict(current), sequence=sequence)
-                if current.get("terminal") in {"completed", "failed"}:
-                    return
-                continue
-            for item in result.events:
-                sequence = int(item.sequence)
-                yield encode_sse(item.event, item.payload, sequence=sequence)
-                if item.event in {"completed", "failed"}:
-                    return
-
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-store",
-            "X-Content-Type-Options": "nosniff",
-            "X-Accel-Buffering": "no",
-        },
+    return build_sse_streaming_response(
+        agent_stream,
+        conversation_id,
+        initial_snapshot=snapshot,
+        poll_interval_sec=_STREAM_POLL_INTERVAL_SEC,
+        heartbeat_sec=_STREAM_HEARTBEAT_SEC,
     )
 
 

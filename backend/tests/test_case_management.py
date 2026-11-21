@@ -14,6 +14,7 @@ from app.services.case_management import (
     CaseDraftParseError,
     CaseKeyConflictError,
     find_finalize_conflicts,
+    parse_case_detail,
     split_case_draft,
     utcnow,
 )
@@ -377,3 +378,64 @@ def test_finalize_multiple_conflicts_updates_all_after_validation():
         assert all(row.revision == 2 for row in updated)
         logs = session.exec(select(_TestCaseOperationLogRow)).all()
         assert [row.operation for row in logs].count("update") == 2
+
+
+def test_parse_case_detail_extracts_pending_items_without_polluting_last_step_expected():
+    md = """## TC-010 - 大额转账风控拦截
+- 优先级：P0
+- 类型：异常
+- 关联测试点：TP-002
+- 验证目标：单笔超限转账进入风控审批
+
+### 前置条件
+- 账户余额充足且已完成实名认证
+
+### 测试步骤
+1. 输入转账金额 60000 元并提交。
+   - 预期：系统提示需要风控复核
+2. 查询当前订单状态。
+   - 预期：订单状态为待审批
+
+### 待确认项
+- 需与业务方确认节假日大额风控阈值是否上调
+- 需确认短信二次验证码超时时间（60s 或 120s）
+"""
+    sections = split_case_draft(md)
+    assert len(sections) == 1
+    detail = parse_case_detail(sections[0])
+
+    assert detail["case_key"] == "TC-010"
+    assert detail["priority"] == "P0"
+    assert len(detail["steps"]) == 2
+    assert detail["steps"][0]["expected"] == "系统提示需要风控复核"
+    assert detail["steps"][1]["expected"] == "订单状态为待审批"
+    assert "待确认项" not in detail["steps"][-1]["expected"]
+    assert "节假日" not in detail["steps"][-1]["expected"]
+    assert detail["pending_items"] == [
+        "需与业务方确认节假日大额风控阈值是否上调",
+        "需确认短信二次验证码超时时间（60s 或 120s）",
+    ]
+
+
+def test_parse_case_detail_separates_expected_block_and_pending_items():
+    md = """## TC-011 - 独立预期结果块
+- 优先级：P1
+
+### 测试步骤
+1. 提交表单
+2. 刷新页面
+
+### 预期结果
+1. 接口返回 200
+2. 页面展示已保存状态
+
+### 待确认项
+- 待确认并发提交的幂等窗口时长
+"""
+    detail = parse_case_detail(split_case_draft(md)[0])
+    assert [step["expected"] for step in detail["steps"]] == [
+        "接口返回 200",
+        "页面展示已保存状态",
+    ]
+    assert "待确认" not in detail["steps"][-1]["expected"]
+    assert detail["pending_items"] == ["待确认并发提交的幂等窗口时长"]

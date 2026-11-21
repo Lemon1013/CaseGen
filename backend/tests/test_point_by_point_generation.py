@@ -178,11 +178,9 @@ def test_point_by_point_pipeline_execution_and_links(tmp_app_data, monkeypatch):
                 "   预期结果：提示订单已进入风控人工审批流程\n"
             )
 
-    mock_pbp_chat.point_by_point = True
-
-    # 3. 运行 run_generate (指定 point_by_point=True)
+    # 3. 运行 run_generate（统一逐点生成，不再区分测试/生产分支）
     with Session(get_engine()) as session:
-        gen_task = run_generate(session, task_id, chat_fn=mock_pbp_chat, point_by_point=True)
+        gen_task = run_generate(session, task_id, chat_fn=mock_pbp_chat)
         assert gen_task.status == "generated", f"Failed with: {gen_task.error_message}"
 
     # 4. 验证调用次数为 2 次（逐点生成各调用一次）
@@ -317,10 +315,8 @@ def test_point_by_point_fallback_order_linking(tmp_app_data, monkeypatch):
             "   预期结果：步骤一通过\n"
         )
 
-    mock_chat.point_by_point = True
-
     with Session(get_engine()) as session:
-        gen_task = run_generate(session, task_id, chat_fn=mock_chat, point_by_point=True)
+        gen_task = run_generate(session, task_id, chat_fn=mock_chat)
         assert gen_task.status == "generated"
 
         links = session.exec(select(DraftTestPointLink)).all()

@@ -11,9 +11,7 @@ import { getCurrentInstance, onUnmounted, ref } from 'vue'
  * - 心跳是后端 SSE 注释行 ": keep-alive"，EventSource 自动忽略，前端无需处理；
  * - 组件卸载（onUnmounted）必须 close()，重进靠 snapshot 恢复。
  *
- * 独立编写，不重构 TaskDetailView.vue（2514 行且带用户未提交 WIP，抽取共用会冲突）；
- * 参考其 openLiveStream / scheduleLiveStreamReconnect / isCurrentLiveStream / queueLivePreviewDelta
- * 的实现范式。TaskDetailView 迁移留作 WIP 合并后的独立任务。
+ * 统一供 tasks 侧（TaskDetailView.vue）与 agent 侧（agentChatStore.ts）共用。
  */
 
 export interface SseProgress {
@@ -121,6 +119,7 @@ export interface SseStreamController {
   cancelPendingFlush: () => void
   readonly connected: { value: boolean }
   readonly connecting: { value: boolean }
+  readonly reconnecting: { value: boolean }
   readonly attempts: { value: number }
   readonly error: { value: string }
   readonly lastEvent: { value: SseEventName | null }
@@ -146,6 +145,7 @@ export function useSseStream(options: SseStreamOptions): SseStreamController {
 
   const connected = ref(false)
   const connecting = ref(false)
+  const reconnecting = ref(false)
   const attempts = ref(0)
   const error = ref('')
   const lastEvent = ref<SseEventName | null>(null)
@@ -224,6 +224,7 @@ export function useSseStream(options: SseStreamOptions): SseStreamController {
     }
     connected.value = false
     connecting.value = false
+    reconnecting.value = false
   }
 
   async function scheduleReconnect(gen: number) {
@@ -235,6 +236,7 @@ export function useSseStream(options: SseStreamOptions): SseStreamController {
       finish('exhausted')
       return
     }
+    reconnecting.value = true
     if (options.beforeReconnect) {
       let allowed = true
       try {
@@ -242,11 +244,16 @@ export function useSseStream(options: SseStreamOptions): SseStreamController {
       } catch {
         allowed = false
       }
-      if (!allowed || !isCurrent(gen, null)) {
+      if (!isCurrent(gen, null)) return
+      if (!allowed) {
         teardown()
         finish('refused')
         return
       }
+    }
+    if (options.isActive && !options.isActive()) {
+      reconnecting.value = false
+      return
     }
     attempts.value += 1
     const attempt = attempts.value
@@ -256,6 +263,7 @@ export function useSseStream(options: SseStreamOptions): SseStreamController {
     reconnectTimer = window.setTimeout(() => {
       reconnectTimer = null
       if (!isCurrent(gen, null)) return
+      reconnecting.value = false
       source = null
       openInternal(gen)
     }, delay)
@@ -384,6 +392,7 @@ export function useSseStream(options: SseStreamOptions): SseStreamController {
     if (!url) return
     if (source) return
     closed.value = false
+    reconnecting.value = false
     connecting.value = true
     const candidate = new EventSource(url)
     source = candidate
@@ -424,6 +433,7 @@ export function useSseStream(options: SseStreamOptions): SseStreamController {
     cancelPendingFlush,
     connected,
     connecting,
+    reconnecting,
     attempts,
     error,
     lastEvent,

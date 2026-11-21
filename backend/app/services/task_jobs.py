@@ -6,25 +6,27 @@ immediately after scheduling.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import logging
-import traceback
-import threading
 import secrets
+import threading
+import traceback
 from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta
-from typing import Optional
+from datetime import datetime, timedelta, timezone
+from typing import Iterator, Optional
 
-from sqlmodel import Session
+from sqlalchemy import or_, update
+from sqlmodel import Session, select
 
+from app import config
 from app.db import get_engine
 from app.models.entities import (
     CaseDraft,
     GenerationTask,
+    ReviewResult,
     TaskRetrievalCheckpoint,
     TaskTestPointCheckpoint,
 )
-from sqlalchemy import exists, update, or_
-from sqlmodel import select
 from app.services.task_events import append_event
 from app.services.task_locks import task_locks
 from app.services.task_pipeline import (
@@ -33,10 +35,50 @@ from app.services.task_pipeline import (
     run_regenerate,
     run_review,
 )
-from app.services.task_stream import task_stream
 from app.services.task_state import transition
+from app.services.task_stream import task_stream
 
 logger = logging.getLogger(__name__)
+
+# Process-wide concurrency limiter shared across background LLM jobs.
+_task_semaphore_lock = threading.Lock()
+_task_max_concurrent: int = config.TASK_MAX_CONCURRENT
+_task_concurrency_semaphore = threading.BoundedSemaphore(_task_max_concurrent)
+
+
+def get_task_semaphore() -> threading.BoundedSemaphore:
+    """Return the active process-wide concurrency semaphore for background jobs."""
+    with _task_semaphore_lock:
+        return _task_concurrency_semaphore
+
+
+def set_task_max_concurrent(limit: int) -> threading.BoundedSemaphore:
+    """Replace the global task concurrency semaphore (intended for tests/config)."""
+    global _task_max_concurrent, _task_concurrency_semaphore
+    safe_limit = max(1, int(limit))
+    with _task_semaphore_lock:
+        _task_max_concurrent = safe_limit
+        _task_concurrency_semaphore = threading.BoundedSemaphore(safe_limit)
+        return _task_concurrency_semaphore
+
+
+@contextmanager
+def _acquire_task_slot(task_id: int, *, notify_stream: bool = False) -> Iterator[None]:
+    """Acquire one global background execution slot and always release on exit."""
+    sem = get_task_semaphore()
+    if not sem.acquire(blocking=False):
+        if notify_stream:
+            snap = task_stream.snapshot(task_id)
+            if snap is not None and snap.get("terminal") is None:
+                task_stream.notice(
+                    task_id,
+                    message="当前并发任务较多，正在排队等待执行槽位…",
+                )
+        sem.acquire()
+    try:
+        yield
+    finally:
+        sem.release()
 
 
 def _utcnow() -> datetime:
@@ -74,14 +116,7 @@ def _claim_job(
     claim_token: str | None = None,
     checkpoint_kind: str = "retrieval",
 ) -> _JobClaim:
-    """Atomically verify a background job still owns its task before running.
-
-    Runs under the per-task lifecycle lock so a delete/recreate, a manual
-    status change, or a second scheduled job cannot interleave with the
-    identity check.  Long pipeline work happens after this claim is released;
-    durable writes stay protected by the pipeline state machine, and failure
-    handling revalidates ``created_at`` plus ``stream_id``.
-    """
+    """Atomically verify a background job still owns its task before running."""
     with task_locks.hold(task_id):
         snapshot = task_stream.snapshot(task_id)
         expected_stream_id = (
@@ -115,6 +150,53 @@ def _claim_job(
         )
 
 
+def _verify_claim_after_slot(
+    task_id: int,
+    claim: _JobClaim,
+    *,
+    expected_statuses: frozenset[str],
+    require_stream: bool,
+) -> bool:
+    """Re-verify task/stream ownership after waking from the concurrency semaphore.
+
+    A queued job may have been manually stopped, replaced, or moved to another
+    status while waiting for an execution slot.
+    """
+    with task_locks.hold(task_id):
+        if require_stream:
+            snapshot = task_stream.snapshot(task_id)
+            if snapshot is None or snapshot.get("terminal") is not None:
+                return False
+            if (
+                claim.expected_stream_id is not None
+                and int(snapshot.get("stream_id") or 0) != claim.expected_stream_id
+            ):
+                return False
+        with Session(get_engine()) as session:
+            task = session.get(GenerationTask, task_id)
+            if task is None or task.status not in expected_statuses:
+                return False
+            if (
+                claim.launch_created_at is not None
+                and task.created_at != claim.launch_created_at
+            ):
+                return False
+            if claim.checkpoint_id is not None:
+                checkpoint = session.get(
+                    _checkpoint_model(claim.checkpoint_kind), claim.checkpoint_id
+                )
+                if checkpoint is None or checkpoint.task_id != task_id:
+                    return False
+                if (
+                    claim.claim_token is None
+                    or checkpoint.resume_claim_token != claim.claim_token
+                ):
+                    return False
+                if checkpoint.resume_status not in (None, "claimed"):
+                    return False
+    return True
+
+
 def _consume_resume_claim(claim: _JobClaim) -> bool:
     """Atomically consume a durable lease so the same token runs once."""
     if claim.checkpoint_id is None:
@@ -127,6 +209,12 @@ def _consume_resume_claim(claim: _JobClaim) -> bool:
             .where(_checkpoint_model(claim.checkpoint_kind).status == "confirmed")
             .where(_checkpoint_model(claim.checkpoint_kind).resume_claim_token == claim.claim_token)
             .where(_checkpoint_model(claim.checkpoint_kind).resume_started_at.is_(None))
+            .where(
+                or_(
+                    _checkpoint_model(claim.checkpoint_kind).resume_status.is_(None),
+                    _checkpoint_model(claim.checkpoint_kind).resume_status == "claimed",
+                )
+            )
             .values(resume_started_at=now, resume_status="running", updated_at=now)
         )
         if result.rowcount != 1:
@@ -194,11 +282,7 @@ def _heartbeat_resume_claim(
 
 
 def _claim_auto_review(task_id: int, launch_created_at: datetime | None) -> bool:
-    """Atomically claim generated -> reviewing before running auto-review.
-
-    A replacement task that reused the same integer id has a different
-    ``created_at`` and therefore never satisfies this claim.
-    """
+    """Atomically claim generated -> reviewing before running auto-review."""
     with task_locks.hold(task_id):
         with Session(get_engine()) as session:
             task = session.get(GenerationTask, task_id)
@@ -226,13 +310,7 @@ def _mark_job_failed(
     expected_stream_id: int | None = None,
     launch_created_at: datetime | None = None,
 ) -> None:
-    """Reload and fail a busy task under its lifecycle lock.
-
-    The captured broker identity and task ``created_at`` prevent a late
-    exception handler from marking or terminating a replacement task that
-    reused the same integer id. Missing/deleted rows leave the broker
-    untouched.
-    """
+    """Reload and fail a busy task under its lifecycle lock."""
     with task_locks.hold(task_id):
         with Session(get_engine()) as session:
             task = session.get(GenerationTask, task_id)
@@ -242,9 +320,6 @@ def _mark_job_failed(
                 launch_created_at is not None
                 and task.created_at != launch_created_at
             ):
-                # The task was deleted and its id reused; this job no longer
-                # owns anything and must not touch the replacement row or its
-                # live stream.
                 return
             marked = _fail_if_stuck(session, task_id, durable_message)
         if marked and stream_message is not None and expected_stream_id is not None:
@@ -262,9 +337,10 @@ def job_generate(
     claim_token: str | None = None,
     checkpoint_kind: str = "retrieval",
 ) -> None:
+    expected_statuses = frozenset({"retrieving", "generating_test_points", "generating"})
     claim = _claim_job(
         task_id,
-        expected_statuses=frozenset({"retrieving", "generating_test_points", "generating"}),
+        expected_statuses=expected_statuses,
         require_stream=True,
         checkpoint_id=checkpoint_id,
         claim_token=claim_token,
@@ -272,55 +348,77 @@ def job_generate(
     )
     if not claim.claimed:
         return
-    if not _consume_resume_claim(claim):
-        return
-    heartbeat_stop = threading.Event()
-    heartbeat_thread = None
-    if claim.checkpoint_id is not None and claim.claim_token is not None:
-        heartbeat_thread = threading.Thread(
-            target=_heartbeat_resume_claim,
-            args=(claim.checkpoint_id, claim.claim_token, heartbeat_stop, 30.0, claim.checkpoint_kind),
-            daemon=True,
-        )
-        heartbeat_thread.start()
-    try:
-        with Session(get_engine()) as session:
-            run_generate(session, task_id, chat_fn=None, auto_review=auto_review)
-        if auto_review and _claim_auto_review(task_id, claim.launch_created_at):
-            with Session(get_engine()) as review_session:
-                run_review(review_session, task_id, chat_fn=None)
-        _finish_resume_claim(claim, "completed")
-    except Exception as exc:
-        logger.exception("background generate failed task_id=%s", task_id)
-        try:
-            _mark_job_failed(
-                task_id,
-                durable_message=(
-                    f"后台生成失败: {exc}\n{traceback.format_exc()[-500:]}"
+    with _acquire_task_slot(task_id, notify_stream=True):
+        if not _verify_claim_after_slot(
+            task_id,
+            claim,
+            expected_statuses=expected_statuses,
+            require_stream=True,
+        ):
+            return
+        if not _consume_resume_claim(claim):
+            return
+        heartbeat_stop = threading.Event()
+        if claim.checkpoint_id is not None and claim.claim_token is not None:
+            heartbeat_thread = threading.Thread(
+                target=_heartbeat_resume_claim,
+                args=(
+                    claim.checkpoint_id,
+                    claim.claim_token,
+                    heartbeat_stop,
+                    30.0,
+                    claim.checkpoint_kind,
                 ),
-                stream_message="后台生成失败，请稍后重试",
-                expected_stream_id=claim.expected_stream_id,
-                launch_created_at=claim.launch_created_at,
+                daemon=True,
             )
-        except Exception:
-            logger.exception("failed to mark task failed task_id=%s", task_id)
-    finally:
-        heartbeat_stop.set()
-        _finish_resume_claim(claim, "failed" if claim.checkpoint_id is not None else "completed")
+            heartbeat_thread.start()
+        try:
+            with Session(get_engine()) as session:
+                run_generate(session, task_id, chat_fn=None, auto_review=auto_review)
+            if auto_review and _claim_auto_review(task_id, claim.launch_created_at):
+                with Session(get_engine()) as review_session:
+                    run_review(review_session, task_id, chat_fn=None)
+            _finish_resume_claim(claim, "completed")
+        except Exception as exc:
+            logger.exception("background generate failed task_id=%s", task_id)
+            try:
+                _mark_job_failed(
+                    task_id,
+                    durable_message=(
+                        f"后台生成失败: {exc}\n{traceback.format_exc()[-500:]}"
+                    ),
+                    stream_message="后台生成失败，请稍后重试",
+                    expected_stream_id=claim.expected_stream_id,
+                    launch_created_at=claim.launch_created_at,
+                )
+            except Exception:
+                logger.exception("failed to mark task failed task_id=%s", task_id)
+        finally:
+            heartbeat_stop.set()
+            _finish_resume_claim(
+                claim, "failed" if claim.checkpoint_id is not None else "completed"
+            )
 
 
 def recover_generation_jobs() -> list[int]:
-    """Resume either stage of the durable two-checkpoint generation flow."""
+    """Recover all interrupted busy task states on process startup.
 
+    Covers:
+    - ``generating_test_points`` / ``generating``: durable checkpoint lease recovery
+    - ``retrieving``: reopen live stream and reschedule ``job_generate``
+    - ``regenerating``: reopen live stream and reschedule ``job_regenerate``
+    - ``reviewing``: reschedule ``job_review`` if a draft exists, otherwise fail safely
+    - ``optimizing``: reschedule ``job_optimize_prompt`` if a review exists, otherwise revert to ``reviewed``
+    """
     with Session(get_engine()) as session:
-        tasks = session.exec(
+        checkpoint_tasks = session.exec(
             select(GenerationTask)
             .where(GenerationTask.status.in_({"generating_test_points", "generating"}))
             .order_by(GenerationTask.id.asc())
         ).all()
         claimed_rows: list[tuple[int, int, bool, str, str]] = []
         now = _utcnow()
-        for task in tasks:
+        for task in checkpoint_tasks:
             task_id = int(task.id)
             kind = "retrieval" if task.status == "generating_test_points" else "test_points"
             model = _checkpoint_model(kind)
@@ -331,10 +429,6 @@ def recover_generation_jobs() -> list[int]:
                 .order_by(model.attempt.desc())
             )
             current = session.exec(statement).first()
-            # Old databases/tasks may be mid-generation without a test-point
-            # checkpoint.  Migrate them to the explicit test-point stage
-            # before claiming the confirmed retrieval lease; never schedule a
-            # legacy task directly into complete-case generation.
             if current is None and task.status == "generating":
                 kind = "retrieval"
                 model = TaskRetrievalCheckpoint
@@ -364,7 +458,10 @@ def recover_generation_jobs() -> list[int]:
             if (
                 current.resume_claim_token is not None
                 and current.resume_status in {"claimed", "running"}
-                and (current.resume_claimed_at is None or current.resume_claimed_at >= now - timedelta(minutes=5))
+                and (
+                    current.resume_claimed_at is None
+                    or current.resume_claimed_at >= now - timedelta(minutes=5)
+                )
             ):
                 continue
             token = secrets.token_urlsafe(24)
@@ -389,9 +486,99 @@ def recover_generation_jobs() -> list[int]:
             )
             if result.rowcount != 1:
                 continue
-            claimed_rows.append((task_id, int(current.id), bool(getattr(current, "auto_review", False)), token, kind))
+            claimed_rows.append(
+                (task_id, int(current.id), bool(getattr(current, "auto_review", False)), token, kind)
+            )
+
+        other_tasks = session.exec(
+            select(GenerationTask)
+            .where(GenerationTask.status.in_({"retrieving", "regenerating", "reviewing", "optimizing"}))
+            .order_by(GenerationTask.id.asc())
+        ).all()
+        retrieving_ids: list[int] = []
+        regenerating_ids: list[int] = []
+        reviewing_ids: list[int] = []
+        optimizing_ids: list[int] = []
+
+        for task in other_tasks:
+            task_id = int(task.id)
+            # Re-entry guard: skip tasks that still have an active in-process stream
+            # (e.g. duplicate create_app() invocations in the same process).
+            live_snap = task_stream.snapshot(task_id)
+            if live_snap is not None and live_snap.get("terminal") is None:
+                continue
+            if task.status == "retrieving":
+                append_event(
+                    session,
+                    task_id,
+                    "recovery",
+                    "进程重启恢复：重新执行知识检索",
+                )
+                retrieving_ids.append(task_id)
+            elif task.status == "regenerating":
+                append_event(
+                    session,
+                    task_id,
+                    "recovery",
+                    "进程重启恢复：重新执行再生成任务",
+                )
+                regenerating_ids.append(task_id)
+            elif task.status == "reviewing":
+                has_draft = (
+                    session.exec(
+                        select(CaseDraft.id).where(CaseDraft.task_id == task_id)
+                    ).first()
+                    is not None
+                )
+                if has_draft:
+                    append_event(
+                        session,
+                        task_id,
+                        "recovery",
+                        "进程重启恢复：重新执行用例评审",
+                    )
+                    reviewing_ids.append(task_id)
+                else:
+                    task.status = transition(task.status, "failed")
+                    task.error_message = "进程重启导致评审中断，请重试"
+                    task.updated_at = now
+                    session.add(task)
+                    append_event(
+                        session,
+                        task_id,
+                        "recovery",
+                        "进程重启导致评审中断且缺少草稿，已标记失败",
+                    )
+            elif task.status == "optimizing":
+                has_review = (
+                    session.exec(
+                        select(ReviewResult.id).where(ReviewResult.task_id == task_id)
+                    ).first()
+                    is not None
+                )
+                if has_review:
+                    append_event(
+                        session,
+                        task_id,
+                        "recovery",
+                        "进程重启恢复：重新执行提示词优化",
+                    )
+                    optimizing_ids.append(task_id)
+                else:
+                    task.status = transition(task.status, "reviewed")
+                    task.error_message = None
+                    task.updated_at = now
+                    session.add(task)
+                    append_event(
+                        session,
+                        task_id,
+                        "recovery",
+                        "进程重启恢复：缺少评审记录，已安全回退至 reviewed",
+                    )
+
         session.commit()
-    ids = [int(row[0]) for row in claimed_rows]
+
+    ids: list[int] = []
     for task_id, checkpoint_id, auto_review, token, kind in claimed_rows:
         status = "generating_test_points" if kind == "retrieval" else "generating"
         task_stream.start(task_id, status=status, message="恢复中断的生成任务")
@@ -400,20 +587,65 @@ def recover_generation_jobs() -> list[int]:
             args=(task_id, auto_review, checkpoint_id, token, kind),
             daemon=True,
         ).start()
+        ids.append(task_id)
+
+    for task_id in retrieving_ids:
+        task_stream.start(task_id, status="retrieving", message="恢复中断的检索任务")
+        threading.Thread(
+            target=job_generate,
+            args=(task_id, False),
+            daemon=True,
+        ).start()
+        ids.append(task_id)
+
+    for task_id in regenerating_ids:
+        task_stream.start(task_id, status="regenerating", message="恢复中断的再生成任务")
+        threading.Thread(
+            target=job_regenerate,
+            args=(task_id,),
+            daemon=True,
+        ).start()
+        ids.append(task_id)
+
+    for task_id in reviewing_ids:
+        threading.Thread(
+            target=job_review,
+            args=(task_id,),
+            daemon=True,
+        ).start()
+        ids.append(task_id)
+
+    for task_id in optimizing_ids:
+        threading.Thread(
+            target=job_optimize_prompt,
+            args=(task_id,),
+            daemon=True,
+        ).start()
+        ids.append(task_id)
+
     return ids
 
 
 def job_review(task_id: int) -> None:
+    expected_statuses = frozenset({"reviewing"})
     claim = _claim_job(
         task_id,
-        expected_statuses=frozenset({"reviewing"}),
+        expected_statuses=expected_statuses,
         require_stream=False,
     )
     if not claim.claimed:
         return
     try:
-        with Session(get_engine()) as session:
-            run_review(session, task_id, chat_fn=None)
+        with _acquire_task_slot(task_id, notify_stream=False):
+            if not _verify_claim_after_slot(
+                task_id,
+                claim,
+                expected_statuses=expected_statuses,
+                require_stream=False,
+            ):
+                return
+            with Session(get_engine()) as session:
+                run_review(session, task_id, chat_fn=None)
     except Exception as exc:
         logger.exception("background review failed task_id=%s", task_id)
         try:
@@ -428,16 +660,25 @@ def job_review(task_id: int) -> None:
 
 
 def job_regenerate(task_id: int) -> None:
+    expected_statuses = frozenset({"regenerating"})
     claim = _claim_job(
         task_id,
-        expected_statuses=frozenset({"regenerating"}),
+        expected_statuses=expected_statuses,
         require_stream=True,
     )
     if not claim.claimed:
         return
     try:
-        with Session(get_engine()) as session:
-            run_regenerate(session, task_id, chat_fn=None)
+        with _acquire_task_slot(task_id, notify_stream=True):
+            if not _verify_claim_after_slot(
+                task_id,
+                claim,
+                expected_statuses=expected_statuses,
+                require_stream=True,
+            ):
+                return
+            with Session(get_engine()) as session:
+                run_regenerate(session, task_id, chat_fn=None)
     except Exception as exc:
         logger.exception("background regenerate failed task_id=%s", task_id)
         try:
@@ -453,16 +694,25 @@ def job_regenerate(task_id: int) -> None:
 
 
 def job_optimize_prompt(task_id: int) -> None:
+    expected_statuses = frozenset({"optimizing"})
     claim = _claim_job(
         task_id,
-        expected_statuses=frozenset({"optimizing"}),
+        expected_statuses=expected_statuses,
         require_stream=False,
     )
     if not claim.claimed:
         return
     try:
-        with Session(get_engine()) as session:
-            run_optimize_prompt(session, task_id, chat_fn=None)
+        with _acquire_task_slot(task_id, notify_stream=False):
+            if not _verify_claim_after_slot(
+                task_id,
+                claim,
+                expected_statuses=expected_statuses,
+                require_stream=False,
+            ):
+                return
+            with Session(get_engine()) as session:
+                run_optimize_prompt(session, task_id, chat_fn=None)
     except Exception as exc:
         logger.exception("background optimize failed task_id=%s", task_id)
         try:

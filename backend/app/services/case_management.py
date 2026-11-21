@@ -573,7 +573,7 @@ def parse_case_detail(section: dict[str, Any]) -> dict[str, Any]:
 
     # 5. 提取步骤与预期 (steps)
     steps_block_match = re.search(
-        r"(?im)^###?\s*(?:测试步骤|步骤与预期|步骤)[^\n]*\n([\s\S]*?)(?=^###?\s*(?:预期结果|待定事项|待定项|备注)|\Z)",
+        r"(?im)^###?\s*(?:测试步骤|步骤与预期|步骤)[^\n]*\n([\s\S]*?)(?=^###?\s*(?:预期结果|预期断言|断言|待确认项|待确认|待定事项|待定项|待定|pending|备注)|\Z)",
         raw_md,
     )
     expected_block_match = re.search(
@@ -615,7 +615,7 @@ def parse_case_detail(section: dict[str, Any]) -> dict[str, Any]:
 
     # 6. 提取待定事项 (pending_items)
     pending_match = re.search(
-        r"(?im)^###?\s*(?:待定事项|待定项|待定|pending)[^\n]*\n([\s\S]*?)(?=^###?|\Z)",
+        r"(?im)^###?\s*(?:待确认项|待确认|待定事项|待定项|待定|pending)[^\n]*\n([\s\S]*?)(?=^###?|\Z)",
         raw_md,
     )
     pending_items: list[str] = []

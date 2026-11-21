@@ -1,4 +1,5 @@
 import { api } from './client'
+import { taskStatusLabel, taskStatusTagType } from '../utils/caseDictionaries'
 
 export interface ReviewResult {
   id: number
@@ -493,43 +494,9 @@ export function getTaskCoverage(id: number, projectId?: number | null) {
 }
 
 export function statusLabel(status: string): string {
-  const map: Record<string, string> = {
-    draft: '草稿',
-    retrieving: '检索中',
-    awaiting_confirmation: '等待确认',
-    generating_test_points: '生成测试点中',
-    awaiting_test_point_confirmation: '等待测试点确认',
-    generating: '生成中',
-    generated: '已生成',
-    reviewing: '评审中',
-    reviewed: '已评审',
-    optimizing: '优化中',
-    regenerating: '再生成中',
-    finalized: '已终版',
-    failed: '失败',
-  }
-  return map[status] || status
+  return taskStatusLabel(status)
 }
 
 export function statusTagType(status: string): '' | 'success' | 'warning' | 'info' | 'danger' {
-  switch (status) {
-    case 'finalized':
-      return 'success'
-    case 'generated':
-    case 'reviewed':
-      return 'info'
-    case 'retrieving':
-    case 'awaiting_confirmation':
-    case 'generating_test_points':
-    case 'awaiting_test_point_confirmation':
-    case 'generating':
-    case 'reviewing':
-    case 'optimizing':
-    case 'regenerating':
-      return 'warning'
-    case 'failed':
-      return 'danger'
-    default:
-      return ''
-  }
+  return taskStatusTagType(status)
 }

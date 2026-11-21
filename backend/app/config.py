@@ -10,6 +10,7 @@ LLM_DEFAULT_TIMEOUT_SEC = int(os.getenv("LLM_DEFAULT_TIMEOUT_SEC", "180"))
 RETRIEVE_TOP_K = int(os.getenv("RETRIEVE_TOP_K", "6"))
 MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "18000"))
 FINAL_SCORE_THRESHOLD = int(os.getenv("FINAL_SCORE_THRESHOLD", "80"))
+TASK_MAX_CONCURRENT = max(1, int(os.getenv("TASK_MAX_CONCURRENT", "4")))
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 ALLOWED_EXTENSIONS = {".md", ".txt", ".pdf", ".docx"}
 

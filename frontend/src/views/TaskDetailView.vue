@@ -1,60 +1,36 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { ElMessage } from 'element-plus'
 import { useProjectStore } from '../projectStore'
-import { ElMessage, ElMessageBox } from 'element-plus'
-import { Aim, CopyDocument, Document, Link, Loading, Warning } from '@element-plus/icons-vue'
-import MarkdownView from '../components/MarkdownView.vue'
-import TaskTimeline from '../components/TaskTimeline.vue'
-import CitationList from '../components/CitationList.vue'
-import ReviewCard from '../components/ReviewCard.vue'
-import { formatDateTime as formatTime } from '../utils/datetime'
-import {
-  applyPrompt,
-  finalizeTask,
-  getFinalizeConflicts,
-  generateTask,
-  getTask,
-  listCitations,
-  listDrafts,
-  listEvents,
-  listReviews,
-  listRevisions,
-  optimizePromptTask,
-  regenerateTask,
-  reviewTask,
-  shouldPollTaskStatus,
-  statusLabel,
-  statusTagType,
-  stopTask,
-  taskStreamUrl,
-  type CaseDraft,
-  type FinalizeConflict,
-  type PromptRevision,
-  type ReviewResult,
-  type TaskCitation,
-  type TaskEvent,
-  type TaskItem,
-  type TaskStreamPayload,
-  updateTaskModel,
-  confirmRetrievalCheckpoint,
-  getRetrievalCheckpoint,
-  getTestPointCheckpoint,
-  editTestPoints,
-  confirmTestPoints,
-  getTaskCoverage,
-  type RetrievalCheckpoint,
-  type TestPointCheckpoint,
-  type TestPointItem,
-  type CoverageSummary,
-} from '../api/tasks'
+import { getSession } from '../api/auth'
 import { listModels, type ModelConfig } from '../api/models'
+import {
+  getRetrievalCheckpoint, getTask, getTaskCoverage, getTestPointCheckpoint,
+  listCitations, listDrafts, listEvents, listReviews, listRevisions,
+  shouldPollTaskStatus, statusLabel, statusTagType, taskStreamUrl,
+  type CaseDraft, type CoverageSummary, type PromptRevision, type RetrievalCheckpoint,
+  type ReviewResult, type TaskCitation, type TaskEvent, type TaskItem, type TestPointCheckpoint,
+} from '../api/tasks'
+import { useSseStream, type SseStreamPayload } from '../composables/useSseStream'
+import { useDraftDepthSync } from '../composables/useDraftDepthSync'
+import { useTaskActions } from '../composables/useTaskActions'
+import { formatDateTime as formatTime } from '../utils/datetime'
+import TaskRetrievalConfirmCard from '../components/task/TaskRetrievalConfirmCard.vue'
+import TaskTestPointsEditorCard from '../components/task/TaskTestPointsEditorCard.vue'
+import TaskDraftViewerCard from '../components/task/TaskDraftViewerCard.vue'
+import TaskSidebarPanel from '../components/task/TaskSidebarPanel.vue'
+import TaskActionDialogs from '../components/task/TaskActionDialogs.vue'
 
 const route = useRoute()
 const router = useRouter()
+const projects = useProjectStore()
+
+const LIVE_STREAM_STATUSES = new Set(['retrieving', 'generating_test_points', 'generating', 'regenerating'])
+const POST_GEN_CONFIRM_DELAY_MS = 400
+const POST_GEN_CONFIRM_MAX_ATTEMPTS = 10
 
 const loading = ref(false)
-const acting = ref(false)
 const task = ref<TaskItem | null>(null)
 const drafts = ref<CaseDraft[]>([])
 const events = ref<TaskEvent[]>([])
@@ -62,195 +38,64 @@ const reviews = ref<ReviewResult[]>([])
 const revisions = ref<PromptRevision[]>([])
 const citations = ref<TaskCitation[]>([])
 const checkpoint = ref<RetrievalCheckpoint | null>(null)
-const selectedCitationIds = ref<number[]>([])
-const supplementalText = ref('')
-const confirmingCheckpoint = ref(false)
-const expandedCitations = reactive(new Set<number>())
-
-function toggleCitation(id: number) {
-  if (expandedCitations.has(id)) expandedCitations.delete(id)
-  else expandedCitations.add(id)
-}
-
 const testPointCheckpoint = ref<TestPointCheckpoint | null>(null)
-const testPoints = ref<TestPointItem[]>([])
-const confirmingTestPoints = ref(false)
 const coverage = ref<CoverageSummary | null>(null)
 const models = ref<ModelConfig[]>([])
 const activeDraftTab = ref('')
 const draftViewMode = ref<'structured' | 'markdown'>('structured')
-const activePointNames = ref<string[]>([])
 
-const liveProgressInfo = computed(() => {
-  const match = /\[(\d+)\/(\d+)\]/.exec(liveStageMessage.value || '')
-  if (match) {
-    const current = parseInt(match[1], 10)
-    const total = parseInt(match[2], 10)
-    const percent = total > 0 ? Math.min(100, Math.round((current / total) * 100)) : 0
-    return { current, total, percent, active: true }
-  }
-  return { current: 0, total: 0, percent: 0, active: false }
-})
-
-watch(
-  () => drafts.value,
-  (newDrafts) => {
-    if (newDrafts.length > 0) {
-      const active = newDrafts.find((d) => String(d.id) === activeDraftTab.value) || newDrafts[0]
-      if (active?.points_with_cases) {
-        activePointNames.value = active.points_with_cases.map((g) => g.stable_key)
-      }
-    }
-  },
-  { immediate: true, deep: true }
-)
-
-watch(
-  () => activeDraftTab.value,
-  (tab) => {
-    const active = drafts.value.find((d) => String(d.id) === tab)
-    if (active?.points_with_cases) {
-      activePointNames.value = active.points_with_cases.map((g) => g.stable_key)
-    }
-  }
-)
-
-async function copyCaseMarkdown(rawMd: string) {
-  try {
-    await navigator.clipboard.writeText(rawMd)
-    ElMessage.success('用例 Markdown 已成功复制到剪贴板')
-  } catch {
-    const ta = document.createElement('textarea')
-    ta.value = rawMd
-    ta.style.position = 'fixed'
-    ta.style.opacity = '0'
-    document.body.appendChild(ta)
-    ta.select()
-    document.execCommand('copy')
-    document.body.removeChild(ta)
-    ElMessage.success('用例 Markdown 已成功复制到剪贴板')
-  }
-}
-
-function dimensionTagType(dim?: string): 'primary' | 'success' | 'warning' | 'danger' | 'info' {
-  const d = (dim || '').toLowerCase()
-  if (d.includes('positive') || d.includes('正向') || d.includes('主流程')) return 'primary'
-  if (d.includes('boundary') || d.includes('边界')) return 'warning'
-  if (d.includes('negative') || d.includes('异常') || d.includes('容错')) return 'danger'
-  if (d.includes('permission') || d.includes('auth') || d.includes('权限')) return 'info'
-  return 'info'
-}
-
-function priorityTagType(priority?: string): 'danger' | 'warning' | 'primary' | 'info' {
-  const p = (priority || '').toUpperCase()
-  if (p === 'P0') return 'danger'
-  if (p === 'P1') return 'warning'
-  if (p === 'P2') return 'info'
-  return 'info'
-}
-
-const dimensionLabelMap = new Map<string, string>([
-  ['positive', '正向'], ['negative', '反向'], ['boundary', '边界'],
-  ['permission', '权限'], ['security', '安全'], ['compatibility', '兼容性'],
-  ['performance', '性能'], ['recovery', '恢复'], ['usability', '可用性'],
-])
-
-function dimensionLabel(value: string): string {
-  return dimensionLabelMap.get(value) || value
-}
-
-function getCitationTitle(id: number): string {
-  const c = citations.value.find((item) => item.id === id)
-  return c?.title || `引用 #${id}`
-}
-
-const applyDialogVisible = ref(false)
-const selectedRevision = ref<PromptRevision | null>(null)
-const alsoRegenerate = ref(true)
-const editedPromptContent = ref('')
-const retryModelId = ref<number | null>(null)
 const livePreviewText = ref('')
 const liveStageMessage = ref('')
 const liveStageStatus = ref('')
 const liveStreamError = ref('')
-const liveStreamConnected = ref(false)
-const liveStreamConnecting = ref(false)
 
 let pollTimer: number | null = null
-let liveStreamSource: EventSource | null = null
 let liveStreamTaskId: number | null = null
-let liveStreamReconnectTimer: number | null = null
-let liveStreamReconnectAttempts = 0
-let livePreviewDeltaBuffer = ''
-let livePreviewBufferTaskId: number | null = null
-let livePreviewFlushFrame: number | null = null
-let postGenerationConfirmTimer: number | null = null
-let postGenerationConfirmTaskId: number | null = null
-let postGenerationConfirmAttempts = 0
-let postGenerationConfirmEpoch = 0
+let streamAuthFailed = false
+let postGenTimer: number | null = null
+let postGenTaskId: number | null = null
+let postGenAttempts = 0
+let postGenEpoch = 0
 let dataRequestSequence = 0
 let latestAppliedDataRequest = 0
 let refreshInFlightSequence: number | null = null
 let loadSequence = 0
-
-const LIVE_STREAM_STATUSES = new Set(['retrieving', 'generating_test_points', 'generating', 'regenerating'])
-const LIVE_STREAM_MAX_RECONNECTS = 3
-const POST_GENERATION_CONFIRM_DELAY_MS = 400
-const POST_GENERATION_CONFIRM_ATTEMPTS = 10
+let isUnmounted = false
 
 const taskId = computed(() => Number(route.params.id))
 
-// Project-scoped APIs require the current project id. Prefer the URL query,
-// then fall back to the active project store / last used project.
-const projects = useProjectStore()
 const projectId = computed(() => {
   const fromQuery = Number(route.query.project_id)
   if (Number.isInteger(fromQuery) && fromQuery > 0) return fromQuery
-  const fromStore = projects.state.currentId
-  if (fromStore) return fromStore
+  if (projects.state.currentId) return projects.state.currentId
   const stored = Number(localStorage.getItem('casegen:last-project-id'))
   return Number.isInteger(stored) && stored > 0 ? stored : null
 })
 
-const isBusy = computed(() =>
-  shouldPollTaskStatus(task.value?.status),
-)
-
+const isBusy = computed(() => shouldPollTaskStatus(task.value?.status))
 const isLiveGeneration = computed(() =>
   Boolean(task.value && task.value.id === taskId.value && LIVE_STREAM_STATUSES.has(task.value.status)),
 )
-
-const showLivePreview = computed(() =>
-  Boolean(livePreviewText.value || liveStreamConnected.value || liveStreamConnecting.value),
+const showEmptyCitationBanner = computed(() =>
+  Boolean(
+    task.value
+    && citations.value.length === 0
+    && ['generated', 'reviewed', 'finalized', 'regenerating'].includes(task.value.status),
+  ),
 )
-
-const showEmptyCitationBanner = computed(() => {
-  if (!task.value) return false
-  const s = task.value.status
-  return (
-    citations.value.length === 0 &&
-    ['generated', 'reviewed', 'finalized', 'regenerating'].includes(s)
-  )
-})
-
-const pendingRevisions = computed(() =>
-  revisions.value.filter((r) => r.status === 'pending'),
-)
-
-const latestReview = computed(
-  () => task.value?.latest_review || reviews.value[0] || null,
-)
-
+const pendingRevisions = computed(() => revisions.value.filter((r) => r.status === 'pending'))
+const latestReview = computed(() => task.value?.latest_review || reviews.value[0] || null)
 const highlightFinal = computed(() => {
   if (!task.value || task.value.status === 'finalized') return false
-  const r = latestReview.value
-  if (!r) return false
-  return Boolean(r.payload?.ready_for_final) || r.score >= 80
+  const review = latestReview.value
+  return Boolean(review && (review.payload?.ready_for_final || review.score >= 80))
 })
 
-function formatCoverage(value: number): string {
-  return `${value}%`
-}
+const { draftScrollStyle, scheduleSyncDraftDepth } = useDraftDepthSync([
+  draftViewMode,
+  () => activeDraftTab.value,
+  () => drafts.value.length,
+])
 
 function nextDataRequest(): number {
   dataRequestSequence += 1
@@ -258,6 +103,7 @@ function nextDataRequest(): number {
 }
 
 function canApplyDataRequest(id: number, sequence: number): boolean {
+  if (isUnmounted) return false
   return id === taskId.value && sequence >= latestAppliedDataRequest
 }
 
@@ -269,246 +115,152 @@ function invalidatePendingDataReads() {
   markDataRequestApplied(nextDataRequest())
 }
 
-function applyTaskUpdate(updated: TaskItem) {
+function applyTaskUpdate(updated: TaskItem): boolean {
+  if (isUnmounted || updated.id !== taskId.value) return false
   invalidatePendingDataReads()
   task.value = updated
+  return true
 }
 
-function hydrateRetrievalEditor(fresh: RetrievalCheckpoint) {
-  const changed = !checkpoint.value
-    || checkpoint.value.id !== fresh.id
-    || checkpoint.value.version !== fresh.version
-  checkpoint.value = fresh
-  if (!changed) return
-  selectedCitationIds.value = fresh.selected_citation_ids.length
-    ? [...fresh.selected_citation_ids]
-    : fresh.candidate_citations.map((item) => item.id)
-  supplementalText.value = fresh.supplemental_text || ''
+function applyTestPointCheckpointUpdate(saved: TestPointCheckpoint): boolean {
+  if (isUnmounted || saved.task_id !== taskId.value) return false
+  invalidatePendingDataReads()
+  testPointCheckpoint.value = saved
+  return true
 }
 
-function hydrateTestPointEditor(fresh: TestPointCheckpoint) {
-  const changed = !testPointCheckpoint.value
-    || testPointCheckpoint.value.id !== fresh.id
-    || testPointCheckpoint.value.version !== fresh.version
-  testPointCheckpoint.value = fresh
-  if (changed) testPoints.value = fresh.points.map((item) => ({ ...item }))
+async function fetchTaskBundle(id: number) {
+  const [t, d, e, rev, revs, c] = await Promise.all([
+    getTask(id, projectId.value),
+    listDrafts(id, projectId.value),
+    listEvents(id, projectId.value),
+    listReviews(id, projectId.value),
+    listRevisions(id, projectId.value),
+    listCitations(id, projectId.value),
+  ])
+  const retrievalFresh = t.status === 'awaiting_confirmation'
+    ? await getRetrievalCheckpoint(id, projectId.value)
+    : null
+  const testPointFresh = t.status === 'awaiting_test_point_confirmation'
+    ? await getTestPointCheckpoint(id, projectId.value).catch(() => null)
+    : null
+  const coverageFresh = await getTaskCoverage(id, projectId.value).catch(() => null)
+  return { t, d, e, rev, revs, c, retrievalFresh, testPointFresh, coverageFresh }
 }
 
-function syncCheckpointEditors(
-  status: string,
-  retrievalFresh: RetrievalCheckpoint | null,
-  testPointFresh: TestPointCheckpoint | null,
-) {
-  if (status === 'awaiting_confirmation' && retrievalFresh) {
-    hydrateRetrievalEditor(retrievalFresh)
-  } else {
-    checkpoint.value = null
-    selectedCitationIds.value = []
-    supplementalText.value = ''
-  }
-
-  if (status === 'awaiting_test_point_confirmation' && testPointFresh) {
-    hydrateTestPointEditor(testPointFresh)
-  } else {
-    testPointCheckpoint.value = null
-    testPoints.value = []
+function applyBundle(bundle: Awaited<ReturnType<typeof fetchTaskBundle>>, keepActiveIfPresent: boolean) {
+  task.value = bundle.t
+  drafts.value = bundle.d
+  events.value = bundle.e
+  reviews.value = bundle.rev
+  revisions.value = bundle.revs
+  citations.value = bundle.c
+  checkpoint.value = bundle.t.status === 'awaiting_confirmation' ? bundle.retrievalFresh : null
+  testPointCheckpoint.value = bundle.t.status === 'awaiting_test_point_confirmation' ? bundle.testPointFresh : null
+  coverage.value = bundle.coverageFresh
+  if (!bundle.d.length) return
+  if (!keepActiveIfPresent) {
+    if (!activeDraftTab.value) activeDraftTab.value = String(bundle.d[0].id)
+  } else if (!bundle.d.some((x) => String(x.id) === activeDraftTab.value)) {
+    activeDraftTab.value = String(bundle.d[0].id)
   }
 }
 
 async function loadAll() {
+  if (isUnmounted) return
   const id = taskId.value
   if (!id || Number.isNaN(id)) return
   const requestSequence = nextDataRequest()
   const currentLoadSequence = ++loadSequence
   loading.value = true
   try {
-    const [t, d, e, rev, revs, c, modelRows] = await Promise.all([
-      getTask(id, projectId.value),
-      listDrafts(id, projectId.value),
-      listEvents(id, projectId.value),
-      listReviews(id, projectId.value),
-      listRevisions(id, projectId.value),
-      listCitations(id, projectId.value),
+    const [bundle, modelRows] = await Promise.all([
+      fetchTaskBundle(id),
       listModels().catch(() => [] as ModelConfig[]),
     ])
-    const retrievalFresh = t.status === 'awaiting_confirmation'
-      ? await getRetrievalCheckpoint(id, projectId.value)
-      : null
-    const testPointFresh = t.status === 'awaiting_test_point_confirmation'
-      ? await getTestPointCheckpoint(id, projectId.value).catch(() => null)
-      : null
-    const coverageFresh = await getTaskCoverage(id, projectId.value).catch(() => null)
     if (!canApplyDataRequest(id, requestSequence)) return
     markDataRequestApplied(requestSequence)
-    task.value = t
-    drafts.value = d
-    events.value = e
-    reviews.value = rev
-    revisions.value = revs
-    citations.value = c
-    syncCheckpointEditors(t.status, retrievalFresh, testPointFresh)
-    coverage.value = coverageFresh
+    applyBundle(bundle, false)
     models.value = modelRows
-    retryModelId.value =
-      t.model_id ?? modelRows.find((model) => model.is_default)?.id ?? modelRows[0]?.id ?? null
-    if (!activeDraftTab.value && d.length) {
-      activeDraftTab.value = String(d[0].id)
-    }
+    nextTick(scheduleSyncDraftDepth)
   } catch (err) {
     if (canApplyDataRequest(id, requestSequence)) {
       ElMessage.error(`加载任务失败：${(err as Error).message}`)
     }
   } finally {
-    if (id === taskId.value && currentLoadSequence === loadSequence) loading.value = false
-  }
-}
-
-const allowEmptyRetrievalConfirm = computed(() => {
-  if (!checkpoint.value) return false
-  return (
-    checkpoint.value.candidate_citations.length === 0 ||
-    (checkpoint.value.knowledge_status != null && checkpoint.value.knowledge_status !== 'ready')
-  )
-})
-
-async function confirmCheckpoint() {
-  if (!task.value || !checkpoint.value || confirmingCheckpoint.value) return
-  if (!allowEmptyRetrievalConfirm.value && !selectedCitationIds.value.length && !supplementalText.value.trim()) {
-    ElMessage.warning('至少选择一条引用或填写补充上下文')
-    return
-  }
-  confirmingCheckpoint.value = true
-  try {
-    const updated = await confirmRetrievalCheckpoint(task.value.id, {
-      selected_citation_ids: selectedCitationIds.value,
-      supplemental_text: supplementalText.value,
-      expected_version: checkpoint.value.version,
-      idempotency_key: `task-${task.value.id}-checkpoint-${checkpoint.value.id}-v${checkpoint.value.version}`,
-      allow_empty_context: selectedCitationIds.value.length === 0,
-    })
-    applyTaskUpdate(updated)
-    await refreshLight(true)
-  } catch (err) {
-    ElMessage.error(`确认失败：${(err as Error).message}`)
-  } finally {
-    confirmingCheckpoint.value = false
+    if (!isUnmounted && id === taskId.value && currentLoadSequence === loadSequence) loading.value = false
   }
 }
 
 async function refreshLight(force = false): Promise<boolean> {
+  if (isUnmounted) return false
   const id = taskId.value
   if (!id || Number.isNaN(id)) return false
   if (refreshInFlightSequence !== null && !force) return false
   const requestSequence = nextDataRequest()
   refreshInFlightSequence = requestSequence
   try {
-    const [t, d, e, rev, revs, c] = await Promise.all([
-      getTask(id, projectId.value),
-      listDrafts(id, projectId.value),
-      listEvents(id, projectId.value),
-      listReviews(id, projectId.value),
-      listRevisions(id, projectId.value),
-      listCitations(id, projectId.value),
-    ])
-    const retrievalFresh = t.status === 'awaiting_confirmation'
-      ? await getRetrievalCheckpoint(id, projectId.value)
-      : null
-    const testPointFresh = t.status === 'awaiting_test_point_confirmation'
-      ? await getTestPointCheckpoint(id, projectId.value).catch(() => null)
-      : null
-    const coverageFresh = await getTaskCoverage(id, projectId.value).catch(() => null)
+    const bundle = await fetchTaskBundle(id)
     if (!canApplyDataRequest(id, requestSequence)) return false
     markDataRequestApplied(requestSequence)
-    task.value = t
-    drafts.value = d
-    events.value = e
-    reviews.value = rev
-    revisions.value = revs
-    citations.value = c
-    syncCheckpointEditors(t.status, retrievalFresh, testPointFresh)
-    coverage.value = coverageFresh
-    if (d.length && !d.some((x) => String(x.id) === activeDraftTab.value)) {
-      activeDraftTab.value = String(d[0].id)
-    }
+    applyBundle(bundle, true)
     return true
   } catch {
-    // keep polling; surface hard errors on manual actions
     return false
   } finally {
     if (refreshInFlightSequence === requestSequence) refreshInFlightSequence = null
   }
 }
 
-function addTestPoint() {
-  const next = testPoints.value.length + 1
-  testPoints.value.push({
-    id: -Date.now(), task_id: taskId.value, checkpoint_id: testPointCheckpoint.value?.id || 0,
-    stable_key: `TP-${String(next).padStart(3, '0')}`, title: '', verification_goal: '',
-    dimension: task.value?.test_dimensions?.[0] || 'positive', priority: 'P1', sort_order: next - 1,
-    is_selected: true, is_excluded: false, citation_ids: [], created_at: '', updated_at: '',
-  })
-}
-
-function removeTestPoint(index: number) {
-  testPoints.value.splice(index, 1)
-  testPoints.value.forEach((item, itemIndex) => { item.sort_order = itemIndex })
-}
-
-function pointPayload() {
-  return testPoints.value.map((item, index) => ({
-    stable_key: item.stable_key,
-    title: item.title,
-    verification_goal: item.verification_goal,
-    dimension: item.dimension,
-    priority: item.priority,
-    sort_order: index,
-    is_selected: item.is_selected,
-    is_excluded: item.is_excluded,
-    citation_ids: item.citation_ids,
-  }))
-}
-
-async function saveTestPoints() {
-  if (!testPointCheckpoint.value) return
-  confirmingTestPoints.value = true
-  try {
-    const saved = await editTestPoints(taskId.value, {
-      expected_version: testPointCheckpoint.value.version,
-      points: pointPayload(),
-    })
-    invalidatePendingDataReads()
-    testPointCheckpoint.value = saved
-    testPoints.value = saved.points.map((item) => ({ ...item }))
-    ElMessage.success('测试点编辑已保存')
-  } catch (err) {
-    ElMessage.error(`保存测试点失败：${(err as Error).message}`)
-  } finally {
-    confirmingTestPoints.value = false
-  }
-}
-
-async function confirmTestPointStage() {
-  if (!task.value || !testPointCheckpoint.value) return
-  confirmingTestPoints.value = true
-  try {
-    const updated = await confirmTestPoints(task.value.id, {
-      expected_version: testPointCheckpoint.value.version,
-      idempotency_key: `task-${task.value.id}-test-points-${testPointCheckpoint.value.id}-v${testPointCheckpoint.value.version}`,
-      points: pointPayload(),
-    })
-    applyTaskUpdate(updated)
-    await refreshLight(true)
-    ElMessage.success('测试点已确认，开始生成完整用例')
-  } catch (err) { ElMessage.error(`确认测试点失败：${(err as Error).message}`) }
-  finally { confirmingTestPoints.value = false }
-}
+const {
+  acting,
+  confirmingCheckpoint,
+  confirmingTestPoints,
+  applyDialogVisible,
+  selectedRevision,
+  retryModelDialogVisible,
+  finalizeConflictDialogVisible,
+  finalizeConflicts,
+  resetDialogState,
+  confirmCheckpoint,
+  saveTestPoints,
+  confirmTestPointStage,
+  onGenerate,
+  onReview,
+  onOptimize,
+  onStopGeneration,
+  onRegenerate,
+  onFinalize,
+  confirmFinalizeOverwrite,
+  onRetryFailed,
+  onSwitchModelAndRetry,
+  openApplyDialog,
+  confirmApply,
+} = useTaskActions({
+  taskId,
+  projectId,
+  task,
+  events,
+  revisions,
+  pendingRevisions,
+  checkpoint,
+  testPointCheckpoint,
+  activeDraftTab,
+  applyTaskUpdate,
+  applyTestPointCheckpointUpdate,
+  invalidatePendingDataReads,
+  refreshLight,
+})
 
 function startPolling() {
   stopPolling()
+  if (isUnmounted) return
   pollTimer = window.setInterval(() => {
-    if (shouldPollTaskStatus(task.value?.status)) {
-      void refreshLight()
+    if (isUnmounted) {
+      stopPolling()
+      return
     }
+    if (shouldPollTaskStatus(task.value?.status)) void refreshLight()
   }, 2000)
 }
 
@@ -520,648 +272,243 @@ function stopPolling() {
 }
 
 function cancelPostGenerationConfirmation() {
-  postGenerationConfirmEpoch += 1
-  if (postGenerationConfirmTimer != null) {
-    clearTimeout(postGenerationConfirmTimer)
-    postGenerationConfirmTimer = null
+  postGenEpoch += 1
+  if (postGenTimer != null) {
+    clearTimeout(postGenTimer)
+    postGenTimer = null
   }
-  postGenerationConfirmTaskId = null
-  postGenerationConfirmAttempts = 0
+  postGenTaskId = null
+  postGenAttempts = 0
 }
 
-function shouldStopPostGenerationConfirmation(status?: string) {
-  return ['reviewing', 'optimizing', 'reviewed', 'failed', 'finalized'].includes(status || '')
+function shouldStopPostGen(status?: string) {
+  return [
+    'reviewing',
+    'optimizing',
+    'reviewed',
+    'failed',
+    'finalized',
+    'awaiting_confirmation',
+    'awaiting_test_point_confirmation',
+  ].includes(status || '')
 }
 
 function startPostGenerationConfirmation(id: number) {
   cancelPostGenerationConfirmation()
-  if (id !== taskId.value || task.value?.id !== id || shouldStopPostGenerationConfirmation(task.value.status)) {
-    return
-  }
-  const epoch = ++postGenerationConfirmEpoch
-  postGenerationConfirmTaskId = id
+  if (isUnmounted || id !== taskId.value || task.value?.id !== id || shouldStopPostGen(task.value.status)) return
+  const epoch = ++postGenEpoch
+  postGenTaskId = id
+  const isStale = () =>
+    isUnmounted || epoch !== postGenEpoch || postGenTaskId !== id || id !== taskId.value || task.value?.id !== id
 
   const confirmStatus = async () => {
-    if (
-      epoch !== postGenerationConfirmEpoch ||
-      postGenerationConfirmTaskId !== id ||
-      id !== taskId.value ||
-      task.value?.id !== id
-    ) {
-      return
-    }
-
+    if (isStale()) return
     await refreshLight()
-    if (
-      epoch !== postGenerationConfirmEpoch ||
-      postGenerationConfirmTaskId !== id ||
-      id !== taskId.value ||
-      task.value?.id !== id
-    ) {
-      return
-    }
-
-    const status = task.value.status
+    if (isStale()) return
+    const status = task.value!.status
     if (status === 'reviewing' || status === 'optimizing') {
       startPolling()
       cancelPostGenerationConfirmation()
       return
     }
-    if (['reviewed', 'failed', 'finalized'].includes(status)) {
+    if (shouldStopPostGen(status) || postGenAttempts >= POST_GEN_CONFIRM_MAX_ATTEMPTS) {
       cancelPostGenerationConfirmation()
       return
     }
-    if (postGenerationConfirmAttempts >= POST_GENERATION_CONFIRM_ATTEMPTS) {
-      cancelPostGenerationConfirmation()
-      return
-    }
-
-    postGenerationConfirmAttempts += 1
-    postGenerationConfirmTimer = window.setTimeout(() => {
-      postGenerationConfirmTimer = null
+    postGenAttempts += 1
+    postGenTimer = window.setTimeout(() => {
+      postGenTimer = null
       void confirmStatus()
-    }, POST_GENERATION_CONFIRM_DELAY_MS)
+    }, POST_GEN_CONFIRM_DELAY_MS)
   }
 
-  postGenerationConfirmTimer = window.setTimeout(() => {
-    postGenerationConfirmTimer = null
+  postGenTimer = window.setTimeout(() => {
+    postGenTimer = null
     void confirmStatus()
-  }, POST_GENERATION_CONFIRM_DELAY_MS)
+  }, POST_GEN_CONFIRM_DELAY_MS)
 }
 
-function isCurrentLiveStream(source: EventSource, id: number) {
-  return source === liveStreamSource && id === liveStreamTaskId && id === taskId.value
-}
-
-function cancelLivePreviewFlush() {
-  if (livePreviewFlushFrame != null) {
-    cancelAnimationFrame(livePreviewFlushFrame)
-    livePreviewFlushFrame = null
-  }
-  livePreviewDeltaBuffer = ''
-  livePreviewBufferTaskId = null
-}
-
-function flushLivePreviewDeltas() {
-  if (livePreviewFlushFrame != null) {
-    cancelAnimationFrame(livePreviewFlushFrame)
-    livePreviewFlushFrame = null
-  }
-  const delta = livePreviewDeltaBuffer
-  const bufferedTaskId = livePreviewBufferTaskId
-  livePreviewDeltaBuffer = ''
-  livePreviewBufferTaskId = null
-  if (
-    delta &&
-    bufferedTaskId === taskId.value &&
-    bufferedTaskId === liveStreamTaskId
-  ) {
-    livePreviewText.value += delta
-  }
-}
-
-function replaceLivePreview(text: string) {
-  cancelLivePreviewFlush()
-  livePreviewText.value = text
-}
-
-function clearLivePreview() {
-  cancelLivePreviewFlush()
-  livePreviewText.value = ''
-}
-
-function queueLivePreviewDelta(id: number, delta: string) {
-  if (!delta || id !== taskId.value || id !== liveStreamTaskId) return
-  if (livePreviewBufferTaskId !== id) {
-    cancelLivePreviewFlush()
-    livePreviewBufferTaskId = id
-  }
-  livePreviewDeltaBuffer += delta
-  if (livePreviewFlushFrame == null) {
-    livePreviewFlushFrame = requestAnimationFrame(() => {
-      livePreviewFlushFrame = null
-      flushLivePreviewDeltas()
-    })
-  }
-}
-
-function clearLiveStreamConnection(options?: {
-  clearPreview?: boolean
-  clearStage?: boolean
-  resetReconnectAttempts?: boolean
-}) {
-  if (liveStreamSource) {
-    liveStreamSource.close()
-    liveStreamSource = null
-  }
-  if (liveStreamReconnectTimer != null) {
-    clearTimeout(liveStreamReconnectTimer)
-    liveStreamReconnectTimer = null
-  }
-  liveStreamTaskId = null
-  liveStreamConnected.value = false
-  liveStreamConnecting.value = false
-  if (options?.resetReconnectAttempts !== false) {
-    liveStreamReconnectAttempts = 0
-  }
-  if (options?.clearPreview) clearLivePreview()
-  else cancelLivePreviewFlush()
-  if (options?.clearStage) {
-    liveStageMessage.value = ''
-    liveStageStatus.value = ''
-  }
-}
-
-function parseStreamPayload(event: Event): TaskStreamPayload | null {
-  try {
-    const payload = JSON.parse((event as MessageEvent<string>).data) as unknown
-    return payload && typeof payload === 'object' ? payload as TaskStreamPayload : null
-  } catch {
-    return null
-  }
-}
-
-function updateLiveStage(payload: TaskStreamPayload, fallback = '') {
+function updateLiveStage(payload: SseStreamPayload, fallback = '') {
   if (payload.status) liveStageStatus.value = payload.status
   if (payload.message) liveStageMessage.value = payload.message
   else if (fallback) liveStageMessage.value = fallback
 }
 
-async function handleLiveStreamCompleted(
-  source: EventSource,
-  id: number,
-  payload: TaskStreamPayload,
-) {
-  if (!isCurrentLiveStream(source, id)) return
-  if (typeof payload.text === 'string') replaceLivePreview(payload.text)
-  else flushLivePreviewDeltas()
+async function handleLiveStreamCompleted(id: number, payload: SseStreamPayload) {
+  if (isUnmounted || id !== taskId.value) return
+  if (typeof payload.text === 'string') livePreviewText.value = payload.text
   updateLiveStage(payload, '生成完成，正在载入正式草稿…')
-  clearLiveStreamConnection({ resetReconnectAttempts: false })
-  const refreshed = await refreshLight()
+  const refreshed = await refreshLight(true)
+  if (isUnmounted) return
   if (refreshed && id === taskId.value && !isLiveGeneration.value) {
-    clearLivePreview()
+    livePreviewText.value = ''
     liveStageMessage.value = ''
     liveStageStatus.value = ''
   }
-  if (id === taskId.value && task.value?.id === id) {
-    startPostGenerationConfirmation(id)
-  }
+  if (id === taskId.value && task.value?.id === id) startPostGenerationConfirmation(id)
 }
 
-async function handleLiveStreamFailed(
-  source: EventSource,
-  id: number,
-  payload: TaskStreamPayload,
-) {
-  if (!isCurrentLiveStream(source, id)) return
+async function handleLiveStreamFailed(id: number, payload: SseStreamPayload) {
+  if (isUnmounted || id !== taskId.value) return
   cancelPostGenerationConfirmation()
-  clearLivePreview()
+  livePreviewText.value = ''
   updateLiveStage(payload, '生成失败')
   liveStreamError.value = payload.message || task.value?.error_message || '生成失败，请稍后重试'
-  clearLiveStreamConnection({ resetReconnectAttempts: false })
-  await refreshLight()
+  await refreshLight(true)
 }
 
-function scheduleLiveStreamReconnect(id: number) {
-  if (!isLiveGeneration.value || id !== taskId.value) return
-  if (liveStreamReconnectAttempts >= LIVE_STREAM_MAX_RECONNECTS) {
-    liveStageMessage.value = '实时预览连接已断开，仍会通过自动刷新更新任务状态'
-    return
-  }
-  liveStreamReconnectAttempts += 1
-  const attempt = liveStreamReconnectAttempts
-  const delay = attempt * 1000
-  liveStageMessage.value = `实时预览连接中断，正在重连（${attempt}/${LIVE_STREAM_MAX_RECONNECTS}）…`
-  liveStreamReconnectTimer = window.setTimeout(() => {
-    liveStreamReconnectTimer = null
-    if (isLiveGeneration.value && id === taskId.value && !liveStreamSource) {
-      openLiveStream(id)
-    }
-  }, delay)
-}
-
-function openLiveStream(id: number) {
-  if (!isLiveGeneration.value || id !== taskId.value || liveStreamSource || liveStreamReconnectTimer != null) {
-    return
-  }
-  const streamProjectId = task.value?.project_id ?? projectId.value
-  if (!streamProjectId) return
-  if (liveStreamTaskId !== id) {
-    liveStreamTaskId = id
-    liveStreamReconnectAttempts = 0
-  }
-  liveStreamConnecting.value = true
-  const source = new EventSource(taskStreamUrl(id, streamProjectId))
-  liveStreamSource = source
-
-  source.onopen = () => {
-    if (!isCurrentLiveStream(source, id)) return
-    liveStreamConnecting.value = false
-    liveStreamConnected.value = true
+const liveStream = useSseStream({
+  closeOnUnmount: true,
+  url: () => {
+    const id = taskId.value
+    const streamProjectId = task.value?.project_id ?? projectId.value
+    if (!id || Number.isNaN(id) || !streamProjectId) return null
+    return taskStreamUrl(id, streamProjectId)
+  },
+  isActive: () => !isUnmounted && isLiveGeneration.value && liveStreamTaskId === taskId.value,
+  onOpen: () => {
+    streamAuthFailed = false
     if (!liveStageMessage.value) liveStageMessage.value = '已连接实时生成预览'
-  }
-
-  source.addEventListener('snapshot', (event) => {
-    if (!isCurrentLiveStream(source, id)) return
-    const payload = parseStreamPayload(event)
-    if (!payload) return
-    if (typeof payload.text === 'string') replaceLivePreview(payload.text)
-    else flushLivePreviewDeltas()
+  },
+  onSnapshot: (payload) => {
+    if (typeof payload.text === 'string') livePreviewText.value = payload.text
     updateLiveStage(payload)
-    if (payload.terminal === 'completed') {
-      void handleLiveStreamCompleted(source, id, payload)
-    } else if (payload.terminal === 'failed') {
-      void handleLiveStreamFailed(source, id, payload)
+  },
+  onStatus: (payload) => {
+    liveStreamError.value = ''
+    updateLiveStage(payload)
+  },
+  onReset: (payload) => {
+    livePreviewText.value = typeof payload.text === 'string' ? payload.text : ''
+    liveStreamError.value = ''
+    updateLiveStage(payload)
+  },
+  onDelta: (chunk) => { livePreviewText.value += chunk },
+  onRetry: (payload) => updateLiveStage(payload, '模型请求正在重试…'),
+  onNotice: (payload) => updateLiveStage(payload),
+  onCompleted: (payload) => { void handleLiveStreamCompleted(taskId.value, payload) },
+  onFailed: (payload) => { void handleLiveStreamFailed(taskId.value, payload) },
+  onReconnecting: (attempt, max) => {
+    liveStageMessage.value = `实时预览连接中断，正在重连（${attempt}/${max}）…`
+  },
+  onReconnectExhausted: () => {
+    if (isUnmounted) return
+    liveStageMessage.value = '实时预览连接已断开，仍会通过自动刷新更新任务状态'
+    if (isBusy.value) startPolling()
+  },
+  beforeReconnect: async () => {
+    const id = taskId.value
+    if (isUnmounted || !id || Number.isNaN(id)) return false
+    try {
+      await getSession()
+    } catch {
+      if (isUnmounted) return false
+      streamAuthFailed = true
+      liveStreamError.value = '登录状态已失效，请重新登录后查看实时生成进度'
+      liveStageMessage.value = ''
+      return false
     }
-  })
+    if (isUnmounted || id !== taskId.value) return false
+    try {
+      const fresh = await getTask(id, task.value?.project_id ?? projectId.value)
+      if (isUnmounted || id !== taskId.value) return false
+      if (!LIVE_STREAM_STATUSES.has(fresh.status)) {
+        applyTaskUpdate(fresh)
+        void refreshLight(true)
+        return false
+      }
+      return true
+    } catch {
+      return !isUnmounted
+    }
+  },
+})
 
-  source.addEventListener('status', (event) => {
-    if (!isCurrentLiveStream(source, id)) return
-    const payload = parseStreamPayload(event)
-    if (!payload) return
-    liveStreamError.value = ''
-    updateLiveStage(payload)
-  })
-
-  source.addEventListener('reset', (event) => {
-    if (!isCurrentLiveStream(source, id)) return
-    const payload = parseStreamPayload(event)
-    if (!payload) return
-    replaceLivePreview(typeof payload.text === 'string' ? payload.text : '')
-    liveStreamError.value = ''
-    updateLiveStage(payload)
-  })
-
-  source.addEventListener('delta', (event) => {
-    if (!isCurrentLiveStream(source, id)) return
-    const payload = parseStreamPayload(event)
-    if (!payload) return
-    if (typeof payload.delta === 'string') queueLivePreviewDelta(id, payload.delta)
-  })
-
-  source.addEventListener('retry', (event) => {
-    if (!isCurrentLiveStream(source, id)) return
-    const payload = parseStreamPayload(event)
-    if (!payload) return
-    updateLiveStage(payload, '模型请求正在重试…')
-  })
-
-  source.addEventListener('notice', (event) => {
-    if (!isCurrentLiveStream(source, id)) return
-    const payload = parseStreamPayload(event)
-    if (!payload) return
-    updateLiveStage(payload)
-  })
-
-  source.addEventListener('completed', (event) => {
-    const payload = parseStreamPayload(event)
-    if (payload) void handleLiveStreamCompleted(source, id, payload)
-  })
-
-  source.addEventListener('failed', (event) => {
-    const payload = parseStreamPayload(event)
-    if (payload) void handleLiveStreamFailed(source, id, payload)
-  })
-
-  source.onerror = () => {
-    if (!isCurrentLiveStream(source, id)) return
-    source.close()
-    liveStreamSource = null
-    liveStreamConnected.value = false
-    liveStreamConnecting.value = false
-    scheduleLiveStreamReconnect(id)
-  }
-}
+const showLivePreview = computed(() =>
+  Boolean(
+    livePreviewText.value
+    || liveStream.connected.value
+    || liveStream.connecting.value
+    || liveStream.reconnecting.value,
+  ),
+)
 
 function syncLiveStream() {
+  if (isUnmounted) return
   if (!isLiveGeneration.value) {
-    const isFailed = task.value?.status === 'failed'
-    if (isFailed) {
-      clearLivePreview()
+    if (task.value?.status === 'failed') {
+      livePreviewText.value = ''
       liveStreamError.value = task.value?.error_message || liveStreamError.value
     } else if (task.value && !shouldPollTaskStatus(task.value.status)) {
-      clearLivePreview()
+      livePreviewText.value = ''
       liveStageMessage.value = ''
       liveStageStatus.value = ''
     }
-    clearLiveStreamConnection({ resetReconnectAttempts: false })
+    liveStream.close('manual')
+    liveStreamTaskId = null
     return
   }
+  if (streamAuthFailed) return
   if (liveStreamTaskId !== taskId.value) {
-    clearLiveStreamConnection({ clearPreview: true, clearStage: true })
+    liveStream.close('manual')
+    livePreviewText.value = ''
+    liveStageMessage.value = ''
+    liveStageStatus.value = ''
     liveStreamError.value = ''
-  }
-  openLiveStream(taskId.value)
-}
-
-async function runAction(
-  label: string,
-  fn: (id: number) => Promise<TaskItem>,
-) {
-  if (!task.value) return
-  acting.value = true
-  try {
-    ElMessage.info(`已提交${label}…`)
-    const updated = await fn(task.value.id)
-    applyTaskUpdate(updated)
-    await refreshLight(true)
-    // 后台任务：接口快速返回 in-progress，由轮询刷新结果，按钮不必一直转
-    if (shouldPollTaskStatus(updated.status)) {
-      ElMessage.success(`${label}已在后台执行，状态会自动刷新`)
-    } else if (updated.status === 'failed') {
-      ElMessage.error(`${label}失败：${updated.error_message || '未知错误'}`)
-    } else {
-      ElMessage.success(`${label}完成`)
-    }
-  } catch (e) {
-    ElMessage.error(`${label}失败：${(e as Error).message}`)
-    await refreshLight(true)
-  } finally {
-    acting.value = false
-  }
-}
-
-function onGenerate() {
-  return runAction('生成', generateTask)
-}
-
-async function onStopGeneration() {
-  if (!task.value || task.value.status !== 'generating') return
-  try {
-    await ElMessageBox.confirm(
-      '停止将中止进行中的生成，已产生的部分内容会被丢弃且不可恢复。确定停止吗？',
-      '停止生成确认',
-      { type: 'warning', confirmButtonText: '停止生成', cancelButtonText: '继续生成' },
-    )
-  } catch {
+    liveStreamTaskId = taskId.value
+    liveStream.open()
     return
   }
-  acting.value = true
-  try {
-    const updated = await stopTask(task.value.id, projectId.value)
-    applyTaskUpdate(updated)
-    ElMessage.success('已停止生成')
-    await refreshLight(true)
-  } catch (e) {
-    ElMessage.error(`停止生成失败：${(e as Error).message}`)
-    await refreshLight(true)
-  } finally {
-    acting.value = false
-  }
-}
-
-function onReview() {
-  return runAction('评审', reviewTask)
-}
-
-function onOptimize() {
-  return runAction('优化 Prompt', optimizePromptTask)
-}
-
-async function onRegenerate() {
-  try {
-    await ElMessageBox.confirm('再生成将重新检索并覆盖当前生成流程，是否继续？', '再生成确认', {
-      type: 'warning',
-    })
-  } catch {
-    return
-  }
-  return runAction('再生成', regenerateTask)
-}
-
-async function onFinalize() {
-  if (!task.value) return
-  const selectedDraftId = activeDraftTab.value ? Number(activeDraftTab.value) : null
-  let conflicts: FinalizeConflict[]
-  acting.value = true
-  try {
-    const preview = await getFinalizeConflicts(task.value.id, selectedDraftId)
-    conflicts = preview.conflicts
-  } catch (e) {
-    ElMessage.error(`检查终版冲突失败：${(e as Error).message}`)
-    return
-  } finally {
-    acting.value = false
-  }
-  if (conflicts.length > 0) {
-    const caseKeys = conflicts.slice(0, 5).map((item) => item.case_key).join('、')
-    const suffix = conflicts.length > 5 ? ' 等' : ''
-    try {
-      await ElMessageBox.confirm(
-        `本次终版会更新 ${conflicts.length} 条该需求下已存在的用例：${caseKeys}${suffix}。更新会覆盖已有用例内容并记录操作日志，是否继续？`,
-        '更新已有用例',
-        { type: 'warning', confirmButtonText: '继续终版', cancelButtonText: '返回' },
-      )
-    } catch {
-      return
-    }
-    return runAction('终版', (id) => finalizeTask(id, selectedDraftId, true))
-  }
-  try {
-    await ElMessageBox.confirm('确认将当前草稿标记为终版？', '终版确认', {
-      type: 'warning',
-    })
-  } catch {
-    return
-  }
-  return runAction('终版', (id) => finalizeTask(id, selectedDraftId, false))
-}
-
-async function onRetryFailed() {
-  if (!task.value) return
-  const last = [...events.value].reverse().find((event) => event.step !== 'model_change')
-  const step = last?.step || ''
-  if (step.includes('review')) return onReview()
-  if (step.includes('optimize')) return onOptimize()
-  if (step.includes('regenerat')) return onRegenerate()
-  return onGenerate()
-}
-
-async function onSwitchModelAndRetry() {
-  if (!task.value || retryModelId.value == null) {
-    ElMessage.warning('请先选择重试模型')
-    return
-  }
-  acting.value = true
-  try {
-    const updated = await updateTaskModel(task.value.id, retryModelId.value)
-    applyTaskUpdate(updated)
-    ElMessage.success('模型已切换，正在重新生成')
-  } catch (e) {
-    ElMessage.error(`切换模型失败：${(e as Error).message}`)
-    acting.value = false
-    return
-  }
-  acting.value = false
-  await onGenerate()
-}
-
-function openApplyDialog(rev?: PromptRevision) {
-  selectedRevision.value = rev || pendingRevisions.value[0] || revisions.value[0] || null
-  if (!selectedRevision.value) {
-    ElMessage.warning('没有可应用的 Prompt 修订')
-    return
-  }
-  alsoRegenerate.value = true
-  editedPromptContent.value = selectedRevision.value.new_content
-  applyDialogVisible.value = true
-}
-
-async function confirmApply() {
-  if (!task.value || !selectedRevision.value) return
-  if (!editedPromptContent.value.trim()) {
-    ElMessage.warning('Prompt 内容不能为空')
-    return
-  }
-  acting.value = true
-  try {
-    const applied = await applyPrompt(task.value.id, {
-      revision_id: selectedRevision.value.id,
-      mode: 'task_temp',
-      content: editedPromptContent.value,
-    })
-    applyTaskUpdate(applied)
-    ElMessage.success('已仅对本任务应用临时 Prompt')
-    applyDialogVisible.value = false
-    if (alsoRegenerate.value) {
-      const regenerated = await regenerateTask(task.value.id)
-      applyTaskUpdate(regenerated)
-      ElMessage.success('已触发再生成')
-    }
-    await refreshLight(true)
-  } catch (e) {
-    ElMessage.error(`应用失败：${(e as Error).message}`)
-  } finally {
-    acting.value = false
+  if (!liveStream.connected.value && !liveStream.connecting.value && !liveStream.reconnecting.value) {
+    liveStream.open()
   }
 }
 
 watch(
   () => task.value?.status,
   () => {
+    if (isUnmounted) return
     if (isBusy.value) startPolling()
     else stopPolling()
-    if (shouldStopPostGenerationConfirmation(task.value?.status)) {
-      cancelPostGenerationConfirmation()
-    }
+    if (shouldStopPostGen(task.value?.status)) cancelPostGenerationConfirmation()
     syncLiveStream()
   },
   { immediate: true },
 )
 
 watch(taskId, () => {
+  if (isUnmounted) return
   invalidatePendingDataReads()
   refreshInFlightSequence = null
   activeDraftTab.value = ''
+  streamAuthFailed = false
   cancelPostGenerationConfirmation()
-  clearLiveStreamConnection({ clearPreview: true, clearStage: true })
+  liveStream.close('manual')
+  liveStreamTaskId = null
+  livePreviewText.value = ''
+  liveStageMessage.value = ''
+  liveStageStatus.value = ''
   liveStreamError.value = ''
+  resetDialogState()
   task.value = null
   drafts.value = []
   events.value = []
   reviews.value = []
   revisions.value = []
   citations.value = []
+  checkpoint.value = null
+  testPointCheckpoint.value = null
+  coverage.value = null
   void loadAll()
 })
 
-const draftScrollStyle = ref<Record<string, string>>({})
-let rightColumnObserver: ResizeObserver | null = null
-let syncRafId: number | null = null
-let isMounted = false
-
-function scheduleSyncDraftDepth() {
-  if (typeof window === 'undefined' || !isMounted) return
-  if (syncRafId !== null) {
-    cancelAnimationFrame(syncRafId)
-  }
-  syncRafId = requestAnimationFrame(() => {
-    syncRafId = null
-    if (!isMounted) return
-    syncDraftDepth()
-  })
-}
-
-function syncDraftDepth() {
-  if (typeof window === 'undefined') return
-  if (window.innerWidth < 992) {
-    draftScrollStyle.value = { maxHeight: '540px' }
-    return
-  }
-  const leftCol = document.querySelector('.left-main-col') as HTMLElement | null
-  const rightCol = document.querySelector('.right-main-col') as HTMLElement | null
-  const draftCard = document.querySelector('.draft-container-card') as HTMLElement | null
-  const lastRightCard = document.querySelector('.right-main-col > .block:last-child') as HTMLElement | null
-  const draftScroll = draftCard?.querySelector('.draft-scroll') as HTMLElement | null
-
-  const isSideBySide = Boolean(
-    leftCol &&
-    rightCol &&
-    rightCol.getBoundingClientRect().top < (draftCard?.getBoundingClientRect().bottom ?? 0)
-  )
-  if (!isSideBySide) {
-    draftScrollStyle.value = { maxHeight: '540px' }
-    return
-  }
-
-  if (draftCard && (lastRightCard || rightCol)) {
-    const targetBottom = lastRightCard
-      ? lastRightCard.getBoundingClientRect().bottom
-      : (rightCol ? rightCol.getBoundingClientRect().bottom : 0)
-
-    // el-card 内边距 (20px) + 边框 (1px) = 21px
-    const cardBottomOffset = 21
-    const scrollTop = draftScroll
-      ? draftScroll.getBoundingClientRect().top
-      : (draftCard.getBoundingClientRect().top + 156)
-
-    const availableH = Math.round(targetBottom - scrollTop - cardBottomOffset)
-
-    if (availableH >= 380) {
-      draftScrollStyle.value = {
-        maxHeight: `${availableH}px`,
-        height: `${availableH}px`,
-      }
-      return
-    }
-  }
-  draftScrollStyle.value = { maxHeight: '720px' }
-}
-
-watch([draftViewMode, () => activeDraftTab.value], () => {
-  nextTick(scheduleSyncDraftDepth)
-})
-
-onMounted(() => {
-  isMounted = true
-  window.addEventListener('resize', scheduleSyncDraftDepth)
-
-  const rightCol = document.querySelector('.right-main-col')
-  if (rightCol && typeof ResizeObserver !== 'undefined') {
-    rightColumnObserver = new ResizeObserver(() => {
-      scheduleSyncDraftDepth()
-    })
-    rightColumnObserver.observe(rightCol)
-  }
-
-  void loadAll().then(() => {
-    if (!isMounted) return
-    nextTick(scheduleSyncDraftDepth)
-  })
-})
+onMounted(() => { void loadAll() })
 
 onUnmounted(() => {
-  isMounted = false
-  if (syncRafId !== null) {
-    cancelAnimationFrame(syncRafId)
-    syncRafId = null
-  }
+  isUnmounted = true
   stopPolling()
   cancelPostGenerationConfirmation()
-  clearLiveStreamConnection({ clearPreview: true })
-  rightColumnObserver?.disconnect()
-  rightColumnObserver = null
-  window.removeEventListener('resize', scheduleSyncDraftDepth)
+  liveStream.close('unmounted')
 })
 </script>
 
@@ -1174,33 +521,19 @@ onUnmounted(() => {
         </div>
         <h1 class="page-title">
           <span class="task-spec-id">TASK // #{{ task?.id ?? taskId }}</span>
-          <el-tag
-            v-if="task"
-            :type="statusTagType(task.status)"
-            effect="light"
-            style="margin-left: 8px; vertical-align: middle"
-          >
+          <el-tag v-if="task" :type="statusTagType(task.status)" effect="light" style="margin-left: 8px; vertical-align: middle">
             {{ statusLabel(task.status) }}
           </el-tag>
-          <el-tag
-            v-if="highlightFinal"
-            type="success"
-            effect="dark"
-            style="margin-left: 8px; vertical-align: middle"
-          >
+          <el-tag v-if="highlightFinal" type="success" effect="dark" style="margin-left: 8px; vertical-align: middle">
             可终版
           </el-tag>
         </h1>
         <p class="title-line">{{ task?.title || '（无标题）' }}</p>
       </div>
       <div class="page-actions">
-        <el-button
-          v-if="task?.status === 'generating'"
-          type="danger"
-          plain
-          :loading="acting"
-          @click="onStopGeneration"
-        >停止生成</el-button>
+        <el-button v-if="task?.status === 'generating'" type="danger" plain :loading="acting" @click="onStopGeneration">
+          停止生成
+        </el-button>
         <el-button @click="refreshLight()">刷新</el-button>
       </div>
     </div>
@@ -1215,119 +548,23 @@ onUnmounted(() => {
       style="margin-bottom: 16px"
     />
 
-    <el-card v-if="task?.status === 'awaiting_confirmation' && checkpoint" shadow="never" class="block checkpoint-card">
-      <template #header>检索结果确认</template>
-      <p class="meta">请确认将用于生成的知识引用，可取消不相关条目；也可补充背景上下文后继续。</p>
+    <TaskRetrievalConfirmCard
+      v-if="task?.status === 'awaiting_confirmation' && checkpoint"
+      :checkpoint="checkpoint"
+      :confirming="confirmingCheckpoint"
+      @confirm="confirmCheckpoint"
+    />
 
-      <el-alert
-        v-if="checkpoint.knowledge_status === 'not_configured'"
-        type="warning"
-        show-icon
-        :closable="false"
-        class="checkpoint-status-alert"
-        title="该项目未配置知识库，可联系管理员添加"
-        :description="checkpoint.knowledge_message || '确认后仍可继续后续测试点生成，您也可以在下方填写补充背景上下文。'"
-      />
-      <el-alert
-        v-else-if="checkpoint.knowledge_status === 'no_hits'"
-        type="info"
-        show-icon
-        :closable="false"
-        class="checkpoint-status-alert"
-        title="未检索到相关内容"
-        :description="checkpoint.knowledge_message || '外部知识库未命中相关条目，可填写补充背景或直接确认继续生成测试点。'"
-      />
-      <el-alert
-        v-if="checkpoint.knowledge_status === 'source_error' || checkpoint.source_warnings?.length"
-        type="warning"
-        show-icon
-        :closable="false"
-        class="checkpoint-status-alert"
-        :title="checkpoint.knowledge_status === 'source_error' ? '外部知识库检索异常' : '部分外部知识库检索告警'"
-      >
-        <template #default>
-          <p v-if="checkpoint.knowledge_message" class="checkpoint-alert-msg">{{ checkpoint.knowledge_message }}</p>
-          <ul v-if="checkpoint.source_warnings?.length" class="checkpoint-warnings-list">
-            <li v-for="(warn, idx) in checkpoint.source_warnings" :key="`${warn.source_id ?? 's'}-${idx}`">
-              <strong v-if="warn.source_name">{{ warn.source_name }}</strong>
-              <span v-if="warn.category">（{{ warn.category }}）</span>
-              <span v-if="warn.source_name || warn.category">：</span>
-              {{ warn.message }}
-            </li>
-          </ul>
-          <p class="checkpoint-alert-msg">您仍可基于已有命中结果或补充上下文确认并继续生成测试点。</p>
-        </template>
-      </el-alert>
-
-      <el-checkbox-group v-if="checkpoint.candidate_citations.length" v-model="selectedCitationIds" class="checkpoint-list">
-        <el-checkbox v-for="item in checkpoint.candidate_citations" :key="item.id" :value="item.id" class="checkpoint-item">
-          <span class="checkpoint-title">
-            <el-tag
-              v-if="item.citation_type === 'external'"
-              size="small"
-              type="warning"
-              effect="plain"
-              style="margin-right: 6px"
-            >
-              外部知识
-            </el-tag>
-            <el-tag
-              v-else
-              size="small"
-              type="primary"
-              effect="plain"
-              style="margin-right: 6px"
-            >
-              知识引用
-            </el-tag>
-            {{ item.title }}
-          </span>
-          <span class="checkpoint-meta">{{ item.citation_type === 'external' ? '外部知识' : (item.citation_type || '知识') }} · score {{ item.score.toFixed(3) }} · {{ item.file_path || item.path }}</span>
-          <span class="checkpoint-snippet" :class="{ expanded: expandedCitations.has(item.id) }">{{ item.snippet || item.content_excerpt }}</span>
-          <el-button
-            v-if="(item.snippet || item.content_excerpt || '').length >= 120"
-            class="checkpoint-expand"
-            link
-            type="primary"
-            @click.stop="toggleCitation(item.id)"
-          >
-            {{ expandedCitations.has(item.id) ? '收起' : '展开全文' }}
-          </el-button>
-        </el-checkbox>
-      </el-checkbox-group>
-      <el-input v-model="supplementalText" type="textarea" :rows="4" maxlength="10000" show-word-limit placeholder="补充上下文（可选）" />
-      <div class="checkpoint-actions">
-        <el-button
-          type="primary"
-          :loading="confirmingCheckpoint"
-          :disabled="!allowEmptyRetrievalConfirm && !selectedCitationIds.length && !supplementalText.trim()"
-          @click="confirmCheckpoint"
-        >
-          确认并继续生成测试点
-        </el-button>
-      </div>
-    </el-card>
-
-    <el-card v-if="(task?.status === 'awaiting_test_point_confirmation' || task?.status === 'generating_test_points') && testPointCheckpoint" shadow="never" class="block checkpoint-card test-point-card">
-      <template #header>
-        <div class="card-head"><span>测试点确认</span><el-tag type="warning" size="small">先确认测试点，再生成完整用例</el-tag></div>
-      </template>
-      <p class="meta">可编辑标题、验证目标、维度、优先级、选择状态和引用；删除或排除不需要的测试点。</p>
-      <div v-for="(point, index) in testPoints" :key="point.id" class="test-point-editor">
-        <div class="test-point-editor-head">
-          <strong class="point-key">{{ point.stable_key }}</strong>
-          <el-select v-model="point.dimension" style="width: 130px"><el-option v-for="dimension in (task?.test_dimensions || [])" :key="dimension" :label="dimensionLabel(dimension)" :value="dimension" /></el-select>
-          <el-select v-model="point.priority" style="width: 96px"><el-option label="P0" value="P0" /><el-option label="P1" value="P1" /><el-option label="P2" value="P2" /></el-select>
-          <el-checkbox v-model="point.is_selected">选中</el-checkbox>
-          <el-checkbox v-model="point.is_excluded">排除</el-checkbox>
-          <span class="point-head-spacer" />
-          <el-button link type="danger" @click="removeTestPoint(index)">删除</el-button>
-        </div>
-        <el-input v-model="point.title" placeholder="测试点标题" class="point-title-input" />
-        <el-input v-model="point.verification_goal" type="textarea" :rows="2" placeholder="验证目标" />
-      </div>
-      <div class="point-actions"><el-button @click="addTestPoint">新增测试点</el-button><el-button :loading="confirmingTestPoints" :disabled="task?.status !== 'awaiting_test_point_confirmation'" @click="saveTestPoints">保存编辑</el-button><el-button type="primary" :loading="confirmingTestPoints" :disabled="task?.status !== 'awaiting_test_point_confirmation'" @click="confirmTestPointStage">保存并确认测试点</el-button></div>
-    </el-card>
+    <TaskTestPointsEditorCard
+      v-if="(task?.status === 'awaiting_test_point_confirmation' || task?.status === 'generating_test_points') && testPointCheckpoint"
+      :checkpoint="testPointCheckpoint"
+      :task-id="taskId"
+      :dimensions="task?.test_dimensions || []"
+      :saving="confirmingTestPoints"
+      :editable="task?.status === 'awaiting_test_point_confirmation'"
+      @save="saveTestPoints"
+      @confirm="confirmTestPointStage"
+    />
 
     <el-alert
       v-if="task?.error_message || liveStreamError"
@@ -1354,17 +591,7 @@ onUnmounted(() => {
       <template v-else-if="task.status === 'failed'">
         <el-button type="danger" :loading="acting" @click="onRetryFailed">重试当前步</el-button>
         <el-button :loading="acting" @click="onGenerate">重新生成</el-button>
-        <el-select v-model="retryModelId" placeholder="选择重试模型" style="width: 260px">
-          <el-option
-            v-for="model in models"
-            :key="model.id"
-            :label="`${model.name} · ${model.model_name}${model.is_default ? '（默认）' : ''}`"
-            :value="model.id"
-          />
-        </el-select>
-        <el-button type="warning" :loading="acting" @click="onSwitchModelAndRetry">
-          换模型并重新生成
-        </el-button>
+        <el-button type="warning" :loading="acting" @click="retryModelDialogVisible = true">换模型并重新生成</el-button>
       </template>
       <template v-else-if="task.status === 'finalized'">
         <el-tag type="success" effect="dark">已终版（只读）</el-tag>
@@ -1375,12 +602,7 @@ onUnmounted(() => {
         </el-tag>
       </template>
 
-      <el-button
-        v-if="pendingRevisions.length"
-        type="warning"
-        :loading="acting"
-        @click="openApplyDialog()"
-      >
+      <el-button v-if="pendingRevisions.length" type="warning" :loading="acting" @click="openApplyDialog()">
         查看并应用 Prompt（{{ pendingRevisions.length }}）
       </el-button>
     </div>
@@ -1396,343 +618,53 @@ onUnmounted(() => {
           </template>
           <div class="req-desc">{{ task?.description || '-' }}</div>
           <div v-if="task?.focus_tags?.length" class="tags">
-            <el-tag
-              v-for="tag in task.focus_tags"
-              :key="tag"
-              size="small"
-              style="margin-right: 6px"
-            >
-              {{ tag }}
-            </el-tag>
+            <el-tag v-for="tag in task.focus_tags" :key="tag" size="small" style="margin-right: 6px">{{ tag }}</el-tag>
           </div>
         </el-card>
 
-        <el-card v-if="showLivePreview" shadow="never" class="block live-preview-card">
-          <template #header>
-            <div class="card-head">
-              <div class="head-left">
-                <span class="preview-title">实时生成预览</span>
-                <el-tag type="warning" size="small" effect="plain" class="live-tag">
-                  <el-icon class="is-loading"><Loading /></el-icon> 实时生成中
-                </el-tag>
-              </div>
-              <span v-if="liveProgressInfo.active" class="progress-pill">
-                {{ liveProgressInfo.current }} / {{ liveProgressInfo.total }} 测试点
-              </span>
-            </div>
-          </template>
-          <div v-if="liveProgressInfo.active" class="live-progress-container">
-            <el-progress
-              :percentage="liveProgressInfo.percent"
-              :stroke-width="10"
-              status="success"
-              :striped="true"
-              :striped-flow="true"
-              class="live-progress-bar"
-            />
-          </div>
-          <div v-if="liveStageMessage" class="live-preview-status">
-            {{ liveStageStatus ? `${statusLabel(liveStageStatus)} · ` : '' }}{{ liveStageMessage }}
-          </div>
-          <div class="live-preview-content">
-            <MarkdownView v-if="livePreviewText" :content="livePreviewText" />
-            <el-empty v-else description="正在等待模型输出…" :image-size="56" />
-          </div>
-        </el-card>
-
-        <el-card shadow="never" class="block draft-container-card">
-          <template #header>
-            <div class="card-head draft-card-header">
-              <div class="header-title-row">
-                <span class="main-title">用例草稿</span>
-                <span v-if="drafts.length" class="draft-count-tag">共 {{ drafts.length }} 个版本</span>
-              </div>
-              <el-radio-group v-model="draftViewMode" size="small" class="view-mode-toggle">
-                <el-radio-button value="structured"><el-icon style="margin-right: 4px; vertical-align: -1px"><Aim /></el-icon>结构化测试点矩阵</el-radio-button>
-                <el-radio-button value="markdown"><el-icon style="margin-right: 4px; vertical-align: -1px"><Document /></el-icon>Markdown 全文</el-radio-button>
-              </el-radio-group>
-            </div>
-          </template>
-          <el-tabs v-if="drafts.length" v-model="activeDraftTab" class="draft-tabs">
-            <el-tab-pane
-              v-for="d in drafts"
-              :key="d.id"
-              :label="`v${d.version}`"
-              :name="String(d.id)"
-            >
-              <div class="draft-meta">
-                <span class="meta-time">{{ formatTime(d.created_at) }}</span>
-                <span v-if="d.prompt_version_ref" class="meta-prompt"> · {{ d.prompt_version_ref }}</span>
-                <el-tag
-                  v-if="task?.finalized_draft_id === d.id"
-                  type="success"
-                  size="small"
-                  effect="plain"
-                  style="margin-left: 8px"
-                >
-                  已定稿并导入
-                </el-tag>
-              </div>
-
-              <!-- 视图 1：测试点关联视图 -->
-              <div v-if="draftViewMode === 'structured'" class="draft-scroll structured-draft-view" :style="draftScrollStyle">
-                <template v-if="d.points_with_cases && d.points_with_cases.length">
-                  <el-collapse v-model="activePointNames" class="point-collapse-tree">
-                    <el-collapse-item
-                      v-for="group in d.points_with_cases"
-                      :key="group.stable_key"
-                      :name="group.stable_key"
-                      class="point-collapse-item"
-                    >
-                      <template #title>
-                        <div class="point-header-bar">
-                          <div class="point-header-left">
-                            <el-tag
-                              size="small"
-                              :type="dimensionTagType(group.dimension)"
-                              effect="light"
-                              class="dimension-tag"
-                            >
-                              {{ group.dimension || '默认' }}
-                            </el-tag>
-                            <el-tag
-                              size="small"
-                              :type="priorityTagType(group.priority)"
-                              effect="dark"
-                              class="priority-pill"
-                            >
-                              {{ group.priority || 'P1' }}
-                            </el-tag>
-                            <span class="point-stable-key">{{ group.stable_key }}</span>
-                            <span class="point-title-text">{{ group.title }}</span>
-                          </div>
-                          <div class="point-header-right">
-                            <el-tag
-                              size="small"
-                              :type="group.cases.length ? 'primary' : 'info'"
-                              effect="plain"
-                              round
-                              class="case-count-pill"
-                            >
-                              {{ group.cases.length }} 条用例
-                            </el-tag>
-                          </div>
-                        </div>
-                      </template>
-
-                      <!-- 测试点展开主体 -->
-                      <div class="point-body-content">
-                        <!-- 验证目标条 -->
-                        <div class="point-goal-callout">
-                          <el-icon class="goal-icon"><Aim /></el-icon>
-                          <div class="goal-text">
-                            <span class="goal-label">AIM // 验证目标：</span>
-                            {{ group.verification_goal || '针对该测试点开展验证' }}
-                          </div>
-                        </div>
-
-                        <!-- 绑定引用 Chips -->
-                        <div v-if="group.citation_ids && group.citation_ids.length" class="point-citations-row">
-                          <span class="citations-label"><el-icon><Link /></el-icon> 关联证据：</span>
-                          <el-tag
-                            v-for="cid in group.citation_ids"
-                            :key="cid"
-                            size="small"
-                            type="info"
-                            class="citation-chip"
-                          >
-                            #{{ cid }} {{ getCitationTitle(cid) }}
-                          </el-tag>
-                        </div>
-
-                        <!-- 嵌套衍生测试用例列表 -->
-                        <div v-if="group.cases && group.cases.length" class="cases-tree-list">
-                          <div
-                            v-for="c in group.cases"
-                            :key="c.case_key"
-                            class="case-card-unit"
-                          >
-                            <div class="case-card-header">
-                              <div class="case-title-left">
-                                <span class="case-badge-key">{{ c.case_key }}</span>
-                                <span class="case-main-title">{{ c.title }}</span>
-                                <el-tag v-if="c.type" size="small" type="primary" effect="plain" class="case-type-tag">
-                                  {{ c.type }}
-                                </el-tag>
-                                <el-tag size="small" :type="priorityTagType(c.priority)" effect="light" class="case-priority-tag">
-                                  {{ c.priority }}
-                                </el-tag>
-                              </div>
-                              <div class="case-actions-right">
-                                <el-button
-                                  size="small"
-                                  link
-                                  type="primary"
-                                  class="copy-btn"
-                                  @click="copyCaseMarkdown(c.raw_md)"
-                                >
-                                  <el-icon><CopyDocument /></el-icon>
-                                  <span>复制用例</span>
-                                </el-button>
-                              </div>
-                            </div>
-
-                            <div class="case-card-body">
-                              <!-- 前置条件 -->
-                              <div v-if="c.preconditions" class="case-section-block">
-                                <div class="section-label">前置条件</div>
-                                <div class="section-text pre-box">{{ c.preconditions }}</div>
-                              </div>
-
-                              <!-- 测试数据 -->
-                              <div v-if="c.test_data" class="case-section-block">
-                                <div class="section-label">测试数据</div>
-                                <div class="section-text data-box">{{ c.test_data }}</div>
-                              </div>
-
-                              <!-- 测试步骤与预期 -->
-                              <div v-if="c.steps && c.steps.length" class="case-steps-flow">
-                                <div class="section-label">测试步骤与断言</div>
-                                <div class="steps-table-list">
-                                  <div
-                                    v-for="step in c.steps"
-                                    :key="step.step_no"
-                                    class="step-item-row"
-                                  >
-                                    <div class="step-num-col">
-                                      <span class="step-pill">{{ step.step_no }}</span>
-                                    </div>
-                                    <div class="step-content-col">
-                                      <div class="step-action-desc">{{ step.action }}</div>
-                                      <div v-if="step.expected" class="step-expected-card">
-                                        <span class="expected-check-icon">✓</span>
-                                        <span class="expected-text-body">{{ step.expected }}</span>
-                                      </div>
-                                    </div>
-                                  </div>
-                                </div>
-                              </div>
-
-                              <!-- 待定事项 -->
-                              <div v-if="c.pending_items && c.pending_items.length" class="case-pending-block">
-                                <div class="pending-head">
-                                  <el-icon><Warning /></el-icon> 待定事项
-                                </div>
-                                <ul class="pending-list">
-                                  <li v-for="(pItem, pIdx) in c.pending_items" :key="pIdx">{{ pItem }}</li>
-                                </ul>
-                              </div>
-                            </div>
-                          </div>
-                        </div>
-                        <el-empty
-                          v-else
-                          description="该测试点尚未生成衍生测试用例"
-                          :image-size="48"
-                          class="empty-cases-placeholder"
-                        />
-                      </div>
-                    </el-collapse-item>
-                  </el-collapse>
-                </template>
-                <div v-else class="structured-fallback">
-                  <el-empty description="暂无结构化测试点关联数据，建议切换至 Markdown 视图查看" :image-size="64" />
-                </div>
-              </div>
-
-              <!-- 视图 2：完整 Markdown 视图 -->
-              <div v-else class="draft-scroll markdown-draft-view" :style="draftScrollStyle">
-                <MarkdownView :content="d.content_md" />
-              </div>
-            </el-tab-pane>
-          </el-tabs>
-          <el-empty v-else description="暂无草稿" :image-size="64" />
-        </el-card>
+        <TaskDraftViewerCard
+          :drafts="drafts"
+          v-model:active-draft-tab="activeDraftTab"
+          v-model:draft-view-mode="draftViewMode"
+          :finalized-draft-id="task?.finalized_draft_id"
+          :citations="citations"
+          :draft-scroll-style="draftScrollStyle"
+          :show-live-preview="showLivePreview"
+          :live-preview-text="livePreviewText"
+          :live-stage-message="liveStageMessage"
+          :live-stage-status="liveStageStatus"
+        />
       </el-col>
 
       <el-col :xs="24" :md="10" :lg="10" class="right-main-col">
-        <el-card shadow="never" class="block">
-          <template #header>时间线</template>
-          <TaskTimeline :events="events" />
-        </el-card>
-
-        <el-card v-if="coverage" shadow="never" class="block">
-          <template #header>覆盖概览</template>
-          <el-progress :percentage="coverage.coverage_percent" :format="formatCoverage" />
-          <div class="coverage-stats">已覆盖 {{ coverage.covered_test_points }} / {{ coverage.selected_test_points }} 个选中测试点；未覆盖 {{ coverage.uncovered_test_points }} 个</div>
-          <el-collapse>
-            <el-collapse-item title="测试点明细" name="points">
-              <div v-for="point in coverage.points" :key="point.stable_key" class="coverage-row"><el-tag size="small" :type="point.covered ? 'success' : 'warning'">{{ point.covered ? '已覆盖' : '未覆盖' }}</el-tag><span>{{ point.stable_key }} · {{ point.title }}</span><small>{{ point.priority }} · {{ point.dimension }}</small></div>
-            </el-collapse-item>
-            <el-collapse-item title="引用使用明细" name="citations">
-              <div v-for="citation in coverage.citations" :key="citation.citation_id" class="coverage-row"><el-tag size="small" :type="citation.used ? 'success' : 'info'">{{ citation.used ? '已使用' : '未使用' }}</el-tag><span>[{{ citation.citation_id }}] {{ citation.title }}</span><small>{{ citation.test_point_keys.join('、') || '无测试点' }}</small></div>
-            </el-collapse-item>
-          </el-collapse>
-        </el-card>
-
-        <el-card shadow="never" class="block">
-          <CitationList
-            :citations="citations"
-            :count="citations.length || task?.citation_count || 0"
-            :project-id="task?.project_id ?? projectId"
-          />
-        </el-card>
-
-        <el-card shadow="never" class="block">
-          <ReviewCard :review="latestReview" />
-        </el-card>
-
-        <el-card v-if="revisions.length" shadow="never" class="block">
-          <template #header>Prompt 修订</template>
-          <div
-            v-for="rev in revisions"
-            :key="rev.id"
-            class="rev-item"
-          >
-            <div class="rev-head">
-              <span>#{{ rev.id }} · {{ rev.status }}</span>
-              <el-button
-                v-if="rev.status === 'pending' && task?.status !== 'finalized'"
-                link
-                type="primary"
-                @click="openApplyDialog(rev)"
-              >
-                应用
-              </el-button>
-            </div>
-            <div class="rev-preview">{{ rev.new_content.slice(0, 180) }}{{ rev.new_content.length > 180 ? '…' : '' }}</div>
-          </div>
-        </el-card>
+        <TaskSidebarPanel
+          :events="events"
+          :coverage="coverage"
+          :citations="citations"
+          :citation-count="citations.length || task?.citation_count || 0"
+          :project-id="task?.project_id ?? projectId"
+          :latest-review="latestReview"
+          :revisions="revisions"
+          :can-apply-revision="task?.status !== 'finalized'"
+          @apply-revision="openApplyDialog"
+        />
       </el-col>
     </el-row>
 
-    <el-dialog
-      v-model="applyDialogVisible"
-      title="应用优化后的 Prompt"
-      width="640px"
-      destroy-on-close
-    >
-      <div v-if="selectedRevision" class="apply-body">
-        <div class="apply-meta">修订 #{{ selectedRevision.id }} · {{ selectedRevision.status }}</div>
-        <el-input
-          v-model="editedPromptContent"
-          type="textarea"
-          :rows="12"
-        />
-        <div class="apply-hint">可在确认前手动修改；最终保存的是此处内容。</div>
-        <el-alert
-          type="info"
-          show-icon
-          :closable="false"
-          title="此修订仅对当前任务临时生效，不会影响系统或其他用户的提示词模板"
-        />
-        <el-checkbox v-model="alsoRegenerate">应用后立即再生成</el-checkbox>
-      </div>
-      <template #footer>
-        <el-button @click="applyDialogVisible = false">取消</el-button>
-        <el-button type="primary" :loading="acting" @click="confirmApply">确认应用</el-button>
-      </template>
-    </el-dialog>
+    <TaskActionDialogs
+      v-model:apply-visible="applyDialogVisible"
+      :selected-revision="selectedRevision"
+      v-model:retry-model-visible="retryModelDialogVisible"
+      :models="models"
+      :default-model-id="task?.model_id ?? null"
+      :task-error-message="task?.error_message"
+      v-model:finalize-conflict-visible="finalizeConflictDialogVisible"
+      :finalize-conflicts="finalizeConflicts"
+      :acting="acting"
+      @confirm-apply="confirmApply"
+      @confirm-retry-model="onSwitchModelAndRetry"
+      @confirm-finalize-overwrite="confirmFinalizeOverwrite"
+    />
   </div>
 </template>
 
@@ -1772,141 +704,6 @@ onUnmounted(() => {
   border-radius: var(--cg-radius) !important;
 }
 
-.draft-scroll {
-  min-height: 0;
-  overflow-y: auto;
-  overflow-x: hidden;
-  padding-right: 6px;
-  scrollbar-width: thin;
-  scrollbar-color: var(--cg-border-strong, #cbd5e1) transparent;
-  box-sizing: border-box;
-}
-
-.draft-scroll::-webkit-scrollbar {
-  width: 6px;
-}
-
-.draft-scroll::-webkit-scrollbar-track {
-  background: transparent;
-}
-
-.draft-scroll::-webkit-scrollbar-thumb {
-  background-color: var(--cg-border-strong, #cbd5e1);
-  border-radius: 4px;
-}
-
-.draft-scroll::-webkit-scrollbar-thumb:hover {
-  background-color: var(--cg-text-muted, #71717a);
-}
-
-.checkpoint-list {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr);
-  gap: 10px;
-  max-height: clamp(260px, calc(100vh - 420px), 540px);
-  overflow-y: auto;
-  overflow-x: hidden;
-  margin: 12px 0;
-  min-width: 0;
-}
-
-.checkpoint-status-alert {
-  margin: 10px 0 12px;
-}
-
-.checkpoint-alert-msg {
-  margin: 4px 0 0;
-  font-size: 12.5px;
-  line-height: 1.5;
-}
-
-.checkpoint-warnings-list {
-  margin: 6px 0;
-  padding-left: 18px;
-  font-size: 12.5px;
-  line-height: 1.6;
-}
-
-.checkpoint-actions {
-  margin-top: 12px;
-}
-
-.checkpoint-item {
-  display: flex;
-  align-items: flex-start;
-  width: 100%;
-  min-width: 0;
-  min-height: 32px;
-  height: auto;
-  margin-right: 0;
-  box-sizing: border-box;
-  white-space: normal;
-  border: 1px solid var(--cg-border);
-  border-radius: var(--cg-radius-sm);
-  padding: 10px;
-}
-
-.checkpoint-item :deep(.el-checkbox__input) {
-  flex: 0 0 auto;
-  margin-top: 2px;
-}
-
-.checkpoint-item :deep(.el-checkbox__label) {
-  display: flex;
-  flex: 1 1 auto;
-  flex-direction: column;
-  min-width: 0;
-  max-width: 100%;
-  line-height: 1.45;
-  white-space: normal;
-  overflow-wrap: anywhere;
-  word-break: break-word;
-}
-
-.checkpoint-title,
-.checkpoint-meta,
-.checkpoint-snippet {
-  display: block;
-  max-width: 100%;
-  overflow-wrap: anywhere;
-  word-break: break-word;
-}
-
-.checkpoint-title { font-weight: 700; }
-.checkpoint-meta { color: var(--cg-text-muted); font-size: 12px; }
-.checkpoint-snippet {
-  color: var(--cg-text-secondary);
-  font-size: 12px;
-  margin-top: 4px;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-  line-height: 1.6;
-  word-break: break-word;
-}
-
-.checkpoint-snippet.expanded {
-  display: -webkit-box;
-  -webkit-line-clamp: unset;
-  max-width: 720px;
-  line-height: 1.7;
-  word-break: break-word;
-}
-
-.checkpoint-expand {
-  align-self: flex-start;
-  margin-top: 2px;
-  height: auto;
-  padding: 0;
-  font-size: 12px;
-  line-height: 1.5;
-}
-
-@media (max-width: 900px) {
-  .checkpoint-list { max-height: none; overflow: visible; }
-}
-
 .block :deep(.el-card__header) {
   font-weight: 700;
   border-bottom-color: var(--cg-border);
@@ -1918,9 +715,7 @@ onUnmounted(() => {
   align-items: center;
 }
 
-.meta,
-.draft-meta,
-.apply-meta {
+.meta {
   color: var(--cg-text-muted);
   font-size: 12px;
 }
@@ -1931,538 +726,7 @@ onUnmounted(() => {
   color: var(--cg-text);
 }
 
-.space-banner {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-bottom: 12px;
-  padding-bottom: 10px;
-  border-bottom: 1px solid var(--cg-border);
-}
-
-.live-preview-card {
-  border-color: rgba(230, 162, 60, 0.45) !important;
-}
-
-.live-preview-status {
-  margin-bottom: 14px;
-  padding: 8px 10px;
-  border-radius: var(--cg-radius-sm);
-  color: var(--cg-text-secondary);
-  font-size: 13px;
-  background: var(--cg-surface-muted);
-}
-
 .tags {
   margin-top: 10px;
 }
-
-.rev-item {
-  border: 1px solid var(--cg-border);
-  border-radius: var(--cg-radius-sm);
-  padding: 8px 10px;
-  margin-bottom: 8px;
-  background: var(--cg-surface-muted);
-}
-
-.rev-head {
-  display: flex;
-  justify-content: space-between;
-  font-size: 13px;
-  font-weight: 600;
-}
-
-.rev-preview {
-  margin-top: 6px;
-  font-size: 12px;
-  color: var(--cg-text-secondary);
-  white-space: pre-wrap;
-}
-
-.apply-body {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-
-/* ==================== 测试点关联视图与草稿卡片样式 ==================== */
-.draft-card-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 12px;
-}
-
-.header-title-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-
-.main-title {
-  font-size: 16px;
-  font-weight: 700;
-  color: var(--cg-text-primary, #0f172a);
-}
-
-.draft-count-tag {
-  font-size: 12px;
-  color: var(--cg-text-secondary, #64748b);
-  background: var(--cg-surface-muted, #f1f5f9);
-  padding: 2px 8px;
-  border-radius: 12px;
-}
-
-.view-mode-toggle :deep(.el-radio-button__inner) {
-  font-weight: 500;
-  padding: 6px 14px;
-}
-
-.draft-tabs {
-  margin-top: -8px;
-}
-
-.draft-meta {
-  display: flex;
-  align-items: center;
-  margin-bottom: 12px;
-  font-size: 12px;
-  color: var(--cg-text-secondary, #64748b);
-}
-
-.meta-time {
-  font-family: ui-monospace, SFMono-Regular, monospace;
-}
-
-/* 测试点折叠卡片树 */
-.point-collapse-tree {
-  border: none;
-  --el-collapse-header-height: auto;
-}
-
-.point-collapse-item {
-  border: 1px solid var(--cg-border, #e2e8f0) !important;
-  border-radius: 8px !important;
-  margin-bottom: 12px;
-  overflow: hidden;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.02);
-  transition: all 0.2s ease-in-out;
-}
-
-.point-collapse-item:hover {
-  border-color: #cbd5e1 !important;
-  box-shadow: 0 3px 8px rgba(0, 0, 0, 0.04);
-}
-
-.point-collapse-item :deep(.el-collapse-item__header) {
-  padding: 12px 16px;
-  background: #f8fafc;
-  border-bottom: 1px solid transparent;
-  line-height: normal;
-}
-
-.point-collapse-item.is-active :deep(.el-collapse-item__header) {
-  border-bottom-color: var(--cg-border, #e2e8f0);
-}
-
-.point-collapse-item :deep(.el-collapse-item__content) {
-  padding: 16px;
-  background: #ffffff;
-}
-
-.point-header-bar {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  width: 100%;
-  padding-right: 12px;
-  gap: 12px;
-}
-
-.point-header-left {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-
-.dimension-tag {
-  font-weight: 500;
-  border-radius: 4px;
-}
-
-.priority-pill {
-  font-family: var(--cg-font-mono);
-  font-weight: 700;
-  border-radius: 4px;
-  padding: 0 6px;
-}
-
-.priority-pill.el-tag--danger {
-  background: #ffe4e6 !important;
-  color: #e11d48 !important;
-  border: 1px solid #fecdd3 !important;
-}
-
-.priority-pill.el-tag--warning {
-  background: #fef3c7 !important;
-  color: #b45309 !important;
-  border: 1px solid #fde68a !important;
-}
-
-.priority-pill.el-tag--info {
-  background: #f4f4f5 !important;
-  color: #52525b !important;
-  border: 1px solid #e4e4e7 !important;
-}
-
-.point-stable-key {
-  font-family: var(--cg-font-mono);
-  font-weight: 700;
-  font-size: 12px;
-  color: #ffffff;
-  background: #18181b;
-  padding: 2px 8px;
-  border-radius: 4px;
-  letter-spacing: 0.5px;
-}
-
-.point-title-text {
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--cg-text-primary, #0f172a);
-}
-
-.case-count-pill {
-  font-weight: 600;
-  font-size: 12px;
-}
-
-/* 验证目标 Callout */
-.point-goal-callout {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  background: #f0fdf4;
-  border-left: 3px solid #10b981;
-  border-radius: 6px;
-  padding: 8px 12px;
-  margin-bottom: 12px;
-  font-size: 13px;
-  color: #065f46;
-}
-
-.goal-icon {
-  font-size: 16px;
-  color: #10b981;
-  flex-shrink: 0;
-}
-
-.goal-label {
-  font-family: var(--cg-font-mono);
-  font-weight: 700;
-  color: #047857;
-}
-
-/* 关联证据 Row */
-.point-citations-row {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-bottom: 14px;
-  font-size: 12px;
-  color: var(--cg-text-secondary, #64748b);
-}
-
-.citations-label {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  font-weight: 600;
-}
-
-.citation-chip {
-  font-size: 12px;
-  font-family: var(--cg-font-mono);
-  background: #f4f4f5 !important;
-  border: 1px solid #e4e4e7 !important;
-  color: #27272a !important;
-}
-
-/* 衍生用例卡片 */
-.cases-tree-list {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-
-.case-card-unit {
-  border: 1px solid #e2e8f0;
-  border-radius: 8px;
-  background: #ffffff;
-  padding: 14px 16px;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.02);
-  transition: all 0.2s ease;
-}
-
-.case-card-unit:hover {
-  border-color: #cbd5e1;
-  box-shadow: 0 4px 10px rgba(0, 0, 0, 0.04);
-}
-
-.case-card-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 8px;
-  padding-bottom: 10px;
-  border-bottom: 1px dashed #e2e8f0;
-  margin-bottom: 12px;
-}
-
-.case-title-left {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-
-.case-badge-key {
-  font-family: var(--cg-font-mono);
-  font-weight: 700;
-  font-size: 12px;
-  color: #18181b;
-  background: #f4f4f5;
-  border: 1px solid #e4e4e7;
-  padding: 2px 7px;
-  border-radius: 4px;
-}
-
-.case-priority-tag.el-tag--danger {
-  background: #ffe4e6 !important;
-  color: #e11d48 !important;
-  border: 1px solid #fecdd3 !important;
-}
-
-.case-priority-tag.el-tag--warning {
-  background: #fef3c7 !important;
-  color: #b45309 !important;
-  border: 1px solid #fde68a !important;
-}
-
-.case-priority-tag.el-tag--info {
-  background: #f4f4f5 !important;
-  color: #52525b !important;
-  border: 1px solid #e4e4e7 !important;
-}
-
-.case-main-title {
-  font-size: 14px;
-  font-weight: 600;
-  color: #1e293b;
-}
-
-.copy-btn {
-  font-size: 12px;
-  font-weight: 500;
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  padding: 3px 8px;
-  border: 1px solid #e4e4e7;
-  border-radius: 4px;
-  color: #52525b;
-  background: #ffffff;
-  transition: all 0.15s ease;
-}
-
-.copy-btn:hover {
-  border-color: #10b981;
-  color: #10b981;
-  background: #ecfdf5;
-}
-
-.case-card-body {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
-.case-section-block {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.section-label {
-  font-size: 12px;
-  font-weight: 700;
-  color: #64748b;
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-}
-
-.pre-box, .data-box {
-  background: #f8fafc;
-  border: 1px solid #f1f5f9;
-  border-radius: 6px;
-  padding: 8px 12px;
-  font-size: 13px;
-  color: #334155;
-  line-height: 1.5;
-  white-space: pre-wrap;
-}
-
-/* 测试步骤与断言 */
-.case-steps-flow {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.steps-table-list {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  margin-top: 2px;
-}
-
-.step-item-row {
-  display: flex;
-  align-items: flex-start;
-  gap: 12px;
-  padding: 6px 0;
-}
-
-.step-num-col {
-  flex-shrink: 0;
-  margin-top: 2px;
-}
-
-.step-pill {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 22px;
-  height: 22px;
-  border-radius: 50%;
-  background: #18181b;
-  color: #ffffff;
-  font-family: var(--cg-font-mono);
-  font-size: 12px;
-  font-weight: 700;
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12);
-}
-
-.step-content-col {
-  flex: 1;
-  min-width: 0;
-}
-
-.step-action-desc {
-  font-size: 13px;
-  line-height: 1.5;
-  color: #1e293b;
-  font-weight: 500;
-}
-
-.step-expected-card {
-  display: flex;
-  align-items: flex-start;
-  gap: 6px;
-  background: #f0fdf4;
-  border: 1px solid #bbf7d0;
-  border-radius: 6px;
-  padding: 6px 10px;
-  margin-top: 6px;
-  color: #166534;
-  font-size: 13px;
-  line-height: 1.45;
-}
-
-.expected-check-icon {
-  font-weight: bold;
-  color: #10b981;
-  flex-shrink: 0;
-}
-
-.expected-text-body {
-  word-break: break-word;
-}
-
-/* 待定事项 */
-.case-pending-block {
-  background: #fffbeb;
-  border: 1px solid #fde68a;
-  border-radius: 6px;
-  padding: 8px 12px;
-  color: #92400e;
-  font-size: 12px;
-}
-
-.pending-head {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  font-weight: 700;
-  margin-bottom: 4px;
-}
-
-.pending-list {
-  margin: 0;
-  padding-left: 18px;
-}
-
-/* 实时生成预览增强 */
-.live-progress-container {
-  margin-bottom: 12px;
-}
-
-.head-left {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.progress-pill {
-  font-size: 12px;
-  font-weight: 600;
-  background: #fef3c7;
-  color: #b45309;
-  padding: 2px 8px;
-  border-radius: 10px;
-}
-
-/* 测试点确认编辑器 */
-.test-point-editor {
-  border: 1px solid var(--cg-border);
-  border-radius: var(--cg-radius-sm, 6px);
-  padding: 12px;
-  background: var(--cg-bg-card, #fff);
-  margin-bottom: 10px;
-}
-
-.test-point-editor-head {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-  margin-bottom: 8px;
-}
-
-.point-key {
-  font-family: var(--cg-font-mono, monospace);
-}
-
-.point-head-spacer {
-  flex: 1;
-}
-
-.point-title-input {
-  margin-bottom: 8px;
-}
-
 </style>
