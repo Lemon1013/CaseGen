@@ -158,6 +158,8 @@ export const useAgentChatStore = defineStore('agentChat', () => {
   const models = ref<AgentModelItem[]>([])
   const modelsLoading = ref(false)
   const modelsError = ref('')
+  const dshReady = ref(true)
+  const dshUnavailableReason = ref('')
   const defaultModelLabel = ref('DSH 默认')
 
   // ---- 功能可用性（spec §7：AGENT_ENABLED=false 时 /api/agent/* 返回 410）----
@@ -644,10 +646,19 @@ export const useAgentChatStore = defineStore('agentChat', () => {
       const provider = payload.default_provider || ''
       const model = payload.default_model || ''
       defaultModelLabel.value = provider && model ? `${provider}/${model}` : 'DSH 默认'
+      dshReady.value = true
+      dshUnavailableReason.value = ''
     } catch (error) {
-      // 不留空列表伪装成功：把错误透给 UI，用户可重试或改用手动输入。
+      // 不留空列表伪装成功：把错误透给 UI，用户可重试或检查 DSH 接口就绪状态。
       models.value = []
-      modelsError.value = errorMessage(error)
+      if (isAgentDisabled(error)) {
+        markAgentUnavailable()
+        return
+      }
+      const msg = errorMessage(error)
+      modelsError.value = msg
+      dshReady.value = false
+      dshUnavailableReason.value = msg
     } finally {
       modelsLoading.value = false
     }
@@ -969,6 +980,8 @@ export const useAgentChatStore = defineStore('agentChat', () => {
     models,
     modelsLoading,
     modelsError,
+    dshReady,
+    dshUnavailableReason,
     defaultModelLabel,
     agentAvailable,
     agentDisabledNotice,

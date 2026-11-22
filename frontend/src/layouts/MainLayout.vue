@@ -1,10 +1,12 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { ElMessage } from 'element-plus'
 import {
   Collection,
   Cpu,
   ChatDotRound,
+  Check,
   EditPen,
   DataAnalysis,
   Connection,
@@ -20,7 +22,7 @@ import {
   Expand,
   Fold,
 } from '@element-plus/icons-vue'
-import { listModels, MODELS_UPDATED_EVENT, type ModelConfig } from '../api/models'
+import { listModels, MODELS_UPDATED_EVENT, notifyModelsUpdated, updateModel, type ModelConfig } from '../api/models'
 import { setProjectInvalidHandler } from '../api/client'
 import { useAuthStore } from '../authStore'
 import BrandMark from '../components/BrandMark.vue'
@@ -30,7 +32,9 @@ const route = useRoute()
 const router = useRouter()
 const projects = useProjectStore()
 const auth = useAuthStore()
-const defaultModel = ref<ModelConfig | null>(null)
+const models = ref<ModelConfig[]>([])
+const switchingModel = ref(false)
+const defaultModel = computed(() => models.value.find((m) => m.is_default) || models.value[0] || null)
 const projectQuery = computed(() => {
   const project = projects.current.value
   if (!project) return {}
@@ -149,12 +153,34 @@ let modelLoadSeq = 0
 async function loadDefaultModel() {
   const seq = ++modelLoadSeq
   try {
-    const models = await listModels()
+    const rows = await listModels()
     if (seq !== modelLoadSeq) return
-    defaultModel.value = models.find((m) => m.is_default) || models[0] || null
+    models.value = rows
   } catch {
     if (seq !== modelLoadSeq) return
-    defaultModel.value = null
+    models.value = []
+  }
+}
+
+function onModelDropdownVisible(visible: boolean) {
+  if (visible) void loadDefaultModel()
+}
+
+async function onModelCommand(modelId: unknown) {
+  const id = Number(modelId)
+  if (!Number.isInteger(id) || id <= 0) return
+  if (switchingModel.value || defaultModel.value?.id === id) return
+  const target = models.value.find((m) => m.id === id)
+  switchingModel.value = true
+  try {
+    await updateModel(id, { is_default: true })
+    await loadDefaultModel()
+    notifyModelsUpdated()
+    ElMessage.success(`已切换默认模型为 ${target ? `${target.name} · ${target.model_name}` : `#${id}`}`)
+  } catch (e) {
+    ElMessage.error(`切换默认模型失败：${(e as Error).message}`)
+  } finally {
+    switchingModel.value = false
   }
 }
 
@@ -314,10 +340,52 @@ watch(
           <p v-if="pageDescription" class="topbar-desc">{{ pageDescription }}</p>
         </div>
         <div class="topbar-right">
-          <el-select v-if="projects.state.projects.length" :model-value="projects.state.currentId" class="project-select" aria-label="当前项目" @change="(id: number) => projects.select(id, router)" @visible-change="onProjectSelectVisible">
+          <el-select
+            v-if="projects.state.projects.length"
+            :model-value="projects.state.currentId"
+            class="project-select"
+            aria-label="当前空间"
+            @change="(id: number) => projects.select(id, router)"
+            @visible-change="onProjectSelectVisible"
+          >
+            <template #prefix>
+              <span class="project-select-prefix">空间：</span>
+            </template>
             <el-option v-for="project in projects.state.projects.filter((item) => item.status === 'active')" :key="project.id" :label="project.name" :value="project.id" />
           </el-select>
-          <div v-if="defaultModel && route.name !== 'agent-chat'" class="model-chip" title="当前默认模型">
+          <el-dropdown
+            v-if="defaultModel && route.name !== 'agent-chat' && auth.isAdmin"
+            trigger="click"
+            :disabled="switchingModel"
+            @command="onModelCommand"
+            @visible-change="onModelDropdownVisible"
+          >
+            <button type="button" class="model-chip model-chip--interactive" title="点击切换默认模型">
+              <span class="model-dot" />
+              <span class="model-label">默认模型</span>
+              <span class="model-name">{{ defaultModel.name }} · {{ defaultModel.model_name }}</span>
+              <el-icon class="model-caret"><ArrowDown /></el-icon>
+            </button>
+            <template #dropdown>
+              <el-dropdown-menu>
+                <el-dropdown-item
+                  v-for="item in models"
+                  :key="item.id"
+                  :command="item.id"
+                  :disabled="switchingModel || item.id === defaultModel.id"
+                >
+                  <div class="model-option-row">
+                    <span class="model-option-check">
+                      <el-icon v-if="item.id === defaultModel.id"><Check /></el-icon>
+                    </span>
+                    <span class="model-option-name">{{ item.name }}</span>
+                    <span class="model-option-model">{{ item.model_name }}</span>
+                  </div>
+                </el-dropdown-item>
+              </el-dropdown-menu>
+            </template>
+          </el-dropdown>
+          <div v-else-if="defaultModel && route.name !== 'agent-chat'" class="model-chip" title="当前默认模型">
             <span class="model-dot" />
             <span class="model-label">默认模型</span>
             <span class="model-name">{{ defaultModel.name }} · {{ defaultModel.model_name }}</span>
@@ -697,13 +765,66 @@ watch(
   max-width: 360px;
 }
 
+.model-chip--interactive {
+  cursor: pointer;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.model-chip--interactive:hover,
+.model-chip--interactive:focus-visible {
+  border-color: var(--cg-primary, #10b981);
+  box-shadow: 0 1px 4px rgba(16, 185, 129, 0.15);
+}
+
+.model-caret {
+  color: var(--cg-text-muted);
+  flex-shrink: 0;
+}
+
+.model-option-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 200px;
+  font-size: 12.5px;
+}
+
+.model-option-check {
+  width: 14px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: #10b981;
+  flex-shrink: 0;
+}
+
+.model-option-name {
+  font-weight: 600;
+  color: var(--cg-text);
+}
+
+.model-option-model {
+  margin-left: auto;
+  color: var(--cg-text-muted);
+  font-family: var(--cg-font-mono);
+  font-size: 11.5px;
+}
+
 .topbar-right {
   display: flex;
   align-items: center;
   gap: 10px;
 }
 
-.project-select { width: 180px; }
+.project-select {
+  width: 220px;
+}
+
+.project-select-prefix {
+  color: var(--cg-text-muted);
+  font-size: 12.5px;
+  white-space: nowrap;
+}
 
 .model-dot {
   width: 8px;

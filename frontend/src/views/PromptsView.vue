@@ -121,7 +121,9 @@ const scopeTabs = computed<Array<{ value: ScopeFilter; label: string; count: num
 })
 
 const filteredPrompts = computed(() =>
-  prompts.value.filter((row) => matchesScope(row, scopeFilter.value)),
+  prompts.value
+    .filter((row) => matchesScope(row, scopeFilter.value))
+    .sort((a, b) => Number(Boolean(b.is_active)) - Number(Boolean(a.is_active))),
 )
 
 const selected = computed(() =>

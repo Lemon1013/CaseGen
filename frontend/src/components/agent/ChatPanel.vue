@@ -107,13 +107,14 @@ async function onCancel() {
 }
 
 const composerPlaceholder = computed(() => {
+  if (!store.dshReady) return 'DSH Agent 接口未就绪，暂不可发送消息，请先在页面顶部重试连接'
   if (closed.value) return '该会话已关闭，新建会话后可继续对话'
   if (busy.value) return 'Agent 正在生成回复，可等待或中止本轮'
   return undefined
 })
 
 const composerDisabled = computed(() =>
-  Boolean(closed.value || !conversation.value || !store.agentAvailable),
+  Boolean(closed.value || !conversation.value || !store.agentAvailable || !store.dshReady),
 )
 </script>
 

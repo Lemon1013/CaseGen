@@ -118,7 +118,7 @@ def list_prompts(
     stmt = (
         select(PromptTemplate)
         .where(col(PromptTemplate.type).in_(PROMPT_TYPES))
-        .order_by(col(PromptTemplate.id).desc())
+        .order_by(col(PromptTemplate.is_active).desc(), col(PromptTemplate.id).desc())
     )
     if type:
         stmt = stmt.where(PromptTemplate.type == type)

@@ -333,16 +333,46 @@ onUnmounted(() => {
       :description="store.skillsError"
     />
     <el-alert
-      v-if="store.modelsError"
+      v-if="store.agentAvailable && !store.dshReady"
+      class="page-alert"
+      type="error"
+      show-icon
+      :closable="false"
+      title="DSH Agent 接口未就绪，当前无法发起对话"
+    >
+      <template #default>
+        <div class="dsh-alert-body">
+          <p class="dsh-alert-desc">
+            当前未能连接至对接的 DSH 服务（可能尚未启动、服务地址未配置或网络不可达），请确认 DSH 服务正常运行后重试。
+            <span v-if="store.dshUnavailableReason" class="dsh-alert-reason">
+              （原因：{{ store.dshUnavailableReason }}）
+            </span>
+          </p>
+          <el-button
+            size="small"
+            type="primary"
+            plain
+            :loading="store.modelsLoading"
+            @click="store.loadModels(true)"
+          >
+            重新检测连接
+          </el-button>
+        </div>
+      </template>
+    </el-alert>
+    <el-alert
+      v-else-if="store.dshReady && store.modelsError"
       class="page-alert"
       type="warning"
       show-icon
       :closable="false"
       title="DSH 模型列表载入失败，可手动输入 provider/model 或稍后重试"
-      :description="store.modelsError"
     >
       <template #default>
-        <el-button size="small" link type="primary" @click="store.loadModels(true)">重试</el-button>
+        <div class="dsh-alert-body">
+          <p class="dsh-alert-desc">{{ store.modelsError }}</p>
+          <el-button size="small" link type="primary" @click="store.loadModels(true)">重试</el-button>
+        </div>
       </template>
     </el-alert>
 
@@ -391,7 +421,8 @@ onUnmounted(() => {
               <el-button
                 size="small"
                 type="primary"
-                :disabled="!store.agentAvailable || !projectId"
+                :disabled="!store.agentAvailable || !store.dshReady || !projectId"
+                :title="!store.dshReady ? 'DSH Agent 接口未就绪' : undefined"
                 @click="openCreateDialog"
               >
                 <el-icon><Plus /></el-icon>
@@ -563,7 +594,14 @@ onUnmounted(() => {
           </div>
         </div>
         <div v-if="!current" class="chat-placeholder">
-          <el-empty description="选择左侧会话，或新建一个对话" :image-size="72" />
+          <el-empty
+            :description="
+              !store.dshReady
+                ? 'DSH Agent 接口未就绪，暂无法新建对话，请先检查 DSH 服务状态后点击顶部「重新检测连接」'
+                : '选择左侧会话，或新建一个对话'
+            "
+            :image-size="72"
+          />
         </div>
         <ChatPanel v-else @save-to-cases="onRequestSaveToCases" />
       </el-card>
@@ -1096,6 +1134,24 @@ onUnmounted(() => {
 
 .info-drawer-body {
   padding: 4px 16px 20px;
+}
+
+.dsh-alert-body {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.dsh-alert-desc {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.dsh-alert-reason {
+  color: var(--cg-text-muted);
+  word-break: break-word;
 }
 
 

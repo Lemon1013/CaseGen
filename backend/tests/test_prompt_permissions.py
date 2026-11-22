@@ -1542,3 +1542,57 @@ def test_retired_prompt_types_hidden_from_list_and_404_on_single_item_apis(tmp_a
             r_fork = client.post(f"/api/prompts/{rid}/fork", headers=_origin(), json={})
             assert r_fork.status_code == 404
             assert r_fork.json()["detail"] == "Prompt not found"
+
+
+def test_list_prompts_orders_active_before_inactive(tmp_app_data, monkeypatch):
+    client, _ = _setup_auth_env(monkeypatch)
+
+    res_inactive = client.post(
+        "/api/prompts",
+        headers=_origin(),
+        json={
+            "name": "gen_inactive_newer",
+            "type": "generate",
+            "content": "inactive template",
+            "visibility": "system",
+            "is_active": False,
+        },
+    )
+    assert res_inactive.status_code == 200, res_inactive.text
+
+    res_active = client.post(
+        "/api/prompts",
+        headers=_origin(),
+        json={
+            "name": "gen_active_older",
+            "type": "generate",
+            "content": "active template",
+            "visibility": "system",
+            "is_active": True,
+        },
+    )
+    assert res_active.status_code == 200, res_active.text
+
+    # 再建一条较新的未启用模板（id 更大），列表仍应把所有启用项排在未启用项之前
+    res_inactive_newest = client.post(
+        "/api/prompts",
+        headers=_origin(),
+        json={
+            "name": "gen_inactive_newest",
+            "type": "generate",
+            "content": "inactive newest template",
+            "visibility": "system",
+            "is_active": False,
+        },
+    )
+    assert res_inactive_newest.status_code == 200, res_inactive_newest.text
+
+    listing = client.get("/api/prompts?type=generate", headers=_origin())
+    assert listing.status_code == 200, listing.text
+    rows = listing.json()
+    active_flags = [row["is_active"] for row in rows]
+    assert True in active_flags and False in active_flags
+    first_inactive_idx = active_flags.index(False)
+    assert all(flag is True for flag in active_flags[:first_inactive_idx])
+    assert all(flag is False for flag in active_flags[first_inactive_idx:])
+

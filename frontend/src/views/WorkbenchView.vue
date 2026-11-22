@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { listModels, type ModelConfig } from '../api/models'
+import { listModels, MODELS_UPDATED_EVENT, type ModelConfig } from '../api/models'
 import { listPrompts, type PromptTemplate } from '../api/prompts'
 import { createTask, generateTask, optimizeRequirement } from '../api/tasks'
 import { listCases, type TestCaseItem } from '../api/cases'
@@ -80,6 +80,7 @@ const form = reactive({
 const importingDoc = ref(false)
 const docDragOver = ref(false)
 const docFileInput = ref<HTMLInputElement | null>(null)
+const importedAutoTitle = ref<string | null>(null)
 const MAX_IMPORT_CHARS = 20000
 const selectedCases = computed(() => referenceCases.value.filter((row) => selectedReferenceIds.value.includes(row.id)))
 const referenceChars = computed(() => selectedCases.value.reduce((n, row) => n + row.content_md.length, 0) + form.reference_text.length)
@@ -190,11 +191,30 @@ async function importDoc(file: File) {
       if (merged === null) return
       form.description = merged
     }
-    if (!form.title.trim()) form.title = result.title.slice(0, 120)
+    if (!form.title.trim()) {
+      const nextTitle = result.title.slice(0, 120)
+      form.title = nextTitle
+      importedAutoTitle.value = nextTitle || null
+    } else {
+      importedAutoTitle.value = null
+    }
     form.source_filename = file.name
     ElMessage.success(`已导入 ${result.char_count} 字，请检查并手动编辑`)
   } catch (e) { ElMessage.error(`导入需求文档失败：${(e as Error).message}`) }
   finally { importingDoc.value = false }
+}
+
+function clearImportedDoc() {
+  form.source_filename = null
+  form.description = ''
+  if (!form.requirement_id && importedAutoTitle.value && form.title === importedAutoTitle.value) {
+    form.title = ''
+  }
+  importedAutoTitle.value = null
+  if (docFileInput.value) {
+    docFileInput.value.value = ''
+  }
+  ElMessage.info('已清除导入的文档内容')
 }
 
 async function optimize() {
@@ -228,7 +248,29 @@ async function submit() {
   finally { submitting.value = false }
 }
 
-onMounted(loadOptions)
+async function syncModelsAfterSwitch() {
+  try {
+    const modelsRows = await listModels()
+    models.value = modelsRows
+    const nextDefault = modelsRows.find((row) => row.is_default)?.id ?? null
+    if (nextDefault != null) {
+      form.model_id = nextDefault
+    } else if (form.model_id != null && !modelsRows.some((row) => row.id === form.model_id)) {
+      form.model_id = modelsRows[0]?.id ?? null
+    }
+  } catch {
+    // 忽略后台刷新失败，保留当前表单选择
+  }
+}
+
+onMounted(() => {
+  window.addEventListener(MODELS_UPDATED_EVENT, syncModelsAfterSwitch)
+  void loadOptions()
+})
+
+onUnmounted(() => {
+  window.removeEventListener(MODELS_UPDATED_EVENT, syncModelsAfterSwitch)
+})
 </script>
 
 <template>
@@ -277,7 +319,7 @@ onMounted(loadOptions)
                   <el-input v-model="form.description" type="textarea" :rows="8" maxlength="20000" show-word-limit />
                   <div v-if="form.source_filename" class="source-file-row">
                     <span class="hint">来源文件：{{ form.source_filename }}</span>
-                    <el-button link size="small" @click="form.source_filename = null">清除</el-button>
+                    <el-button link size="small" title="清除导入的文档及需求内容" @click="clearImportedDoc">清除</el-button>
                   </div>
                 </div>
               </div>
