@@ -1,4 +1,3 @@
-from datetime import datetime
 from typing import Literal, Optional
 
 from pydantic import BaseModel
@@ -47,16 +46,11 @@ class ProjectCountsOut(BaseModel):
     new_30d: int
 
 
-class DocumentCountsOut(BaseModel):
-    total: int
-    pending_ingest: int
-    by_status: list[StatusCountOut]
-
-
-class WikiCountsOut(BaseModel):
-    pages: int
-    pending_reviews: int
-    by_status: list[StatusCountOut]
+class AgentCountsOut(BaseModel):
+    conversations: int
+    active_conversations: int
+    messages: int
+    new_30d: int
 
 
 class TaskCountsOut(BaseModel):
@@ -85,8 +79,7 @@ class DataPoolCountsOut(BaseModel):
 class DashboardCountsOut(BaseModel):
     users: UserCountsOut
     projects: ProjectCountsOut
-    documents: DocumentCountsOut
-    wiki: WikiCountsOut
+    agent: AgentCountsOut
     tasks: TaskCountsOut
     cases: CaseCountsOut
     platform: PlatformCountsOut
@@ -102,17 +95,17 @@ class TrendPointOut(BaseModel):
     date: str
     tasks: int
     cases: int
-    documents: int
+    agent_conversations: int
 
 
 class RecentActivityOut(BaseModel):
-    type: Literal["task", "document", "review", "case"]
+    type: Literal["task", "case"]
     id: int
     title: str
     status: str
     project_id: Optional[int]
     project_name: str
-    created_at: datetime
+    created_at: str
 
 
 class DashboardOverviewOut(BaseModel):

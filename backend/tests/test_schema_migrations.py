@@ -179,3 +179,59 @@ def test_backup_captures_uncheckpointed_wal_frames_and_cleans_temp_files(tmp_pat
         rows = bak_conn.execute("SELECT id, val FROM items").fetchall()
     assert rows == [(1, "in-wal")]
     assert list(tmp_path.glob(".*.tmp-*")) == []
+
+
+def test_migration_0005_adds_coverage_metadata_json_to_legacy_checkpoints(tmp_app_data):
+    init_db()
+    db_path = tmp_app_data / "meta" / "app.db"
+    reset_engine()
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute('DROP TABLE "task_test_point_checkpoints"')
+        conn.execute(
+            """
+            CREATE TABLE task_test_point_checkpoints (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id INTEGER NOT NULL,
+                retrieval_checkpoint_id INTEGER,
+                attempt INTEGER NOT NULL DEFAULT 1,
+                version INTEGER NOT NULL DEFAULT 1,
+                status TEXT NOT NULL DEFAULT 'pending',
+                auto_review INTEGER NOT NULL DEFAULT 0,
+                decision_hash TEXT NOT NULL DEFAULT '',
+                idempotency_key TEXT,
+                resume_claim_token TEXT,
+                resume_claimed_at DATETIME,
+                resume_started_at DATETIME,
+                resume_status TEXT NOT NULL DEFAULT 'idle',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO task_test_point_checkpoints (task_id, attempt, status) "
+            "VALUES (1, 1, 'confirmed')"
+        )
+        conn.execute(
+            "DELETE FROM schema_migrations WHERE version = '0005_checkpoint_coverage_metadata'"
+        )
+        conn.commit()
+
+    init_db()
+
+    applied = get_applied_migrations(get_engine())
+    assert "0005_checkpoint_coverage_metadata" in applied
+    baks = list(db_path.parent.glob("*.pre-migration-*.bak"))
+    assert baks, "migrating legacy db should produce a .bak backup"
+
+    with sqlite3.connect(db_path) as conn:
+        cols = {
+            row[1]
+            for row in conn.execute('PRAGMA table_info("task_test_point_checkpoints")').fetchall()
+        }
+        assert "coverage_metadata_json" in cols
+        row = conn.execute(
+            "SELECT task_id, status, coverage_metadata_json FROM task_test_point_checkpoints"
+        ).fetchone()
+        assert row == (1, "confirmed", "{}")

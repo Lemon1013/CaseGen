@@ -14,12 +14,12 @@ function toDate(value: string | number | Date | null | undefined): Date | null {
   return Number.isNaN(parsed.getTime()) ? null : parsed
 }
 
-export function formatDateTime(
+function formatDateParts(
   value: string | number | Date | null | undefined,
   timeZone: string = DEFAULT_TIME_ZONE,
-): string {
+): Record<string, string> | null {
   const date = toDate(value)
-  if (!date) return '-'
+  if (!date) return null
   const parts = new Intl.DateTimeFormat('zh-CN', {
     timeZone,
     year: 'numeric',
@@ -30,6 +30,36 @@ export function formatDateTime(
     second: '2-digit',
     hourCycle: 'h23',
   }).formatToParts(date)
-  const get = (type: string) => parts.find((part) => part.type === type)?.value ?? ''
-  return `${get('year')}-${get('month')}-${get('day')} ${get('hour')}:${get('minute')}:${get('second')}`
+  const mapped: Record<string, string> = {}
+  for (const part of parts) {
+    mapped[part.type] = part.value
+  }
+  return mapped
+}
+
+export function formatDateTime(
+  value: string | number | Date | null | undefined,
+  timeZone: string = DEFAULT_TIME_ZONE,
+): string {
+  const parts = formatDateParts(value, timeZone)
+  if (!parts) return '-'
+  return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second}`
+}
+
+export function formatShortDateTime(
+  value: string | number | Date | null | undefined,
+  timeZone: string = DEFAULT_TIME_ZONE,
+): string {
+  const parts = formatDateParts(value, timeZone)
+  if (!parts) return '—'
+  return `${parts.month}-${parts.day} ${parts.hour}:${parts.minute}`
+}
+
+export function formatTimeOnly(
+  value: string | number | Date | null | undefined,
+  timeZone: string = DEFAULT_TIME_ZONE,
+): string {
+  const parts = formatDateParts(value, timeZone)
+  if (!parts) return ''
+  return `${parts.hour}:${parts.minute}:${parts.second}`
 }

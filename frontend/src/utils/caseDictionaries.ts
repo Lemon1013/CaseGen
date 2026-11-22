@@ -4,6 +4,8 @@ export type DimensionTagType = 'primary' | 'success' | 'warning' | 'danger' | 'i
 export type CaseStatusTagType = 'success' | 'info'
 export type CasePriority = 'P0' | 'P1' | 'P2'
 
+export const CASE_PRIORITIES: readonly CasePriority[] = ['P0', 'P1', 'P2']
+
 export const TASK_STATUS_LABELS: Record<string, string> = {
   draft: '草稿',
   retrieving: '检索中',

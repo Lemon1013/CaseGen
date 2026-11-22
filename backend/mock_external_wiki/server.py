@@ -28,6 +28,7 @@ import json
 import posixpath
 import re
 import secrets
+import socket
 import sys
 import threading
 import time
@@ -730,6 +731,21 @@ class MockWikiHandler(BaseHTTPRequestHandler):
                     self.send_header(key, value)
             self.end_headers()
             self.wfile.write(body)
+            self.wfile.flush()
+            if close_after:
+                # 在 Windows 下若直接关闭仍有未读完请求体的套接字，Winsock 会发送 TCP RST，
+                # 导致客户端还未读取响应就被中断（WinError 10053）。先半关闭写端并短时排空。
+                try:
+                    self.connection.shutdown(socket.SHUT_WR)
+                    self.connection.settimeout(0.2)
+                    drained = 0
+                    while drained < self._MAX_BODY_BYTES * 2:
+                        chunk = self.connection.recv(65536)
+                        if not chunk:
+                            break
+                        drained += len(chunk)
+                except OSError:
+                    pass
         except (BrokenPipeError, ConnectionResetError):
             self.close_connection = True
 

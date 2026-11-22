@@ -28,21 +28,16 @@ export interface DashboardProjectCounts {
   new_30d: number
 }
 
+export interface DashboardAgentCounts {
+  conversations: number
+  active_conversations: number
+  messages: number
+  new_30d: number
+}
+
 export interface DashboardStatusCount {
   status: string
   count: number
-}
-
-export interface DashboardDocumentCounts {
-  total: number
-  pending_ingest: number
-  by_status: DashboardStatusCount[]
-}
-
-export interface DashboardWikiCounts {
-  pages: number
-  pending_reviews: number
-  by_status: DashboardStatusCount[]
 }
 
 export interface DashboardGroupCount {
@@ -81,8 +76,7 @@ export interface DashboardDataPoolCounts {
 export interface DashboardCounts {
   users: DashboardUserCounts
   projects: DashboardProjectCounts
-  documents: DashboardDocumentCounts
-  wiki: DashboardWikiCounts
+  agent: DashboardAgentCounts
   tasks: DashboardTaskCounts
   cases: DashboardCaseCounts
   platform: DashboardPlatformCounts
@@ -98,11 +92,11 @@ export interface TrendPoint {
   date: string
   tasks: number
   cases: number
-  documents: number
+  agent_conversations: number
 }
 
 export interface RecentActivity {
-  type: string
+  type: 'task' | 'case' | string
   id: number | string
   title: string
   status: string

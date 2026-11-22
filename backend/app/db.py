@@ -283,6 +283,32 @@ def _migrate_0004_remove_legacy_wiki_prompts(engine: Engine) -> None:
                 )
 
 
+def _migrate_0005_checkpoint_coverage_metadata(engine: Engine) -> None:
+    """为旧版 task_test_point_checkpoints 表补齐 coverage_metadata_json 列。"""
+    with engine.begin() as conn:
+        exists = conn.execute(
+            text(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='task_test_point_checkpoints'"
+            )
+        ).first()
+        if exists is None:
+            return
+        cols = {
+            str(row[1])
+            for row in conn.execute(
+                text('PRAGMA table_info("task_test_point_checkpoints")')
+            ).fetchall()
+        }
+        if "coverage_metadata_json" not in cols:
+            conn.execute(
+                text(
+                    'ALTER TABLE "task_test_point_checkpoints" '
+                    'ADD COLUMN "coverage_metadata_json" TEXT NOT NULL DEFAULT \'{}\''
+                )
+            )
+
+
 VERSIONED_MIGRATIONS: tuple[MigrationEntry, ...] = (
     ("0001_v2_refactor_baseline", "Record v2 refactor baseline", _noop_baseline_migration),
     (
@@ -299,6 +325,11 @@ VERSIONED_MIGRATIONS: tuple[MigrationEntry, ...] = (
         "0004_remove_legacy_wiki_prompts",
         "Remove retired wiki_analyze and wiki_write prompt templates",
         _migrate_0004_remove_legacy_wiki_prompts,
+    ),
+    (
+        "0005_checkpoint_coverage_metadata",
+        "Add coverage_metadata_json column to task_test_point_checkpoints",
+        _migrate_0005_checkpoint_coverage_metadata,
     ),
 )
 
