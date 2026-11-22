@@ -1,10 +1,12 @@
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue'
+import { onMounted, onUnmounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   createModel,
   deleteModel,
   listModels,
+  MODELS_UPDATED_EVENT,
+  notifyModelsUpdated,
   pingModel,
   updateModel,
   type ModelConfig,
@@ -99,6 +101,7 @@ async function submit() {
       })
       ElMessage.success('已创建模型')
     }
+    notifyModelsUpdated()
     dialogVisible.value = false
     await load()
   } catch (e) {
@@ -126,6 +129,7 @@ async function handleDelete(row: ModelConfig) {
       type: 'warning',
     })
     await deleteModel(row.id)
+    notifyModelsUpdated()
     ElMessage.success('已删除')
     await load()
   } catch (e) {
@@ -134,7 +138,18 @@ async function handleDelete(row: ModelConfig) {
   }
 }
 
-onMounted(load)
+function onModelsUpdated() {
+  void load()
+}
+
+onMounted(() => {
+  window.addEventListener(MODELS_UPDATED_EVENT, onModelsUpdated)
+  void load()
+})
+
+onUnmounted(() => {
+  window.removeEventListener(MODELS_UPDATED_EVENT, onModelsUpdated)
+})
 </script>
 
 <template>

@@ -1,16 +1,11 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
-import { ElMessage, ElMessageBox } from 'element-plus'
-import { CircleClose, Document, Promotion } from '@element-plus/icons-vue'
-import { importRequirementDoc } from '../../api/requirements'
-import { AGENT_MESSAGE_MAX_CHARS } from '../../api/agent'
+import { ElMessage } from 'element-plus'
+import { Document, Promotion } from '@element-plus/icons-vue'
+import { AGENT_MESSAGE_MAX_CHARS, uploadAgentAttachment, type AgentAttachmentItem } from '../../api/agent'
 
 /**
- * 对话输入框 + 需求文档投喂（一体化悬浮输入舱）。
- * dropzone 与文档导入范式复用自 WorkbenchView.vue：
- * importRequirementDoc 解析 .md/.txt/.pdf/.docx，返回 text 追加进输入框（超长按 20000 字截断并提示）。
- * 另外后端对单条消息正文有 32000 字硬上限（AgentMessageCreate.max_length），
- * 导入截断后仍可能超限，所以发送前再拦一次，避免白跑一次 422。
+ * Agent 对话输入框与附件上传：上传后只保留附件元数据，不把解析正文注入输入框；正文上限为 32000 字。
  */
 
 const props = defineProps<{
@@ -19,25 +14,29 @@ const props = defineProps<{
   busy?: boolean
   placeholder?: string
   projectId?: number | null
+  conversationId?: string | null
 }>()
 
 const emit = defineEmits<{
-  send: [content: string]
+  send: [content: string, attachmentIds: string[], attachments: AgentAttachmentItem[]]
 }>()
-
-const MAX_IMPORT_CHARS = 20000
 
 const draft = ref('')
 const importingDoc = ref(false)
 const docDragOver = ref(false)
 const docFileInput = ref<HTMLInputElement | null>(null)
-const sourceFilename = ref('')
+const attachments = ref<AgentAttachmentItem[]>([])
 
 /** 超出后端上限（AGENT_MESSAGE_MAX_CHARS）就禁止发送，字数条转红。 */
 const overLimit = computed(() => draft.value.length > AGENT_MESSAGE_MAX_CHARS)
 
+function formatAttachmentSize(size: number): string {
+  if (size < 1024 * 1024) return String(Math.max(1, Math.round(size / 1024)) + ' KB')
+  return String((size / 1024 / 1024).toFixed(2) + ' MB')
+}
+
 const canSend = computed(
-  () => !props.disabled && !props.sending && !overLimit.value && Boolean(draft.value.trim()),
+  () => !props.disabled && !props.sending && !importingDoc.value && !overLimit.value && Boolean(draft.value.trim() || attachments.value.length),
 )
 
 const charCount = computed(() => draft.value.length)
@@ -47,7 +46,7 @@ const charCountText = computed(() =>
     ? `${charCount.value} / ${AGENT_MESSAGE_MAX_CHARS} 字（超出上限，请删减）`
     : charCount.value > 0
       ? `${charCount.value} / ${AGENT_MESSAGE_MAX_CHARS} 字`
-      : 'Ctrl / ⌘ + Enter 发送，Enter 换行；支持拖拽或导入需求文档',
+      : 'Ctrl / ⌘ + Enter 发送，Enter 换行',
 )
 
 watch(
@@ -57,70 +56,55 @@ watch(
   },
 )
 
+watch(() => props.conversationId, () => clearAfterSend())
+
 function pickImportFile() {
   docFileInput.value?.click()
 }
 
 function onImportFileChange(event: Event) {
   const input = event.target as HTMLInputElement
-  const file = input.files?.[0]
+  const files = Array.from(input.files || [])
   input.value = ''
-  if (file) void importDoc(file)
+  void uploadFiles(files)
 }
 
 function onDropImport(event: DragEvent) {
   docDragOver.value = false
-  const file = event.dataTransfer?.files?.[0]
-  if (file) void importDoc(file)
+  const files = Array.from(event.dataTransfer?.files || [])
+  void uploadFiles(files)
 }
 
-async function importDoc(file: File) {
+async function uploadFiles(files: File[]) {
+  if (props.disabled || importingDoc.value) return
+  if (!props.conversationId) {
+    ElMessage.warning('请先选择会话')
+    return
+  }
+  const remaining = 5 - attachments.value.length
+  if (remaining <= 0) {
+    ElMessage.warning('最多上传 5 个附件')
+    return
+  }
+  if (files.length > remaining) ElMessage.warning('最多上传 5 个附件，超出部分未上传')
   importingDoc.value = true
   try {
-    const result = await importRequirementDoc(file, props.projectId ?? null)
-    let text = result.text
-    if (text.length > MAX_IMPORT_CHARS) {
-      text = text.slice(0, MAX_IMPORT_CHARS)
-      ElMessage.warning(
-        `已截断至 ${MAX_IMPORT_CHARS} 字，原文共 ${result.char_count} 字，请人工补齐关键内容`,
-      )
-    }
-    if (!draft.value.trim()) {
-      draft.value = text
-    } else {
-      let action = 'replace'
+    for (const file of files.slice(0, remaining)) {
       try {
-        action = 'append'
-        await ElMessageBox.confirm(
-          `已解析「${result.title}」共 ${result.char_count} 字。输入框已有内容，如何处理？`,
-          '导入需求文档',
-          {
-            confirmButtonText: '追加',
-            cancelButtonText: '覆盖',
-            distinguishCancelAndClose: true,
-            type: 'warning',
-          },
-        )
-      } catch (choice) {
-        if (choice === 'cancel') action = 'replace'
-        else return
+        const item = await uploadAgentAttachment(props.conversationId, file, props.projectId ?? null)
+        attachments.value.push(item)
+        ElMessage.success('已上传 ' + item.filename)
+      } catch (error) {
+        ElMessage.error('附件上传失败：' + (error as Error).message)
       }
-      draft.value =
-        action === 'append'
-          ? `${draft.value}\n\n${text}`.slice(0, MAX_IMPORT_CHARS * 2)
-          : text
     }
-    sourceFilename.value = file.name
-    ElMessage.success(`已导入 ${result.char_count} 字，请检查后发送`)
-  } catch (error) {
-    ElMessage.error(`导入需求文档失败：${(error as Error).message}`)
   } finally {
     importingDoc.value = false
   }
 }
 
-function clearAttachment() {
-  sourceFilename.value = ''
+function removeAttachment(id: string) {
+  attachments.value = attachments.value.filter((item) => item.id !== id)
 }
 
 function setDraft(text: string) {
@@ -130,16 +114,18 @@ function setDraft(text: string) {
 function submit() {
   if (!canSend.value) return
   const content = draft.value.trim()
-  if (!content) return
   if (overLimit.value) {
     ElMessage.warning(
       `消息超出 ${AGENT_MESSAGE_MAX_CHARS} 字上限（当前 ${charCount.value} 字），请删减后再发送`,
     )
     return
   }
-  emit('send', content)
+  emit('send', content, attachments.value.map((item) => item.id), [...attachments.value])
+}
+
+function clearAfterSend() {
   draft.value = ''
-  sourceFilename.value = ''
+  attachments.value = []
 }
 
 function onKeydown(event: KeyboardEvent) {
@@ -150,7 +136,7 @@ function onKeydown(event: KeyboardEvent) {
   }
 }
 
-defineExpose({ submit, draft, setDraft })
+defineExpose({ submit, draft, setDraft, clearAfterSend })
 </script>
 
 <template>
@@ -162,15 +148,10 @@ defineExpose({ submit, draft, setDraft })
       @dragleave.prevent="docDragOver = false"
       @drop.prevent="onDropImport"
     >
-      <div v-if="sourceFilename" class="source-file-row">
-        <span class="source-file-name">
-          <el-icon><Document /></el-icon>
-          <span>{{ sourceFilename }}</span>
-        </span>
-        <el-button size="small" link type="danger" @click="clearAttachment">
-          <el-icon><CircleClose /></el-icon>
-          <span>移除</span>
-        </el-button>
+      <div v-if="attachments.length" class="source-file-row">
+        <el-tag v-for="item in attachments" :key="item.id" closable @close="removeAttachment(item.id)">
+          {{ item.filename }}（{{ formatAttachmentSize(item.size) }}）
+        </el-tag>
       </div>
 
       <el-input
@@ -194,9 +175,9 @@ defineExpose({ submit, draft, setDraft })
             @click="pickImportFile"
           >
             <el-icon><Document /></el-icon>
-            <span>从文档导入</span>
+            <span>上传附件</span>
           </el-button>
-          <span class="hint" :class="{ 'char-count-over': overLimit }">{{ charCountText }}</span>
+          <span class="hint" :class="{ 'char-count-over': overLimit }">{{ charCountText }}；可上传 .md/.txt/.pdf/.docx，最多 5 个，单个不超过 20MB</span>
         </div>
 
         <div class="composer-actions">
@@ -221,6 +202,7 @@ defineExpose({ submit, draft, setDraft })
       class="import-file-input"
       type="file"
       accept=".md,.txt,.pdf,.docx"
+      multiple
       @change="onImportFileChange"
     />
   </div>
@@ -292,9 +274,10 @@ defineExpose({ submit, draft, setDraft })
 }
 
 .source-file-row {
-  display: inline-flex;
+  display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-start;
+  flex-wrap: wrap;
   gap: 10px;
   padding: 4px 10px;
   border-radius: 6px;

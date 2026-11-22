@@ -8,14 +8,13 @@ import { useProjectStore } from '../projectStore'
 import { useAgentChatStore } from '../stores/agentChatStore'
 import ChatPanel from '../components/agent/ChatPanel.vue'
 import SkillPicker from '../components/agent/SkillPicker.vue'
-import CitationList from '../components/CitationList.vue'
-import { listCitations, type TaskCitation } from '../api/tasks'
-import type { AgentConversationItem, AgentSaveAsDraftResult } from '../api/agent'
+import SaveAgentCasesModal from '../components/agent/SaveAgentCasesModal.vue'
+import type { AgentConversationItem, AgentSaveCasesResult } from '../api/agent'
 
 /**
  * Agent 对话页（spec §3.6-3）。
  * 左列会话历史 + 中列消息流；顶部技能/模型收成一行摘要（展开可改当前会话配置），
- * 右栏会话信息与转存后的引用溯源收进抽屉，默认隐藏。
+ * 右栏会话信息与最近入库记录收进抽屉，默认隐藏。
  *
  * 所有流式状态都在 agentChatStore：MainLayout.vue:279 的 router-view :key = projects.state.currentId，
  * 切项目会销毁本视图；store 内 setProjectId() 负责 teardown，视图卸载只 releaseView()（有进行中的轮次
@@ -32,9 +31,9 @@ const creating = ref(false)
 const createTitle = ref('')
 const createSkill = ref<string | null>(null)
 const createModel = ref('')
-const citations = ref<TaskCitation[]>([])
-const citationsLoading = ref(false)
-const savedTaskId = ref<number | null>(null)
+const saveModalVisible = ref(false)
+const saveModalMessageId = ref<string | null>(null)
+const lastSavedCases = ref<AgentSaveCasesResult | null>(null)
 
 // 顶部摘要行的展开编辑与右栏抽屉；与新建弹窗的 createSkill/createModel 完全隔离。
 const configExpanded = ref(false)
@@ -58,12 +57,6 @@ const projectId = computed<number | null>(() => {
   if (projects.state.currentId) return projects.state.currentId
   const stored = Number(localStorage.getItem('casegen:last-project-id'))
   return Number.isInteger(stored) && stored > 0 ? stored : null
-})
-
-const spaceId = computed<number | undefined>(() => {
-  const raw = Array.isArray(route.query.space_id) ? route.query.space_id[0] : route.query.space_id
-  const value = Number(raw)
-  return Number.isInteger(value) && value > 0 ? value : undefined
 })
 
 const conversations = computed(() => store.conversations)
@@ -119,39 +112,27 @@ async function loadAll() {
   await Promise.all([store.loadConversations(), store.loadSkills(), store.loadModels()])
 }
 
-async function loadCitationsForTask(taskId: number | null) {
-  savedTaskId.value = taskId
-  citations.value = []
-  if (!taskId) return
-  citationsLoading.value = true
-  try {
-    citations.value = await listCitations(taskId, projectId.value)
-  } catch {
-    citations.value = []
-  } finally {
-    citationsLoading.value = false
-  }
+function onRequestSaveToCases(messageId: string) {
+  saveModalMessageId.value = messageId
+  saveModalVisible.value = true
 }
 
-/**
- * 后端返回 AgentSaveAsDraftOut{task_id, draft_id, requirement_id, imported_count, case_keys, message}
- * （spec §3.5 方案 a：虚拟 Requirement + shell GenerationTask + CaseDraft）。
- * task_id 是 number，可直接跳任务详情并用 CitationList(task_id) 拉溯源。
- */
-function onDraftSaved(result: AgentSaveAsDraftResult) {
-  const taskId = typeof result.task_id === 'number' ? result.task_id : null
-  const imported = typeof result.imported_count === 'number' ? result.imported_count : 0
-  const fallback = taskId
-    ? `已转存 ${imported} 条用例草稿（任务 #${taskId}）`
-    : '已转存为用例草稿'
-  ElMessage.success(result.message || fallback)
-  void loadCitationsForTask(taskId)
+function onCasesSaved(result: AgentSaveCasesResult) {
+  lastSavedCases.value = result
   void store.loadConversations()
 }
 
-function openTaskDetail(taskId: number | null) {
-  if (!taskId) return
-  void router.push({ name: 'task-detail', params: { id: String(taskId) }, query: { ...route.query } })
+function openCasesManagement(requirementId?: number | null) {
+  const query: Record<string, string> = {}
+  for (const [key, value] of Object.entries(route.query)) {
+    if (value === undefined || key === 'conversation') continue
+    const normalized = Array.isArray(value) ? String(value[0] ?? '') : String(value)
+    if (normalized) query[key] = normalized
+  }
+  if (requirementId != null && requirementId > 0) {
+    query.requirement_id = String(requirementId)
+  }
+  void router.push({ path: '/cases', query })
 }
 
 function toggleConfig() {
@@ -207,8 +188,8 @@ async function submitCreate() {
     await store.loadConversations()
     await store.selectConversation(conversation.id)
     syncQuery(conversation.id)
-    citations.value = []
-    savedTaskId.value = null
+    lastSavedCases.value = null
+    saveModalVisible.value = false
   } catch (error) {
     ElMessage.error(`创建会话失败：${(error as Error).message}`)
   } finally {
@@ -221,8 +202,8 @@ async function onSelect(conversation: AgentConversationItem) {
   try {
     await store.selectConversation(conversation.id)
     syncQuery(conversation.id)
-    citations.value = []
-    savedTaskId.value = null
+    lastSavedCases.value = null
+    saveModalVisible.value = false
   } catch (error) {
     ElMessage.error(`载入会话失败：${(error as Error).message}`)
   }
@@ -272,8 +253,9 @@ async function refreshSkills() {
 
 watch(projectId, (value) => {
   store.setProjectId(value)
-  citations.value = []
-  savedTaskId.value = null
+  lastSavedCases.value = null
+  saveModalVisible.value = false
+  saveModalMessageId.value = null
   void store.loadConversations()
 })
 
@@ -283,7 +265,16 @@ onMounted(async () => {
     ? route.query.conversation[0]
     : route.query.conversation
   if (typeof requested === 'string' && requested) {
-    await store.selectConversation(requested)
+    const existsInProject = conversations.value.some((item) => item.id === requested)
+    if (existsInProject) {
+      await store.selectConversation(requested)
+    } else if (conversations.value.length) {
+      const first = conversations.value[0]
+      await store.selectConversation(first.id)
+      syncQuery(first.id)
+    } else {
+      syncQuery(null)
+    }
   } else if (conversations.value.length) {
     const first = conversations.value[0]
     await store.selectConversation(first.id)
@@ -342,16 +333,46 @@ onUnmounted(() => {
       :description="store.skillsError"
     />
     <el-alert
-      v-if="store.modelsError"
+      v-if="store.agentAvailable && !store.dshReady"
+      class="page-alert"
+      type="error"
+      show-icon
+      :closable="false"
+      title="DSH Agent 接口未就绪，当前无法发起对话"
+    >
+      <template #default>
+        <div class="dsh-alert-body">
+          <p class="dsh-alert-desc">
+            当前未能连接至对接的 DSH 服务（可能尚未启动、服务地址未配置或网络不可达），请确认 DSH 服务正常运行后重试。
+            <span v-if="store.dshUnavailableReason" class="dsh-alert-reason">
+              （原因：{{ store.dshUnavailableReason }}）
+            </span>
+          </p>
+          <el-button
+            size="small"
+            type="primary"
+            plain
+            :loading="store.modelsLoading"
+            @click="store.loadModels(true)"
+          >
+            重新检测连接
+          </el-button>
+        </div>
+      </template>
+    </el-alert>
+    <el-alert
+      v-else-if="store.dshReady && store.modelsError"
       class="page-alert"
       type="warning"
       show-icon
       :closable="false"
       title="DSH 模型列表载入失败，可手动输入 provider/model 或稍后重试"
-      :description="store.modelsError"
     >
       <template #default>
-        <el-button size="small" link type="primary" @click="store.loadModels(true)">重试</el-button>
+        <div class="dsh-alert-body">
+          <p class="dsh-alert-desc">{{ store.modelsError }}</p>
+          <el-button size="small" link type="primary" @click="store.loadModels(true)">重试</el-button>
+        </div>
       </template>
     </el-alert>
 
@@ -400,7 +421,8 @@ onUnmounted(() => {
               <el-button
                 size="small"
                 type="primary"
-                :disabled="!store.agentAvailable || !projectId"
+                :disabled="!store.agentAvailable || !store.dshReady || !projectId"
+                :title="!store.dshReady ? 'DSH Agent 接口未就绪' : undefined"
                 @click="openCreateDialog"
               >
                 <el-icon><Plus /></el-icon>
@@ -503,7 +525,7 @@ onUnmounted(() => {
             <div class="chat-header-actions">
               <el-button link @click="infoDrawerVisible = true">
                 <el-icon><InfoFilled /></el-icon>
-                <span>会话信息与溯源</span>
+                <span>会话信息与入库记录</span>
               </el-button>
               <el-button link :disabled="!current" @click="toggleConfig">
                 {{ configExpanded ? '收起配置' : '修改配置' }}
@@ -572,9 +594,16 @@ onUnmounted(() => {
           </div>
         </div>
         <div v-if="!current" class="chat-placeholder">
-          <el-empty description="选择左侧会话，或新建一个对话" :image-size="72" />
+          <el-empty
+            :description="
+              !store.dshReady
+                ? 'DSH Agent 接口未就绪，暂无法新建对话，请先检查 DSH 服务状态后点击顶部「重新检测连接」'
+                : '选择左侧会话，或新建一个对话'
+            "
+            :image-size="72"
+          />
         </div>
-        <ChatPanel v-else @draft-saved="onDraftSaved" />
+        <ChatPanel v-else @save-to-cases="onRequestSaveToCases" />
       </el-card>
 
 
@@ -582,7 +611,7 @@ onUnmounted(() => {
 
     <el-drawer
       v-model="infoDrawerVisible"
-      title="会话信息与溯源"
+      title="会话信息与入库记录"
       size="380px"
       destroy-on-close
       class="info-drawer"
@@ -620,27 +649,41 @@ onUnmounted(() => {
         </dl>
         <el-empty v-else description="未选择会话" :image-size="56" />
 
-        <div v-if="savedTaskId" class="saved-block">
+        <div v-if="lastSavedCases" class="saved-block">
           <div class="saved-head">
             <el-icon><View /></el-icon>
-            <span>已转存为用例草稿</span>
+            <span>已直入用例管理</span>
           </div>
           <p class="saved-text">
-            草稿挂在生成任务 #{{ savedTaskId }} 下，可在任务详情页走既有的确认与入库流程。
+            目标需求：<strong>{{ lastSavedCases.requirement_title }}</strong>（#{{ lastSavedCases.requirement_id }}）
+            <br />
+            新增 {{ lastSavedCases.created_count }} 条 · 覆盖 {{ lastSavedCases.overwritten_count }} 条 · 跳过 {{ lastSavedCases.skipped_count }} 条
           </p>
-          <el-button size="small" type="primary" plain @click="openTaskDetail(savedTaskId)">
-            打开任务详情
+          <div v-if="lastSavedCases.case_keys.length" class="saved-keys">
+            <el-tag
+              v-for="key in lastSavedCases.case_keys.slice(0, 8)"
+              :key="key"
+              size="small"
+              effect="plain"
+            >
+              {{ key }}
+            </el-tag>
+          </div>
+          <el-button size="small" type="primary" plain @click="openCasesManagement(lastSavedCases.requirement_id)">
+            前往用例管理查看
           </el-button>
-        </div>
-
-        <div v-if="citationsLoading" class="citation-block citation-loading">
-          正在载入引用溯源…
-        </div>
-        <div v-else-if="citations.length" class="citation-block">
-          <CitationList :citations="citations" :count="citations.length" :space-id="spaceId" />
         </div>
       </div>
     </el-drawer>
+
+    <SaveAgentCasesModal
+      v-model="saveModalVisible"
+      :project-id="projectId"
+      :conversation="current"
+      :messages="store.persistedMessages"
+      :message-id="saveModalMessageId"
+      @saved="onCasesSaved"
+    />
 
     <el-dialog v-model="createDialogVisible" title="新建 Agent 对话" width="560px">
       <el-form label-position="top">
@@ -1077,22 +1120,38 @@ onUnmounted(() => {
   color: var(--cg-text-secondary, #52525b);
 }
 
-.citation-block {
-  margin-top: 14px;
+.saved-keys {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 10px;
 }
 
-.citation-loading {
-  font-size: 12px;
-  color: var(--cg-text-muted, #71717a);
-}
-
-/* 抽屉内容沿用页面已有的 .info-* / .saved-* / .citation-* 样式 */
+/* 抽屉内容沿用页面已有的 .info-* / .saved-* 样式 */
 .info-drawer :deep(.el-drawer__body) {
   padding: 0;
 }
 
 .info-drawer-body {
   padding: 4px 16px 20px;
+}
+
+.dsh-alert-body {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.dsh-alert-desc {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.dsh-alert-reason {
+  color: var(--cg-text-muted);
+  word-break: break-word;
 }
 
 

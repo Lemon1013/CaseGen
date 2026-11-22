@@ -16,6 +16,7 @@ from app.models.entities import (
     TestPoint as PointRow,
     TestPointCaseLink as PointCaseLink,
 )
+from app.services.knowledge_providers import KnowledgeHit, ProjectKnowledgeSearchResult
 from app.services.task_pipeline import run_generate
 
 
@@ -35,27 +36,42 @@ def _model(client: TestClient) -> int:
 
 
 def _hits(*_args, **_kwargs):
-    return {
-        "wiki_hits": [
-            {
-                "id": 101,
-                "title": "余额规则",
-                "path": "pages/balance.md",
-                "content": "余额不足时拒绝下单。",
-                "score": 0.9,
-            }
+    return ProjectKnowledgeSearchResult(
+        configured=True,
+        empty_reason="none",
+        message="",
+        hits=[
+            KnowledgeHit(
+                source_id=1,
+                source_name="外部知识库",
+                provider_type="llm_wiki_django",
+                chunk_id=101,
+                title="余额规则",
+                file_path="raw/sources/balance.docx",
+                document_path="raw/sources/balance.docx",
+                heading_path="规则 > 余额",
+                score=0.9,
+                weighted_score=0.9,
+                snippet="余额不足时拒绝下单。",
+                evidence_snippet="余额不足时拒绝下单。",
+            ),
+            KnowledgeHit(
+                source_id=1,
+                source_name="外部知识库",
+                provider_type="llm_wiki_django",
+                chunk_id=201,
+                title="余额原文",
+                file_path="raw/sources/rules.docx",
+                document_path="raw/sources/rules.docx",
+                heading_path="规则 > 原文",
+                score=0.8,
+                weighted_score=0.8,
+                snippet="原文规定余额不足不得提交订单。",
+                evidence_snippet="原文规定余额不足不得提交订单。",
+            ),
         ],
-        "source_hits": [
-            {
-                "source_chunk_id": 201,
-                "document_id": 99,
-                "title": "余额原文",
-                "path": "documents/rules.md",
-                "content": "原文规定余额不足不得提交订单。",
-                "score": 0.8,
-            }
-        ],
-    }
+        warnings=[],
+    )
 
 
 def _markdown(*, strict: bool = False) -> str:
@@ -69,11 +85,10 @@ def _markdown(*, strict: bool = False) -> str:
     )
 
 
-def _install_hooks(monkeypatch, *, point_payload: str, markdown: str) -> None:
-    monkeypatch.setattr("app.api.tasks._GENERATE_CHAT_FN", lambda **kwargs: markdown)
-    monkeypatch.setattr(
-        "app.services.task_pipeline._GENERATE_CHAT_FN", lambda **kwargs: markdown
-    )
+def _install_hooks(monkeypatch, *, point_payload: str, markdown) -> None:
+    gen_fn = markdown if callable(markdown) else (lambda **kwargs: markdown)
+    monkeypatch.setattr("app.api.tasks._GENERATE_CHAT_FN", gen_fn)
+    monkeypatch.setattr("app.services.task_pipeline._GENERATE_CHAT_FN", gen_fn)
     monkeypatch.setattr("app.api.tasks._TEST_POINTS_CHAT_FN", lambda **kwargs: point_payload)
     monkeypatch.setattr(
         "app.services.task_pipeline._TEST_POINTS_CHAT_FN", lambda **kwargs: point_payload
@@ -124,17 +139,25 @@ def _six_point_payload() -> str:
     )
 
 
-def _six_case_markdown(*, mapped: int = 6) -> str:
-    sections = []
-    for index in range(1, 7):
-        point_key = f"TP-{index:03d}" if index <= mapped else "TP-999"
-        sections.append(
-            f"## TC-{index:03d} 用例 {index}\n"
-            "- 优先级：P1\n"
-            f"- 关联测试点：{point_key}\n\n"
-            "### 预期结果\n行为符合需求。"
-        )
-    return "\n\n".join(sections)
+def _six_case_point_chat(*, mapped: int = 6):
+    """Simulate point-by-point LLM replies for TP-001..TP-006."""
+
+    def _chat(**kwargs) -> str:
+        messages = kwargs.get("messages") or []
+        joined = "\n".join(m.get("content", "") for m in messages)
+        for index in range(1, 7):
+            key = f"TP-{index:03d}"
+            if f"稳定Key：{key}" in joined:
+                point_key = key if index <= mapped else "TP-999"
+                return (
+                    f"## TC-{index:03d} 用例 {index}\n"
+                    "- 优先级：P1\n"
+                    f"- 关联测试点：{point_key}\n\n"
+                    "### 预期结果\n行为符合需求。"
+                )
+        return ""
+
+    return _chat
 
 
 def _wait_for_status(client: TestClient, task_id: int, expected: set[str]) -> dict:
@@ -162,7 +185,7 @@ def _start_to_points(
         markdown=markdown or _markdown(),
     )
     monkeypatch.setattr(
-        "app.services.hybrid_retrieve.hybrid_retrieve", _hits
+        "app.services.task_pipeline.search_project_knowledge", _hits
     )
     body = {
         "title": "余额不足下单",
@@ -408,12 +431,19 @@ def test_test_point_edit_confirm_version_and_idempotency(tmp_app_data, monkeypat
 def test_new_task_strict_finalize_and_deterministic_coverage(tmp_app_data, monkeypatch):
     client = TestClient(create_app())
     model_id = _model(client)
+
+    def _only_tp001_chat(**kwargs) -> str:
+        joined = "\n".join(m.get("content", "") for m in (kwargs.get("messages") or []))
+        if "稳定Key：TP-001" in joined:
+            return _markdown(strict=True)
+        return ""
+
     task_id, checkpoint = _start_to_points(
         client,
         monkeypatch,
         model_id=model_id,
-        point_payload=_point_payload(two_points=True, citations=["1", "S1"]),
-        markdown=_markdown(strict=True),
+        point_payload=_point_payload(two_points=True, citations=["E1", "E2"]),
+        markdown=_only_tp001_chat,
     )
     _confirm_points(client, task_id, checkpoint, f"coverage-confirm-{task_id}")
     generated = _wait_for_status(client, task_id, {"generated", "failed"})
@@ -448,7 +478,7 @@ def test_generated_draft_coverage_is_available_before_and_after_finalize(
         monkeypatch,
         model_id=model_id,
         point_payload=_six_point_payload(),
-        markdown=_six_case_markdown(),
+        markdown=_six_case_point_chat(),
     )
     _confirm_points(client, task_id, checkpoint, f"six-point-coverage-{task_id}")
     assert _wait_for_status(client, task_id, {"generated"})["status"] == "generated"
@@ -481,7 +511,7 @@ def test_generated_draft_leaves_unmapped_current_point_uncovered(tmp_app_data, m
         monkeypatch,
         model_id=model_id,
         point_payload=_six_point_payload(),
-        markdown=_six_case_markdown(mapped=5),
+        markdown=_six_case_point_chat(mapped=5),
     )
     _confirm_points(client, task_id, checkpoint, f"partial-draft-coverage-{task_id}")
     assert _wait_for_status(client, task_id, {"generated"})["status"] == "generated"
@@ -615,7 +645,7 @@ def test_legacy_finalize_and_old_generating_recovery(tmp_app_data, monkeypatch):
     ).json()
     point = _point_payload()
     _install_hooks(monkeypatch, point_payload=point, markdown=_markdown())
-    monkeypatch.setattr("app.services.hybrid_retrieve.hybrid_retrieve", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not retrieve")))
+    monkeypatch.setattr("app.services.task_pipeline.search_project_knowledge", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not retrieve")))
     with Session(get_engine()) as session:
         row = session.get(GenerationTask, task["id"])
         assert row is not None

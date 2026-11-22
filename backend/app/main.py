@@ -8,18 +8,17 @@ from fastapi.responses import JSONResponse
 from sqlmodel import Session
 from starlette.responses import FileResponse
 
-from app.api.documents import router as documents_router
 from app.api.auth import router as auth_router
 from app.api.cases import router as cases_router
 from app.api.models_cfg import router as models_router
 from app.api.prompts import router as prompts_router
 from app.api.requirements import router as requirements_router
 from app.api.tasks import router as tasks_router
-from app.api.wiki import router as wiki_router
 from app.api.wiki_spaces import router as wiki_spaces_router
 from app.api.platform_data import router as platform_data_router
 from app.api.projects import router as projects_router
 from app.api.external_wikis import router as external_wikis_router
+from app.api.knowledge_sources import router as knowledge_sources_router
 from app.api.agent_chat import router as agent_chat_router
 from app.api.users import router as users_router
 from app.api.dashboard import router as dashboard_router
@@ -29,7 +28,6 @@ from app.db import get_engine, init_db
 from app.services.auth import get_user_for_token
 from app.services.permissions import current_user, is_admin, snapshot_user
 from app.services.prompts_seed import seed_default_prompts
-from app.services.wiki_jobs import recover_ingest_jobs
 from app.services.task_jobs import recover_generation_jobs
 from app.services.projects import (
     is_project_scoped_path,
@@ -67,10 +65,6 @@ def create_app() -> FastAPI:
     init_db()
     with Session(get_engine()) as session:
         seed_default_prompts(session)
-    # The durable Job table is the queue.  Recovery is idempotent and the
-    # scheduler itself has one worker, so repeated app construction does not
-    # create a second concurrent Wiki ingest worker.
-    recover_ingest_jobs()
     recover_generation_jobs()
 
     app = FastAPI(title="CaseGen API", version="0.1.0")
@@ -107,6 +101,9 @@ def create_app() -> FastAPI:
         allowed.add(host_origin)
         return origin in allowed
 
+    def _is_positive_int_str(value: str | None) -> bool:
+        return bool(value and value.isascii() and value.isdigit() and int(value) > 0)
+
     @app.middleware("http")
     async def authentication_middleware(request: Request, call_next):
         # OPTIONS is handled by the CORS middleware and carries no session
@@ -118,96 +115,124 @@ def create_app() -> FastAPI:
         path = request.url.path
         if path.startswith("/api"):
             unsafe = request.method not in {"GET", "HEAD", "OPTIONS", "TRACE"}
-            if config.AUTH_ENABLED and path not in public_paths:
-                with Session(get_engine()) as auth_session:
-                    user = get_user_for_token(
-                        auth_session,
-                        request.cookies.get(config.AUTH_COOKIE_NAME),
-                    )
-                    # Freeze the identity WHILE the session is still open.
-                    # The ORM User becomes detached (and its attributes expire)
-                    # as soon as this `with` block closes; keeping it on the
-                    # request would make any later getattr(user, ...) attempt
-                    # a lazy refresh and raise DetachedInstanceError -> 500.
-                    identity = snapshot_user(user) if user is not None else None
-                if identity is None:
-                    return JSONResponse({"detail": "Not authenticated"}, status_code=401)
-                request.state.user = identity
-
-            if config.AUTH_ENABLED and unsafe:
-                origin = request.headers.get("origin")
-                referer = request.headers.get("referer")
-                if origin:
-                    if not _same_origin(origin, request):
-                        return JSONResponse(
-                            {"detail": "Cross-origin request blocked"}, status_code=403
-                        )
-                elif referer:
-                    if not _same_origin(referer, request):
-                        return JSONResponse(
-                            {"detail": "Cross-origin request blocked"}, status_code=403
-                        )
-                else:
-                    return JSONResponse(
-                        {"detail": "Origin or Referer header is required"}, status_code=403
-                    )
-
-            project_raw = request.query_params.get("project_id")
-            if config.AUTH_ENABLED and is_project_scoped_path(path) and project_raw is None:
-                return JSONResponse({"detail": "project_id is required"}, status_code=422)
-            if project_raw is not None and not project_raw.isdigit():
-                return JSONResponse({"detail": "project_id must be a positive integer"}, status_code=422)
-            # Visibility fallback: a project hidden from ordinary users must
-            # be unreachable on project DATA paths such as /api/tasks and
-            # /api/cases, even though the scope check below deliberately skips
-            # the /api/projects/ prefix.  It applies only to real project-data
-            # paths: client.ts injects project_id into every /api request, so
-            # a global guard would also 404 GET /api/projects (the list the
-            # user needs in order to switch away) and GET /api/prompts (which
-            # must stay visible and editable for everyone).  The 404 wording
-            # matches the existing scope guard so a hidden project is
-            # indistinguishable from one that does not exist.
-            if (
-                project_raw
-                and project_raw.isdigit()
-                and config.AUTH_ENABLED
-                and current_user(request) is not None
-                and not is_admin(request)
-                and is_project_visibility_path(path)
-            ):
-                from app.models.entities import Project
-
-                with Session(get_engine()) as visibility_session:
-                    project = visibility_session.get(Project, int(project_raw))
-                    if project is not None and not bool(project.is_public):
-                        return JSONResponse(
-                            {"detail": "Resource not found in project"}, status_code=404
-                        )
-            if project_raw and project_raw.isdigit() and is_project_scoped_path(path) and not path.startswith("/api/projects/"):
-                query_spaces = [
-                    int(value)
-                    for key in ("space_id", "wiki_space_id")
-                    for value in request.query_params.getlist(key)
-                    if value.isdigit()
-                ]
-                try:
-                    with Session(get_engine()) as scope_session:
-                        validate_request_project_scope(
-                            scope_session,
-                            int(project_raw),
-                            request.url.path,
-                            query_spaces,
-                        )
-                except ValueError:
-                    return JSONResponse({"detail": "Resource not found in project"}, status_code=404)
-
-            # If a browser client sends a double-submit token, validate it.
-            # Origin/Referer remains the mandatory CSRF boundary; optional
-            # token validation also protects clients that opt into the header.
+            # Stateless double-submit CSRF check: when a client opts into
+            # X-CSRF-Token, reject mismatches before opening any DB session.
             csrf_header = request.headers.get("x-csrf-token")
             csrf_cookie = request.cookies.get(config.AUTH_CSRF_COOKIE_NAME)
-            if config.AUTH_ENABLED and unsafe and csrf_header is not None and csrf_header != csrf_cookie:
+            if (
+                config.AUTH_ENABLED
+                and unsafe
+                and csrf_header is not None
+                and csrf_header != csrf_cookie
+            ):
                 return JSONResponse({"detail": "CSRF validation failed"}, status_code=403)
+
+            project_raw = request.query_params.get("project_id")
+            need_auth = config.AUTH_ENABLED and path not in public_paths
+            has_valid_project_raw = _is_positive_int_str(project_raw)
+            need_visibility = (
+                has_valid_project_raw
+                and config.AUTH_ENABLED
+                and is_project_visibility_path(path)
+            )
+            need_scope = (
+                has_valid_project_raw
+                and is_project_scoped_path(path)
+                and not path.startswith("/api/projects/")
+            )
+
+            def _check_origin_and_project_param() -> JSONResponse | None:
+                if config.AUTH_ENABLED and unsafe:
+                    origin = request.headers.get("origin")
+                    referer = request.headers.get("referer")
+                    if origin:
+                        if not _same_origin(origin, request):
+                            return JSONResponse(
+                                {"detail": "Cross-origin request blocked"}, status_code=403
+                            )
+                    elif referer:
+                        if not _same_origin(referer, request):
+                            return JSONResponse(
+                                {"detail": "Cross-origin request blocked"}, status_code=403
+                            )
+                    else:
+                        return JSONResponse(
+                            {"detail": "Origin or Referer header is required"}, status_code=403
+                        )
+
+                if config.AUTH_ENABLED and is_project_scoped_path(path) and project_raw is None:
+                    return JSONResponse({"detail": "project_id is required"}, status_code=422)
+                if project_raw is not None and not has_valid_project_raw:
+                    return JSONResponse(
+                        {"detail": "project_id must be a positive integer"}, status_code=422
+                    )
+                return None
+
+            # Use a single short-lived DB Session for all middleware checks
+            # (token lookup + snapshot, project visibility, project scope), and
+            # close it strictly before awaiting call_next(request).
+            if need_auth or need_visibility or need_scope:
+                with Session(get_engine()) as mw_session:
+                    if need_auth:
+                        user = get_user_for_token(
+                            mw_session,
+                            request.cookies.get(config.AUTH_COOKIE_NAME),
+                        )
+                        # Freeze the identity WHILE the session is still open.
+                        # The ORM User becomes detached (and its attributes expire)
+                        # as soon as this `with` block closes; keeping it on the
+                        # request would make any later getattr(user, ...) attempt
+                        # a lazy refresh and raise DetachedInstanceError -> 500.
+                        identity = snapshot_user(user) if user is not None else None
+                        if identity is None:
+                            return JSONResponse({"detail": "Not authenticated"}, status_code=401)
+                        request.state.user = identity
+
+                    precheck_error = _check_origin_and_project_param()
+                    if precheck_error is not None:
+                        return precheck_error
+
+                    # Visibility fallback: a project hidden from ordinary users must
+                    # be unreachable on project DATA paths such as /api/tasks and
+                    # /api/cases, even though the scope check below deliberately skips
+                    # the /api/projects/ prefix.  The 404 wording matches the existing
+                    # scope guard so a hidden project is indistinguishable from one
+                    # that does not exist.
+                    if (
+                        need_visibility
+                        and current_user(request) is not None
+                        and not is_admin(request)
+                    ):
+                        from app.models.entities import Project
+
+                        project = mw_session.get(Project, int(project_raw))
+                        if project is not None and not bool(project.is_public):
+                            return JSONResponse(
+                                {"detail": "Resource not found in project"}, status_code=404
+                            )
+
+                    if need_scope:
+                        query_spaces = [
+                            int(value)
+                            for key in ("space_id", "wiki_space_id")
+                            for value in request.query_params.getlist(key)
+                            if _is_positive_int_str(value)
+                        ]
+                        try:
+                            validate_request_project_scope(
+                                mw_session,
+                                int(project_raw),
+                                request.url.path,
+                                query_spaces,
+                            )
+                        except ValueError:
+                            return JSONResponse(
+                                {"detail": "Resource not found in project"}, status_code=404
+                            )
+            else:
+                precheck_error = _check_origin_and_project_param()
+                if precheck_error is not None:
+                    return precheck_error
 
         return await call_next(request)
 
@@ -215,18 +240,17 @@ def create_app() -> FastAPI:
     def health():
         return {"status": "ok"}
 
-    app.include_router(documents_router)
     app.include_router(auth_router)
     app.include_router(cases_router)
     app.include_router(models_router)
     app.include_router(prompts_router)
     app.include_router(requirements_router)
     app.include_router(tasks_router)
-    app.include_router(wiki_router)
     app.include_router(wiki_spaces_router)
     app.include_router(platform_data_router)
     app.include_router(projects_router)
     app.include_router(external_wikis_router)
+    app.include_router(knowledge_sources_router)
     app.include_router(users_router)
     app.include_router(dashboard_router)
     # Agent plane (line A).  Registered last so its /api/agent prefix can never

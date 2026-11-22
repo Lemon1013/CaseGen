@@ -25,3 +25,21 @@ class ProjectExternalWiki(SQLModel, table=True):
     enabled: bool = True
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow, sa_column_kwargs={"onupdate": _utcnow})
+
+
+class ProjectKnowledgeSource(SQLModel, table=True):
+    __tablename__ = "project_knowledge_sources"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    project_id: int = Field(foreign_key="projects.id", index=True)
+    name: str = Field(default="外部知识库")
+    provider_type: str = Field(default="llm_wiki_django", index=True)
+    base_url: str = Field(default="http://127.0.0.1:8091")
+    auth_type: str = Field(default="none")
+    config_json: str = Field(default="{}")
+    credentials_json: str = Field(default="{}")
+    weight: float = Field(default=1.0)
+    priority: int = Field(default=100)
+    enabled: bool = Field(default=True)
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow, sa_column_kwargs={"onupdate": _utcnow})

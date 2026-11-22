@@ -41,7 +41,7 @@ async function submit() {
     <el-card class="auth-card" shadow="never">
       <div class="auth-brand">CaseGen</div>
       <h1>登录</h1>
-      <p class="auth-hint">登录后管理测试用例、任务和 Wiki 知识库</p>
+      <p class="auth-hint">登录后管理测试用例、生成任务与外部知识库</p>
       <el-alert
         v-if="passwordChanged"
         type="success"

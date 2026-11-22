@@ -2,13 +2,13 @@
 
 Field names stay snake_case on both ends, matching the rest of the backend.
 The draft payload models mirror the app.schemas.tasks draft output models so
-the agent's save-as-draft exit reuses the existing structured draft UI.
+the agent's direct TestCase import reuses the same structured tree contract.
 """
 
 from __future__ import annotations
 
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -46,6 +46,15 @@ class AgentConversationOut(BaseModel):
     updated_at: datetime
 
 
+class AgentAttachmentOut(BaseModel):
+    id: str
+    filename: str
+    size: int
+    content_type: str
+    char_count: int
+    created_at: datetime
+
+
 class AgentMessageOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -54,6 +63,7 @@ class AgentMessageOut(BaseModel):
     role: str
     content: str
     reasoning: str = ""
+    attachments: List[AgentAttachmentOut] = Field(default_factory=list)
     created_at: datetime
 
 
@@ -64,10 +74,11 @@ class AgentConversationDetail(AgentConversationOut):
 
 
 class AgentMessageCreate(BaseModel):
-    content: str = Field(min_length=1, max_length=32_000)
+    content: str = Field(default="", max_length=32_000)
     idempotency_key: str = Field(min_length=1, max_length=200)
     # Optional optimistic lock; when supplied a stale version yields 409.
     expected_version: Optional[int] = Field(default=None, ge=1)
+    attachment_ids: List[str] = Field(default_factory=list, max_length=5)
 
 
 class AgentMessageAccepted(BaseModel):
@@ -160,11 +171,26 @@ class AgentDraftPointGroupIn(BaseModel):
     cases: List[AgentDraftCaseIn] = Field(default_factory=list)
 
 
-class AgentSaveAsDraftOut(BaseModel):
-    task_id: int
-    draft_id: int
+class AgentSaveCasesIn(BaseModel):
+    message_id: str = Field(min_length=1, max_length=64)
+    target_mode: Literal["existing_requirement", "new_requirement"]
+    requirement_id: Optional[int] = Field(default=None, ge=1)
+    requirement_title: Optional[str] = Field(default=None, max_length=200)
+    requirement_description: Optional[str] = Field(default=None, max_length=20_000)
+    conflict_strategy: Literal["error", "overwrite", "skip"] = "error"
+
+
+class AgentSaveCasesOut(BaseModel):
     requirement_id: int
+    requirement_title: str
+    created_requirement: bool = False
+    message_id: str
+    conflict_strategy: str
     imported_count: int
+    created_count: int = 0
+    overwritten_count: int = 0
+    skipped_count: int = 0
     case_keys: List[str] = Field(default_factory=list)
-    version: int = 1
+    overwritten_keys: List[str] = Field(default_factory=list)
+    skipped_keys: List[str] = Field(default_factory=list)
     message: str = ""

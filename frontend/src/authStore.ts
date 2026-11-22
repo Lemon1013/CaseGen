@@ -13,6 +13,7 @@ import {
 } from './api/auth'
 import { ApiError, bumpAuthEpoch, getAuthEpoch } from './api/client'
 import { resetProjectStoreState } from './projectStore'
+import { useAgentChatStore } from './stores/agentChatStore'
 
 function safeRedirect(value: unknown): string {
   if (typeof value !== 'string' || !value.startsWith('/') || value.startsWith('//')) return '/'
@@ -47,6 +48,7 @@ export const useAuthStore = defineStore('auth', () => {
       'casegen:agent-list-collapsed',
     ]) localStorage.removeItem(key)
     resetProjectStoreState()
+    useAgentChatStore().dispose()
   }
 
   function invalidateRestore() {

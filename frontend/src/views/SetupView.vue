@@ -3,6 +3,7 @@ import { ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '../authStore'
+import { PASSWORD_MAX_LENGTH, PASSWORD_POLICY_HINT, passwordPolicyError } from '../utils/password'
 
 const auth = useAuthStore()
 const router = useRouter()
@@ -18,8 +19,13 @@ async function retryService() {
 }
 
 async function submit() {
-  if (!username.value.trim() || password.value.length < 10) {
-    ElMessage.warning('用户名不能为空，密码至少 10 位')
+  if (!username.value.trim()) {
+    ElMessage.warning('用户名不能为空')
+    return
+  }
+  const passwordError = passwordPolicyError(password.value)
+  if (passwordError) {
+    ElMessage.warning(passwordError)
     return
   }
   if (password.value !== confirmPassword.value) {
@@ -58,8 +64,8 @@ async function submit() {
       <el-form label-position="top" @submit.prevent="submit">
         <el-form-item label="用户名"><el-input v-model="username" autocomplete="username" /></el-form-item>
         <el-form-item label="显示名称"><el-input v-model="displayName" autocomplete="name" /></el-form-item>
-        <el-form-item label="密码"><el-input v-model="password" type="password" show-password autocomplete="new-password" /></el-form-item>
-        <el-form-item label="确认密码"><el-input v-model="confirmPassword" type="password" show-password autocomplete="new-password" @keyup.enter="submit" /></el-form-item>
+        <el-form-item label="密码"><el-input v-model="password" type="password" :maxlength="PASSWORD_MAX_LENGTH" show-password autocomplete="new-password" :placeholder="PASSWORD_POLICY_HINT" /></el-form-item>
+        <el-form-item label="确认密码"><el-input v-model="confirmPassword" type="password" :maxlength="PASSWORD_MAX_LENGTH" show-password autocomplete="new-password" @keyup.enter="submit" /></el-form-item>
         <el-button class="auth-submit" type="primary" :loading="loading" @click="submit">完成初始化</el-button>
       </el-form>
     </el-card>

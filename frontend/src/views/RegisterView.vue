@@ -4,6 +4,7 @@ import { ElMessage } from 'element-plus'
 import { useRouter } from 'vue-router'
 import { ApiError } from '../api/client'
 import { useAuthStore } from '../authStore'
+import { PASSWORD_MAX_LENGTH, PASSWORD_POLICY_HINT, passwordPolicyError } from '../utils/password'
 
 const auth = useAuthStore()
 const router = useRouter()
@@ -26,8 +27,9 @@ async function submit() {
     ElMessage.warning('用户名需为 3-32 位，以字母开头，仅可包含小写字母、数字、.、_ 或 -')
     return
   }
-  if (password.value.length < 10) {
-    ElMessage.warning('密码至少 10 位')
+  const passwordError = passwordPolicyError(password.value)
+  if (passwordError) {
+    ElMessage.warning(passwordError)
     return
   }
   if (password.value !== confirmPassword.value) {
@@ -83,7 +85,7 @@ async function submit() {
           <el-input v-model="displayName" maxlength="80" autocomplete="name" placeholder="用于界面展示" @keyup.enter="submit" />
         </el-form-item>
         <el-form-item label="密码">
-          <el-input v-model="password" type="password" maxlength="1024" show-password autocomplete="new-password" placeholder="至少 10 位" @keyup.enter="submit" />
+          <el-input v-model="password" type="password" :maxlength="PASSWORD_MAX_LENGTH" show-password autocomplete="new-password" :placeholder="PASSWORD_POLICY_HINT" @keyup.enter="submit" />
         </el-form-item>
         <el-form-item label="确认密码">
           <el-input v-model="confirmPassword" type="password" maxlength="1024" show-password autocomplete="new-password" @keyup.enter="submit" />

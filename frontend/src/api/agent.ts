@@ -1,7 +1,8 @@
 import { api } from './client'
+import type { CaseConflictStrategy } from '../utils/caseDictionaries'
 
 /**
- * Agent 对话（DSH 集成，spec docs/superpowers/specs/2026-11-04-dsh-agent-integration-design.md §3.1-§3.2）。
+ * Agent 对话（DSH 集成）。正文可为空，但正文和附件不能同时为空；正文上限为 32000 字。
  *
  * 约定：
  * - 走 api() 封装 ⇒ 自动带 X-CSRF-Token、credentials include、自动注入 project_id query。
@@ -16,7 +17,7 @@ export type AgentConversationStatus = 'active' | 'busy' | 'closed'
 
 /**
  * 单条用户消息正文上限，对齐 backend/app/schemas/agent.py:66
- * `AgentMessageCreate.content: str = Field(min_length=1, max_length=32_000)`。
+ * 正文可为空，但正文和附件不能同时为空；正文上限 32000。
  * 超限会被后端 422 拒掉，前端先拦，避免白跑一次请求。
  */
 export const AGENT_MESSAGE_MAX_CHARS = 32_000
@@ -56,6 +57,16 @@ export interface AgentMessageItem {
   content: string
   /** 思考过程（模型 reasoning + 过场说明）；与正文分开存储。 */
   reasoning?: string
+  attachments?: AgentAttachmentItem[]
+  created_at: string
+}
+
+export interface AgentAttachmentItem {
+  id: string
+  filename: string
+  size: number
+  content_type: string
+  char_count: number
   created_at: string
 }
 
@@ -183,12 +194,13 @@ export interface AgentCreateConversationBody {
 }
 
 export interface AgentSendMessageBody {
-  /** 上限 AGENT_MESSAGE_MAX_CHARS（32000），且不可为空白（min_length=1）。 */
+  /** 正文可为空，但正文和附件不能同时为空；正文上限 32000 字。 */
   content: string
   /** 客户端生成，服务端查重（幂等）；上限 200 字。 */
   idempotency_key: string
   /** 乐观锁：回传会话当前 version，过期写入返回 409（AgentMessageCreate.expected_version）。 */
   expected_version?: number
+  attachment_ids?: string[]
 }
 
 /** POST /messages 的返回体，对齐 AgentMessageAccepted（schemas/agent.py:72）。
@@ -225,22 +237,42 @@ export interface AgentUpdateConversationBody {
   expected_version?: number
 }
 
+export type AgentSaveCasesTargetMode = 'existing_requirement' | 'new_requirement'
+
+export interface AgentSaveCasesConflictItem {
+  case_key: string
+  existing_case_id: number
+  existing_title: string
+  existing_status: string
+  new_title: string
+}
+
+export interface AgentSaveCasesPayload {
+  message_id: string
+  target_mode: AgentSaveCasesTargetMode
+  requirement_id?: number | null
+  requirement_title?: string | null
+  requirement_description?: string | null
+  conflict_strategy?: CaseConflictStrategy
+}
+
 /**
- * POST /api/agent/conversations/{id}/save-as-draft 的返回体，
- * 对齐 backend/app/schemas/agent.py:103 `AgentSaveAsDraftOut`（解析失败 422）。
- *
- * spec §3.5 方案 a：虚拟 Requirement + shell GenerationTask(status=generated) + CaseDraft，
- * 所以一定有 task_id（number，非 uuid）⇒ 可直接跳任务详情并用 CitationList(task_id) 拉溯源。
- * 注意：这里没有 points_with_cases —— 用例结构是解析 agent 输出的 fenced JSON 得到的，
- * 见 components/agent/parseAgentCases.ts。
+ * POST /api/agent/conversations/{id}/save-cases 的返回体，
+ * 对齐 backend/app/schemas/agent.py `AgentSaveCasesOut`。
  */
-export interface AgentSaveAsDraftResult {
-  task_id: number
-  draft_id: number
+export interface AgentSaveCasesResult {
   requirement_id: number
-  /** 实际导入的用例条数。 */
+  requirement_title: string
+  created_requirement: boolean
+  message_id: string
+  conflict_strategy: CaseConflictStrategy | string
   imported_count: number
+  created_count: number
+  overwritten_count: number
+  skipped_count: number
   case_keys: string[]
+  overwritten_keys: string[]
+  skipped_keys: string[]
   message: string
 }
 
@@ -380,17 +412,33 @@ export function sendAgentMessage(
   })
 }
 
+export function uploadAgentAttachment(conversationId: string, file: File, projectId?: AgentProjectId | null) {
+  const form = new FormData()
+  form.append('file', file)
+  return api<AgentAttachmentItem>('/api/agent/conversations/' + conversationId + '/attachments' + _projectQuery(projectId), {
+    method: 'POST',
+    body: form,
+  })
+}
+
 export function cancelAgentTurn(id: string, projectId?: AgentProjectId | null) {
   return api<AgentCancelResult>(`/api/agent/conversations/${id}/cancel${_projectQuery(projectId)}`, {
     method: 'POST',
   })
 }
 
-/** 从最近 assistant 消息解析用例 JSON 落库（spec §3.5 方案 a）；解析失败 422。 */
-export function saveAgentConversationAsDraft(id: string, projectId?: AgentProjectId | null) {
-  return api<AgentSaveAsDraftResult>(
-    `/api/agent/conversations/${id}/save-as-draft${_projectQuery(projectId)}`,
-    { method: 'POST' },
+/** 从指定 assistant 消息解析用例 JSON 并直入用例库（绑定已有或新建需求）。 */
+export function saveAgentMessageCases(
+  id: string,
+  payload: AgentSaveCasesPayload,
+  projectId?: AgentProjectId | null,
+) {
+  return api<AgentSaveCasesResult>(
+    `/api/agent/conversations/${encodeURIComponent(id)}/save-cases${_projectQuery(projectId)}`,
+    {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    },
   )
 }
 
@@ -438,8 +486,9 @@ export function createIdempotencyKey(): string {
  *    的 snapshot 也带**（_enrich_snapshot_locked:81-93）⇒ 取消进行中刷新页面仍能正确识别为用户中止；
  * ⑥ POST /messages 返回 AgentMessageAccepted{conversation, message, duplicated}（轮次在后台线程跑）；
  *    POST /cancel 返回 AgentCancelOut{conversation, cancelled, message}，**且随后一定发终态帧再关流**；
- * ⑦ POST /save-as-draft 返回 AgentSaveAsDraftOut{task_id, draft_id, requirement_id, imported_count,
- *    case_keys, message}，task_id 是 **number**（不是 uuid）；
+ * ⑦ POST /save-cases 返回 AgentSaveCasesOut{requirement_id, requirement_title, created_requirement,
+ *    message_id, conflict_strategy, imported_count, created_count, overwritten_count, skipped_count,
+ *    case_keys, overwritten_keys, skipped_keys, message}，直入 TestCase 不再建壳任务；
  * ⑧ 后端**不发**结构化 progress（agent 步骤数不定，message 里也不保证有 [n/m]）⇒ 前端一律不定进度条；
  * ⑨ project_id 后端一律 str(...) 归一化比较，query 传 number 或 string 都吃；跨项目一律 404；
  * ⑩ AGENT_ENABLED=false ⇒ 所有 /api/agent/* 返回 410 + 中文 detail（见 isAgentDisabled）；

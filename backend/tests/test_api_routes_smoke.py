@@ -7,10 +7,14 @@ from app.main import create_app
 
 EXPECTED_PATHS = {
     ("GET", "/api/health"),
-    ("POST", "/api/documents"),
-    ("GET", "/api/documents"),
-    ("GET", "/api/documents/{document_id}"),
-    ("POST", "/api/documents/{document_id}/ingest"),
+    ("GET", "/api/knowledge-providers/types"),
+    ("GET", "/api/projects/{project_id}/knowledge-sources"),
+    ("POST", "/api/projects/{project_id}/knowledge-sources"),
+    ("PUT", "/api/projects/{project_id}/knowledge-sources/{source_id}"),
+    ("DELETE", "/api/projects/{project_id}/knowledge-sources/{source_id}"),
+    ("POST", "/api/projects/{project_id}/knowledge-sources/test"),
+    ("GET", "/api/projects/{project_id}/knowledge-sources/{source_id}/files"),
+    ("GET", "/api/projects/{project_id}/knowledge-sources/{source_id}/file-content"),
     ("POST", "/api/models"),
     ("GET", "/api/models"),
     ("GET", "/api/models/{model_id}"),
@@ -38,17 +42,6 @@ EXPECTED_PATHS = {
     ("GET", "/api/tasks/{task_id}/events"),
     ("GET", "/api/tasks/{task_id}/reviews"),
     ("GET", "/api/tasks/{task_id}/revisions"),
-    ("GET", "/api/ingest-jobs/{job_id}"),
-    ("POST", "/api/ingest-jobs/{job_id}/retry-failed-windows"),
-    ("GET", "/api/wiki/pages"),
-    ("GET", "/api/wiki/pages/{page_id}"),
-    ("GET", "/api/wiki/reviews"),
-    ("GET", "/api/wiki/reviews/{review_id}"),
-    ("POST", "/api/wiki/reviews/{review_id}/approve"),
-    ("POST", "/api/wiki/reviews/{review_id}/reject"),
-    ("POST", "/api/wiki/reviews/{review_id}/acknowledge"),
-    ("GET", "/api/wiki/index"),
-    ("POST", "/api/wiki/retrieve"),
 }
 
 
@@ -68,11 +61,7 @@ def test_openapi_registers_all_expected_routes(tmp_app_data):
 
 def test_not_found_resources(tmp_app_data):
     client = TestClient(create_app())
-    assert client.get("/api/documents/99999").status_code == 404
     assert client.get("/api/models/99999").status_code == 404
     assert client.get("/api/prompts/99999").status_code == 404
     assert client.get("/api/requirements/99999").status_code == 404
     assert client.get("/api/tasks/99999").status_code == 404
-    assert client.get("/api/wiki/pages/99999").status_code == 404
-    assert client.get("/api/ingest-jobs/99999").status_code == 404
-    assert client.post("/api/documents/99999/ingest").status_code == 404

@@ -18,8 +18,11 @@ export interface RequirementDocImport {
   sha256: string
 }
 
-export function listRequirements() {
-  return api<RequirementItem[]>('/api/requirements')
+export function listRequirements(projectId?: number | null) {
+  const suffix = projectId != null && Number.isInteger(projectId) && projectId > 0
+    ? `?project_id=${encodeURIComponent(String(projectId))}`
+    : ''
+  return api<RequirementItem[]>(`/api/requirements${suffix}`)
 }
 
 export function getRequirement(id: number) {

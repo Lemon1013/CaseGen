@@ -9,10 +9,11 @@ from app import config
 from app.db import get_engine
 from app.main import create_app
 from app.models.entities import AuthSession, SystemSetting, User
+from app.services.auth import hash_password
 
-ADMIN_PASSWORD = "AdminPass123"
-MEMBER_PASSWORD = "MemberPass123"
-NEW_PASSWORD = "NewMemberPass456"
+ADMIN_PASSWORD = "CaseGen-Test1!"
+MEMBER_PASSWORD = "CaseGen-Test1!"
+NEW_PASSWORD = "CaseGen-Test2!"
 
 
 def _origin() -> dict[str, str]:
@@ -123,6 +124,51 @@ def test_register_rejects_weak_password(tmp_app_data, monkeypatch):
 
     response = _register(TestClient(create_app()), "weakpass", password="short")
     assert response.status_code == 422
+    assert "至少 10 位" in response.json()["detail"]
+
+
+def test_register_enforces_each_password_policy_rule(tmp_app_data, monkeypatch):
+    admin_client = _auth_client(tmp_app_data, monkeypatch)
+    _setup_admin(admin_client)
+
+    cases = (
+        ("lowercaseonly", "abcdefghij"),
+        ("missinglower", "ABCDEFGHI!"),
+        ("missingspecial", "Abcdefghij"),
+    )
+    for username, value in cases:
+        response = _register(TestClient(create_app()), username, password=value)
+        assert response.status_code == 422, response.text
+        assert "大写字母" in response.json()["detail"] or "特殊符号" in response.json()["detail"]
+
+    accepted = _register(TestClient(create_app()), "policyok", password="CaseGen-Test1!")
+    assert accepted.status_code == 201, accepted.text
+
+
+def test_setup_rejects_noncompliant_password(tmp_app_data, monkeypatch):
+    client = _auth_client(tmp_app_data, monkeypatch)
+    response = client.post(
+        "/api/auth/setup",
+        headers=_origin(),
+        json={"username": "admin", "password": "abcdefghij"},
+    )
+    assert response.status_code == 422
+    assert "特殊符号" in response.json()["detail"]
+
+
+def test_weak_legacy_password_still_logs_in(tmp_app_data, monkeypatch):
+    client = _auth_client(tmp_app_data, monkeypatch)
+    _setup_admin(client)
+    with Session(get_engine()) as session:
+        session.add(User(
+            username="legacy",
+            display_name="Legacy",
+            password_hash=hash_password("weakpassword"),
+            role="user",
+            is_active=True,
+        ))
+        session.commit()
+    assert _login(TestClient(create_app()), "legacy", "weakpassword").status_code == 200
 
 
 def test_register_rejects_invalid_username(tmp_app_data, monkeypatch):
@@ -379,3 +425,18 @@ def test_change_password_errors_keep_session_valid(tmp_app_data, monkeypatch):
 
     # Rejected attempts must not log the user out.
     assert client.get("/api/auth/me").status_code == 200
+
+
+def test_change_password_rejects_noncompliant_new_password(tmp_app_data, monkeypatch):
+    admin_client = _auth_client(tmp_app_data, monkeypatch)
+    _setup_admin(admin_client)
+    member = _create_member(admin_client)
+    client = TestClient(create_app())
+    assert _login(client, member["username"], MEMBER_PASSWORD).status_code == 200
+    response = client.post(
+        "/api/auth/change-password",
+        headers=_origin(),
+        json={"current_password": MEMBER_PASSWORD, "new_password": "abcdefghij"},
+    )
+    assert response.status_code == 422
+    assert "大写字母" in response.json()["detail"]

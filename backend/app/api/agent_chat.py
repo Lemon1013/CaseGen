@@ -2,7 +2,7 @@
 
 These routes are deliberately thin: conversation ownership, optimistic locking
 and idempotency live here, while the DSH conversation, the turn runner and the
-save-as-draft import live in ``app.services``.  Three rules inherited from the
+direct TestCase import live in ``app.services``.  Three rules inherited from the
 task plane apply unchanged:
 
 - the SSE handler is a ``sync def`` whose inner ``event_stream()`` is the async
@@ -21,17 +21,14 @@ matching rule as defence in depth.
 
 from __future__ import annotations
 
-import asyncio
+import json
 import logging
-import shutil
-import time
-from pathlib import Path
-from typing import AsyncIterator, Optional
+from typing import Optional
 
-import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, col, select
 
 from app import config
@@ -48,14 +45,17 @@ from app.schemas.agent import (
     AgentMessageAccepted,
     AgentMessageCreate,
     AgentMessageOut,
+    AgentAttachmentOut,
     AgentModelItem,
     AgentModelsOut,
-    AgentSaveAsDraftOut,
+    AgentSaveCasesIn,
+    AgentSaveCasesOut,
     AgentSkillOut,
 )
-from app.services import agent_draft, agent_gateway, agent_skills, agent_turn
+from app.services import agent_draft, agent_attachments, agent_gateway, agent_skills, agent_turn
 from app.services.agent_gateway import AgentGatewayError
-from app.services.agent_stream import agent_stream, encode_sse
+from app.services.agent_stream import agent_stream
+from app.services.stream_broker import build_sse_streaming_response
 from app.services.case_management import CaseDraftParseError
 from app.services.permissions import current_user
 from app.services.projects import request_project_id
@@ -95,9 +95,9 @@ _DETAIL_DELETE_BUSY = "本轮对话仍在进行中，请先取消再删除会话
 _DETAIL_DELETE_OK = "会话已删除。"
 _DETAIL_STREAM_IDLE = "当前没有进行中的 Agent 轮次。"
 _DETAIL_STREAM_UNAVAILABLE = "Agent 实时流不可用，请通过会话详情轮询。"
-_DETAIL_DRAFT_BUSY = "本轮对话仍在进行中，请等待结束后再导入草稿。"
+_DETAIL_DRAFT_BUSY = "本轮对话仍在进行中，请等待结束后再入库用例。"
 _DETAIL_DRAFT_FALLBACK = (
-    "用例草稿导入失败，未产生任何用例。请让 Agent 修正格式后重试，或导出 Markdown 手动整理。"
+    "用例入库失败，未产生任何用例。请让 Agent 修正格式后重试，或导出 Markdown 手动整理。"
 )
 
 
@@ -118,15 +118,24 @@ def _require_project(request: Request) -> int:
 
 
 def _owner_id(request: Request) -> Optional[int]:
-    """Return the signed-in user's id, or ``None`` when auth is disabled.
+    """Return the signed-in user's id, failing closed when auth is enabled.
 
-    ``tests/conftest.py`` turns authentication off for the legacy pipeline
-    suite, so ``request.state.user`` is absent.  In that compatibility mode
-    conversation ownership checks are skipped; production always has a user.
+    ``tests/conftest.py`` turns authentication off for legacy pipeline tests.
+    When ``AUTH_ENABLED`` is true, a missing user must raise 401 rather than
+    silently skipping ownership filters.
     """
 
     user = current_user(request)
-    return int(user.id) if user is not None and user.id is not None else None
+    if user is not None and user.id is not None:
+        return int(user.id)
+    if bool(config.AUTH_ENABLED):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    return None
+
+
+def _project_workspace_dir(session: Session, project_id: int, conversation: AgentConversation) -> str:
+    project = session.get(Project, project_id)
+    return str((project.workspace_dir if project is not None else "") or conversation.workspace_dir or "")
 
 
 def _message_counts(session: Session, conversation_ids: list[str]) -> dict[str, int]:
@@ -220,7 +229,17 @@ def _load_messages(session: Session, conversation_id: str) -> list[AgentMessageO
         .where(col(AgentMessage.conversation_id) == str(conversation_id))
         .order_by(col(AgentMessage.created_at), col(AgentMessage.id))
     ).all()
-    return [AgentMessageOut.model_validate(row) for row in rows]
+    return [_message_out(row) for row in rows]
+
+
+def _message_out(row: AgentMessage) -> AgentMessageOut:
+    try:
+        raw = json.loads(row.attachments_json or "[]")
+        items = [AgentAttachmentOut(**{key: item[key] for key in ("id", "filename", "size", "content_type", "char_count", "created_at")})
+                 for item in raw if isinstance(item, dict)]
+    except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+        items = []
+    return AgentMessageOut.model_validate(row).model_copy(update={"attachments": items})
 
 
 def _duplicate_message(
@@ -241,30 +260,6 @@ def _check_version(conversation: AgentConversation, expected_version: Optional[i
         return
     if int(conversation.version or 1) != int(expected_version):
         raise HTTPException(status_code=409, detail=_DETAIL_VERSION)
-
-
-def _cleanup_workspace(workspace_dir: str) -> None:
-    """Remove one agent scratch directory (best effort, never raises).
-
-    Only a directory strictly under the configured workspace root is removed,
-    so a stale or hand-edited row can never delete files outside
-    ``data/agent-workspace``.  The application database lives in ``data/meta``,
-    a sibling of the root, and is therefore unreachable by construction.
-    """
-
-    text = str(workspace_dir or "").strip()
-    if not text:
-        return
-    try:
-        root = Path(config.agent_workspace_root()).resolve()
-        target = Path(text).resolve()
-        target.relative_to(root)
-    except (OSError, ValueError):
-        logger.warning("跳过工作区根目录之外的 Agent 目录清理。")
-        return
-    if target == root:
-        return
-    shutil.rmtree(target, ignore_errors=True)
 
 
 def _close_dsh_session(dsh_session_id: str) -> None:
@@ -483,9 +478,8 @@ def delete_conversation(
 ) -> AgentDeleteOut:
     """Delete a conversation, its messages and its broker stream.
 
-    The DSH workspace directory under ``data/agent-workspace/<conv_id>/`` is
-    removed best-effort: it only ever holds agent scratch files, never the
-    application database.  A busy conversation must be cancelled first.
+    Conversation attachments are removed best-effort while preserving the shared
+    project workspace directory.  A busy conversation must be cancelled first.
     """
 
     _require_agent_enabled()
@@ -496,6 +490,7 @@ def delete_conversation(
         if conversation.status == _BUSY_STATUS:
             raise HTTPException(status_code=409, detail=_DETAIL_DELETE_BUSY)
         dsh_session_id = conversation.dsh_session_id
+        workspace_dir = _project_workspace_dir(session, project_id, conversation)
         messages = session.exec(
             select(AgentMessage).where(col(AgentMessage.conversation_id) == str(conversation_id))
         ).all()
@@ -508,7 +503,36 @@ def delete_conversation(
     agent_stream.discard(conversation_id)
     # Only close the session; shared project workspace & dir are preserved.
     _close_dsh_session(dsh_session_id or "")
+    try:
+        agent_attachments.delete_conversation_attachments(project_id=project_id, conversation_id=conversation_id,
+                                                           workspace_dir=workspace_dir)
+    except Exception:
+        logger.warning("清理 Agent 附件失败：conversation=%s", conversation_id, exc_info=True)
     return AgentDeleteOut(id=str(conversation_id), status="deleted", message=_DETAIL_DELETE_OK)
+
+
+@router.post("/conversations/{conversation_id}/attachments", response_model=AgentAttachmentOut)
+def upload_attachment(conversation_id: str, request: Request, file: UploadFile = File(...),
+                      session: Session = Depends(get_session)) -> AgentAttachmentOut:
+    _require_agent_enabled()
+    project_id = _require_project(request)
+    conversation = _get_conversation(session, conversation_id, project_id, _owner_id(request))
+    workspace_dir = _project_workspace_dir(session, project_id, conversation)
+    if conversation.status == _BUSY_STATUS:
+        raise HTTPException(status_code=409, detail=_DETAIL_BUSY)
+    if conversation.status == _CLOSED_STATUS:
+        raise HTTPException(status_code=409, detail=_DETAIL_CLOSED)
+    try:
+        content = file.file.read(config.MAX_UPLOAD_BYTES + 1)
+        meta = agent_attachments.save_attachment(project_id=project_id, conversation_id=conversation_id,
+            filename=file.filename or "", content=content, content_type=file.content_type,
+            workspace_dir=workspace_dir)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    except Exception:
+        logger.exception("Agent 附件解析失败：conversation=%s", conversation_id)
+        raise HTTPException(status_code=422, detail="附件解析失败，未保存附件。") from None
+    return AgentAttachmentOut(**{key: meta[key] for key in ("id", "filename", "size", "content_type", "char_count", "created_at")})
 
 
 @router.post("/conversations/{conversation_id}/messages", response_model=AgentMessageAccepted)
@@ -530,8 +554,6 @@ def post_message(
     project_id = _require_project(request)
     idempotency_key = body.idempotency_key.strip()
     content = body.content.strip()
-    if not content:
-        raise HTTPException(status_code=422, detail="消息内容不能为空。")
 
     started_stream_id: Optional[int] = None
     with agent_gateway.conversation_locks.hold(conversation_id):
@@ -543,24 +565,34 @@ def post_message(
         if conversation.status == _CLOSED_STATUS:
             raise HTTPException(status_code=409, detail=_DETAIL_CLOSED)
         _check_version(conversation, body.expected_version)
-
         duplicate = _duplicate_message(session, conversation_id, idempotency_key)
         if duplicate is not None:
-            message = AgentMessageOut.model_validate(duplicate)
+            message = _message_out(duplicate)
             conversation_out = _conversation_out(session, conversation)
             return AgentMessageAccepted(
                 conversation=conversation_out, message=message, duplicated=True
             )
 
+        if not content and not body.attachment_ids:
+            raise HTTPException(status_code=422, detail="消息内容不能为空。")
+
+        workspace_dir = _project_workspace_dir(session, project_id, conversation)
+        try:
+            attachments = agent_attachments.resolve_attachments(project_id=project_id, conversation_id=conversation_id,
+                attachment_ids=body.attachment_ids, workspace_dir=workspace_dir)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
+
         message = AgentMessage(
             conversation_id=str(conversation_id),
             role="user",
             content=content,
+            attachments_json=json.dumps(attachments, ensure_ascii=False),
             idempotency_key=idempotency_key,
         )
         session.add(message)
         if conversation.title == _DEFAULT_TITLE:
-            conversation.title = _title_from_message(content)
+            conversation.title = _title_from_message(content or f"附件：{attachments[0]['filename']}")
         conversation.status = _BUSY_STATUS
         conversation.cancel_requested = False
         conversation.version = int(conversation.version or 1) + 1
@@ -578,7 +610,7 @@ def post_message(
         )
         snapshot = agent_stream.snapshot(conversation_id) or {}
         started_stream_id = int(snapshot.get("stream_id") or 0)
-        message_out = AgentMessageOut.model_validate(message)
+        message_out = _message_out(message)
         conversation_out = _conversation_out(session, conversation)
 
     agent_turn.start_turn(conversation_id, stream_id=started_stream_id or 0)
@@ -675,90 +707,79 @@ def stream_conversation(
             "truncated": False,
         }
 
-    async def event_stream() -> AsyncIterator[str]:
-        sequence = int(snapshot.get("sequence") or 0)
-        stream_id = int(snapshot.get("stream_id") or 0)
-        next_heartbeat_at = time.monotonic() + _STREAM_HEARTBEAT_SEC
-        yield encode_sse("snapshot", dict(snapshot), sequence=sequence)
-        if snapshot.get("terminal") in {"completed", "failed"}:
-            return
-        while True:
-            result = agent_stream.poll_after(
-                conversation_id, sequence, stream_id=stream_id
-            )
-            if result.kind == "missing":
-                # Evicted or expired: close the stream and let EventSource
-                # reconnect, where the durable status is authoritative again.
-                return
-            if result.kind == "timeout":
-                now = time.monotonic()
-                if now >= next_heartbeat_at:
-                    yield ": keep-alive\n\n"
-                    next_heartbeat_at = now + _STREAM_HEARTBEAT_SEC
-                await asyncio.sleep(_STREAM_POLL_INTERVAL_SEC)
-                continue
-            if result.kind == "snapshot":
-                current = result.snapshot or {}
-                sequence = int(current.get("sequence") or sequence)
-                stream_id = int(current.get("stream_id") or stream_id)
-                yield encode_sse("snapshot", dict(current), sequence=sequence)
-                if current.get("terminal") in {"completed", "failed"}:
-                    return
-                continue
-            for item in result.events:
-                sequence = int(item.sequence)
-                yield encode_sse(item.event, item.payload, sequence=sequence)
-                if item.event in {"completed", "failed"}:
-                    return
-
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-store",
-            "X-Content-Type-Options": "nosniff",
-            "X-Accel-Buffering": "no",
-        },
+    return build_sse_streaming_response(
+        agent_stream,
+        conversation_id,
+        initial_snapshot=snapshot,
+        poll_interval_sec=_STREAM_POLL_INTERVAL_SEC,
+        heartbeat_sec=_STREAM_HEARTBEAT_SEC,
     )
 
 
 @router.post(
-    "/conversations/{conversation_id}/save-as-draft",
-    response_model=AgentSaveAsDraftOut,
+    "/conversations/{conversation_id}/save-cases",
+    response_model=AgentSaveCasesOut,
 )
-def save_as_draft(
+def save_cases(
     conversation_id: str,
+    body: AgentSaveCasesIn,
     request: Request,
     session: Session = Depends(get_session),
-) -> AgentSaveAsDraftOut:
-    """Import the latest agent answer as a case draft plus TestCase rows.
-
-    Spec 3.5 plan a: a virtual Requirement carries a shell GenerationTask set
-    straight to ``generated`` (the agent has no test-point checkpoint chain, so
-    neither the task state machine nor ``finalize_task`` applies), a CaseDraft
-    version is written from the rendered Markdown and
-    ``import_cases_from_draft`` produces the cases.  The whole thing is atomic:
-    a malformed answer leaves the conversation retryable and never commits a
-    partial case set.
-    """
+) -> AgentSaveCasesOut:
+    """Import cases from a specific assistant message directly into TestCase."""
 
     _require_agent_enabled()
     project_id = _require_project(request)
-    conversation = _get_conversation(session, conversation_id, project_id, _owner_id(request))
+    owner_id = _owner_id(request)
+    conversation = _get_conversation(session, conversation_id, project_id, owner_id)
     if conversation.status == _BUSY_STATUS:
         raise HTTPException(status_code=409, detail=_DETAIL_DRAFT_BUSY)
+
+    user = current_user(request)
+    operator = user.username if user is not None else None
     try:
-        result = agent_draft.save_conversation_as_draft(session, conversation)
+        result = agent_draft.save_message_cases_to_requirement(
+            session,
+            conversation,
+            message_id=body.message_id,
+            target_mode=body.target_mode,
+            requirement_id=body.requirement_id,
+            requirement_title=body.requirement_title,
+            requirement_description=body.requirement_description,
+            conflict_strategy=body.conflict_strategy,
+            operator=operator,
+        )
     except agent_draft.AgentDraftError as exc:
         session.rollback()
         code = str(getattr(exc, "code", "") or "")
+        if code == "not_found":
+            raise HTTPException(status_code=404, detail=_DETAIL_FOREIGN) from None
+        if code == "conflict":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": str(exc),
+                    "code": "conflict",
+                    "conflicts": list(getattr(exc, "conflicts", []) or []),
+                },
+            ) from None
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    except IntegrityError:
+        session.rollback()
         raise HTTPException(
-            status_code=409 if code == "conflict" else 422, detail=str(exc)
+            status_code=409,
+            detail={
+                "message": "存在并发重复的用例编号，请刷新后重试。",
+                "code": "conflict",
+                "conflicts": [],
+            },
         ) from None
     except CaseDraftParseError:
         session.rollback()
         logger.warning(
-            "Agent 草稿导入解析失败：conversation=%s", conversation_id
+            "Agent 消息用例解析失败：conversation=%s message=%s",
+            conversation_id,
+            body.message_id,
         )
         raise HTTPException(
             status_code=422, detail=_DETAIL_DRAFT_FALLBACK
@@ -766,17 +787,21 @@ def save_as_draft(
     except Exception:
         session.rollback()
         logger.exception(
-            "Agent 草稿导入发生未预期错误：conversation=%s", conversation_id
+            "Agent 消息直入用例库发生未预期错误：conversation=%s message=%s",
+            conversation_id,
+            body.message_id,
         )
         raise HTTPException(
             status_code=422, detail=_DETAIL_DRAFT_FALLBACK
         ) from None
+
     logger.info(
-        "Agent 对话已导入用例草稿：conversation=%s task=%s count=%s",
+        "Agent 消息已直入用例库：conversation=%s message=%s requirement=%s count=%s",
         conversation_id,
-        result.get("task_id"),
+        body.message_id,
+        result.get("requirement_id"),
         result.get("imported_count"),
     )
-    return AgentSaveAsDraftOut(**result)
+    return AgentSaveCasesOut(**result)
 
 

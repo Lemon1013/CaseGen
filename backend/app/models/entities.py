@@ -5,7 +5,7 @@ from typing import Optional
 from sqlalchemy import Column, ForeignKey, Index, Integer, Text, UniqueConstraint, text
 from sqlmodel import Field, SQLModel
 
-from app.models.external_wiki import ProjectExternalWiki
+from app.models.external_wiki import ProjectExternalWiki, ProjectKnowledgeSource
 
 
 def _utcnow() -> datetime:
@@ -47,6 +47,12 @@ class PromptTemplate(SQLModel, table=True):
     content: str
     version: int = 1
     is_active: bool = True
+    owner_user_id: Optional[int] = Field(default=None, index=True)
+    visibility: str = Field(
+        default="system",
+        index=True,
+        sa_column_kwargs={"server_default": "system"},
+    )  # "system" | "shared" | "private"
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow, sa_column_kwargs={"onupdate": _utcnow})
 
@@ -417,6 +423,11 @@ class TaskCitation(SQLModel, table=True):
     clause_ids_json: str = "[]"
     # Primary anchored clause if any
     anchor_clause: Optional[str] = None
+    # External knowledge source metadata (Phase 1 multi-provider)
+    knowledge_source_id: Optional[int] = Field(default=None, index=True)
+    file_path: Optional[str] = None
+    heading_path: Optional[str] = None
+    external_metadata_json: Optional[str] = None
 
 
 class TaskRetrievalCheckpoint(SQLModel, table=True):
@@ -938,6 +949,7 @@ class AgentMessage(SQLModel, table=True):
     content: str = ""
     # Thinking process shown as a collapsible panel; answer stays in content.
     reasoning: str = ""
+    attachments_json: str = "[]"
     # Client-supplied dedupe key so a retried POST cannot start a second turn.
     idempotency_key: Optional[str] = Field(default=None, index=True)
     created_at: datetime = Field(default_factory=_utcnow)

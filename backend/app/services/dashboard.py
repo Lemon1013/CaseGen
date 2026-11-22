@@ -4,12 +4,12 @@ from sqlalchemy import and_, case, distinct, func
 from sqlmodel import Session, select
 
 from app.models.entities import (
+    AgentConversation,
+    AgentMessage,
     CaseDraft,
     DataPool,
     DataPoolRevision,
-    Document,
     GenerationTask,
-    IngestJob,
     PlatformArtifact,
     PlatformRenderRun,
     Project,
@@ -18,18 +18,15 @@ from app.models.entities import (
     TestCase,
     TestCaseOperationLog,
     User,
-    WikiPageRow,
-    WikiReviewItem,
-    WikiSpace,
 )
 from app.schemas.dashboard import (
+    AgentCountsOut,
     CaseCountsOut,
     CaseOperationOut,
     CasePriorityCountOut,
     DashboardCountsOut,
     DashboardOverviewOut,
     DataPoolCountsOut,
-    DocumentCountsOut,
     PlatformCountsOut,
     ProjectCountsOut,
     RecentActivityOut,
@@ -40,7 +37,6 @@ from app.schemas.dashboard import (
     TaskGroupCountOut,
     TrendPointOut,
     UserCountsOut,
-    WikiCountsOut,
 )
 
 _SCORE_BANDS = (
@@ -181,33 +177,42 @@ def _project_counts(session: Session, now: datetime) -> ProjectCountsOut:
     )
 
 
-def _document_counts(session: Session) -> DocumentCountsOut:
-    rows = _group_counts(session, Document.status)
-    pending_ingest = _scalar_count(
-        session,
-        select(func.count(IngestJob.id)).where(
-            IngestJob.status.in_(("queued", "running"))
-        ),
-    )
-    return DocumentCountsOut(
-        total=sum(count for _, count in rows),
-        pending_ingest=pending_ingest,
-        by_status=_status_counts(rows),
-    )
+def _format_utc_iso(value: datetime) -> str:
+    """将数据库存储的 UTC datetime 统一格式化为带 Z 后缀的 ISO-8601 字符串。"""
+
+    if value.tzinfo is not None:
+        value = value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _wiki_counts(session: Session) -> WikiCountsOut:
-    rows = _group_counts(session, WikiPageRow.status)
-    pending_reviews = _scalar_count(
-        session,
-        select(func.count(WikiReviewItem.id)).where(
-            WikiReviewItem.status == "pending"
-        ),
-    )
-    return WikiCountsOut(
-        pages=sum(count for _, count in rows),
-        pending_reviews=pending_reviews,
-        by_status=_status_counts(rows),
+def _agent_counts(session: Session, now: datetime) -> AgentCountsOut:
+    cutoff = now - timedelta(days=30)
+    conv_row = session.exec(
+        select(
+            func.count(AgentConversation.id),
+            func.coalesce(
+                func.sum(
+                    case(
+                        (AgentConversation.status.in_(("active", "busy")), 1),
+                        else_=0,
+                    )
+                ),
+                0,
+            ),
+            func.coalesce(
+                func.sum(
+                    case((AgentConversation.created_at >= cutoff, 1), else_=0)
+                ),
+                0,
+            ),
+        )
+    ).one()
+    message_total = _scalar_count(session, select(func.count(AgentMessage.id)))
+    return AgentCountsOut(
+        conversations=int(conv_row[0] or 0),
+        active_conversations=int(conv_row[1] or 0),
+        messages=message_total,
+        new_30d=int(conv_row[2] or 0),
     )
 
 
@@ -227,16 +232,39 @@ def _task_counts(session: Session) -> TaskCountsOut:
 
 
 def _case_counts(session: Session) -> CaseCountsOut:
-    status_counts = dict(_group_counts(session, TestCase.status))
-    priority_counts = dict(_group_counts(session, TestCase.priority))
+    row = session.exec(
+        select(
+            func.count(TestCase.id),
+            func.coalesce(
+                func.sum(case((TestCase.status == "active", 1), else_=0)), 0
+            ),
+            func.coalesce(
+                func.sum(case((TestCase.status == "archived", 1), else_=0)), 0
+            ),
+            func.coalesce(
+                func.sum(case((TestCase.priority == "P0", 1), else_=0)), 0
+            ),
+            func.coalesce(
+                func.sum(case((TestCase.priority == "P1", 1), else_=0)), 0
+            ),
+            func.coalesce(
+                func.sum(case((TestCase.priority == "P2", 1), else_=0)), 0
+            ),
+        )
+    ).one()
+    priority_map = {
+        "P0": int(row[3] or 0),
+        "P1": int(row[4] or 0),
+        "P2": int(row[5] or 0),
+    }
     return CaseCountsOut(
-        total=sum(status_counts.values()),
-        active=status_counts.get("active", 0),
-        archived=status_counts.get("archived", 0),
+        total=int(row[0] or 0),
+        active=int(row[1] or 0),
+        archived=int(row[2] or 0),
         by_priority=[
             CasePriorityCountOut(
                 priority=priority,
-                count=priority_counts.get(priority, 0),
+                count=priority_map.get(priority, 0),
             )
             for priority in _CASE_PRIORITIES
         ],
@@ -270,8 +298,7 @@ def _dashboard_counts(
     return DashboardCountsOut(
         users=_user_counts(session, now),
         projects=_project_counts(session, now),
-        documents=_document_counts(session),
-        wiki=_wiki_counts(session),
+        agent=_agent_counts(session, now),
         tasks=_task_counts(session),
         cases=_case_counts(session),
         platform=_platform_counts(session),
@@ -310,7 +337,7 @@ def _trend(session: Session, now: datetime) -> list[TrendPointOut]:
     cutoff = datetime.combine(start_date, time.min)
     tasks = _counts_by_date(session, GenerationTask, cutoff)
     cases = _counts_by_date(session, TestCase, cutoff)
-    documents = _counts_by_date(session, Document, cutoff)
+    conversations = _counts_by_date(session, AgentConversation, cutoff)
     points: list[TrendPointOut] = []
     for offset in range(14):
         date_value = (start_date + timedelta(days=offset)).isoformat()
@@ -319,25 +346,30 @@ def _trend(session: Session, now: datetime) -> list[TrendPointOut]:
                 date=date_value,
                 tasks=tasks.get(date_value, 0),
                 cases=cases.get(date_value, 0),
-                documents=documents.get(date_value, 0),
+                agent_conversations=conversations.get(date_value, 0),
             )
         )
     return points
 
 
 def _recent_activity(session: Session) -> list[RecentActivityOut]:
+    # 严守隐私红线：管理员看板最近活动仅展示任务与用例，绝不暴露任何用户私密 Agent 会话。
     candidates: list[dict] = []
 
+    resolved_task_project = func.coalesce(
+        GenerationTask.project_id, Requirement.project_id
+    )
     task_rows = session.exec(
         select(
             GenerationTask.id,
             Requirement.title,
             GenerationTask.status,
-            GenerationTask.project_id,
-            Requirement.project_id,
+            resolved_task_project,
+            Project.name,
             GenerationTask.created_at,
         )
         .join(Requirement, GenerationTask.requirement_id == Requirement.id)
+        .outerjoin(Project, resolved_task_project == Project.id)
         .order_by(GenerationTask.created_at.desc(), GenerationTask.id.desc())
         .limit(6)
     ).all()
@@ -346,7 +378,7 @@ def _recent_activity(session: Session) -> list[RecentActivityOut]:
         title,
         status,
         project_id,
-        requirement_project_id,
+        project_name,
         created_at,
     ) in task_rows:
         candidates.append(
@@ -355,63 +387,8 @@ def _recent_activity(session: Session) -> list[RecentActivityOut]:
                 "id": int(task_id),
                 "title": str(title or ""),
                 "status": str(status or ""),
-                "project_id": (
-                    int(project_id)
-                    if project_id is not None
-                    else (
-                        int(requirement_project_id)
-                        if requirement_project_id is not None
-                        else None
-                    )
-                ),
-                "created_at": created_at,
-            }
-        )
-
-    document_rows = session.exec(
-        select(
-            Document.id,
-            Document.filename,
-            Document.status,
-            Document.space_id,
-            Document.created_at,
-        )
-        .order_by(Document.created_at.desc(), Document.id.desc())
-        .limit(6)
-    ).all()
-    for document_id, filename, status, space_id, created_at in document_rows:
-        candidates.append(
-            {
-                "type": "document",
-                "id": int(document_id),
-                "title": str(filename or ""),
-                "status": str(status or ""),
-                "space_id": int(space_id) if space_id is not None else None,
-                "created_at": created_at,
-            }
-        )
-
-    review_rows = session.exec(
-        select(
-            WikiReviewItem.id,
-            WikiReviewItem.reason,
-            WikiPageRow.title,
-            WikiReviewItem.status,
-            WikiReviewItem.space_id,
-            WikiReviewItem.created_at,
-        )
-        .outerjoin(WikiPageRow, WikiReviewItem.page_id == WikiPageRow.id)
-        .order_by(WikiReviewItem.created_at.desc(), WikiReviewItem.id.desc())
-        .limit(6)
-    ).all()
-    for review_id, reason, page_title, status, space_id, created_at in review_rows:
-        candidates.append(
-            {
-                "type": "review",
-                "id": int(review_id),
-                "title": str(page_title or reason or ""),
-                "status": str(status or ""),
-                "space_id": int(space_id) if space_id is not None else None,
+                "project_id": int(project_id) if project_id is not None else None,
+                "project_name": str(project_name or "") if project_id is not None else "",
                 "created_at": created_at,
             }
         )
@@ -422,59 +399,33 @@ def _recent_activity(session: Session) -> list[RecentActivityOut]:
             TestCase.title,
             TestCase.status,
             Requirement.project_id,
+            Project.name,
             TestCase.created_at,
         )
         .join(Requirement, TestCase.requirement_id == Requirement.id)
+        .outerjoin(Project, Requirement.project_id == Project.id)
         .order_by(TestCase.created_at.desc(), TestCase.id.desc())
         .limit(6)
     ).all()
-    for case_id, title, status, project_id, created_at in case_rows:
+    for (
+        case_id,
+        title,
+        status,
+        project_id,
+        project_name,
+        created_at,
+    ) in case_rows:
         candidates.append(
             {
                 "type": "case",
                 "id": int(case_id),
                 "title": str(title or ""),
                 "status": str(status or ""),
-                "project_id": (
-                    int(project_id) if project_id is not None else None
-                ),
+                "project_id": int(project_id) if project_id is not None else None,
+                "project_name": str(project_name or "") if project_id is not None else "",
                 "created_at": created_at,
             }
         )
-
-    space_ids = {
-        item["space_id"]
-        for item in candidates
-        if item.get("space_id") is not None
-    }
-    space_projects: dict[int, int | None] = {}
-    if space_ids:
-        for space_id, project_id in session.exec(
-            select(WikiSpace.id, WikiSpace.project_id).where(
-                WikiSpace.id.in_(space_ids)
-            )
-        ).all():
-            space_projects[int(space_id)] = (
-                int(project_id) if project_id is not None else None
-            )
-
-    for item in candidates:
-        if "space_id" in item:
-            item["project_id"] = space_projects.get(item["space_id"])
-
-    project_ids = {
-        item["project_id"]
-        for item in candidates
-        if item.get("project_id") is not None
-    }
-    project_names: dict[int, str] = {}
-    if project_ids:
-        for project_id, name in session.exec(
-            select(Project.id, Project.name).where(
-                Project.id.in_(project_ids)
-            )
-        ).all():
-            project_names[int(project_id)] = str(name or "")
 
     candidates.sort(
         key=lambda item: (item["created_at"], item["id"]),
@@ -487,12 +438,8 @@ def _recent_activity(session: Session) -> list[RecentActivityOut]:
             title=item["title"],
             status=item["status"],
             project_id=item.get("project_id"),
-            project_name=(
-                project_names.get(item["project_id"], "")
-                if item.get("project_id") is not None
-                else ""
-            ),
-            created_at=item["created_at"],
+            project_name=item.get("project_name", ""),
+            created_at=_format_utc_iso(item["created_at"]),
         )
         for item in candidates[:6]
     ]

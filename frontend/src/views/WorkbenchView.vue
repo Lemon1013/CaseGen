@@ -1,24 +1,21 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
+import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { listModels, type ModelConfig } from '../api/models'
+import { listModels, MODELS_UPDATED_EVENT, type ModelConfig } from '../api/models'
 import { listPrompts, type PromptTemplate } from '../api/prompts'
 import { createTask, generateTask, optimizeRequirement } from '../api/tasks'
 import { listCases, type TestCaseItem } from '../api/cases'
-import { listWikiSpaces, type WikiSpace } from '../api/wikiSpaces'
 import { importRequirementDoc, listRequirements, type RequirementItem } from '../api/requirements'
-import { chooseSpace, rememberAndRoute, spaceIdFromQuery } from '../utils/wikiSpace'
+import { useProjectStore } from '../projectStore'
 
 const router = useRouter()
-const route = useRoute()
+const projects = useProjectStore()
 const submitting = ref(false)
 const optimizing = ref(false)
 const loadingReferences = ref(false)
 const models = ref<ModelConfig[]>([])
 const prompts = ref<PromptTemplate[]>([])
-const spaces = ref<WikiSpace[]>([])
-const currentSpace = ref<WikiSpace | null>(null)
 const requirements = ref<RequirementItem[]>([])
 const referenceCases = ref<TestCaseItem[]>([])
 const selectedReferenceIds = ref<number[]>([])
@@ -26,6 +23,7 @@ const referenceSearch = ref('')
 const referenceTab = ref('library')
 const questions = ref<string[]>([])
 const showQuestions = ref(false)
+const knowledgeSourceCount = computed(() => projects.current.value?.knowledge_source_count ?? 0)
 
 type GenerationGranularity = 'compact' | 'standard' | 'detailed'
 
@@ -74,7 +72,7 @@ const dimensionLabelMap = new Map(dimensionOptions)
 const form = reactive({
   title: '', description: '', focusText: '', model_id: null as number | null,
   prompt_template_id: null as number | null, auto_review: false,
-  wiki_space_id: null as number | null, requirement_id: null as number | null,
+  requirement_id: null as number | null,
   generation_granularity: 'standard' as GenerationGranularity,
   test_dimensions: ['positive', 'negative', 'boundary'] as string[], reference_text: '',
   source_filename: null as string | null,
@@ -82,11 +80,40 @@ const form = reactive({
 const importingDoc = ref(false)
 const docDragOver = ref(false)
 const docFileInput = ref<HTMLInputElement | null>(null)
+const importedAutoTitle = ref<string | null>(null)
 const MAX_IMPORT_CHARS = 20000
 const selectedCases = computed(() => referenceCases.value.filter((row) => selectedReferenceIds.value.includes(row.id)))
 const referenceChars = computed(() => selectedCases.value.reduce((n, row) => n + row.content_md.length, 0) + form.reference_text.length)
 const selectedGranularity = computed(() => granularityOptions.find((item) => item.value === form.generation_granularity) || granularityOptions[1])
 const dimensionSummary = computed(() => form.test_dimensions.map((value) => dimensionLabelMap.get(value) || value).join('、') || '未选择')
+const promptGroups = computed(() => {
+  const groups: Array<{ key: string; label: string; items: PromptTemplate[] }> = [
+    {
+      key: 'system',
+      label: '系统预置',
+      items: prompts.value.filter((row) => row.visibility === 'system' || !row.visibility),
+    },
+    {
+      key: 'private',
+      label: '我的模板',
+      items: prompts.value.filter((row) => row.visibility === 'private'),
+    },
+    {
+      key: 'shared',
+      label: '团队共享',
+      items: prompts.value.filter((row) => row.visibility === 'shared'),
+    },
+  ]
+  return groups.filter((group) => group.items.length > 0)
+})
+
+function formatPromptOptionLabel(row: PromptTemplate) {
+  const base = `${row.name} (v${row.version})`
+  if (row.visibility === 'shared' && row.owner_username) {
+    return `${base} · @${row.owner_username}`
+  }
+  return base
+}
 
 function tags(text: string) { return text.split(/[,，\s]+/).map((x) => x.trim()).filter(Boolean).slice(0, 30) }
 
@@ -100,18 +127,18 @@ async function searchReferences() {
 
 async function loadOptions() {
   try {
-    const [modelsRows, promptRows, spaceRows, reqRows] = await Promise.all([
-      listModels(), listPrompts('generate'), listWikiSpaces(), listRequirements().catch(() => [] as RequirementItem[]),
+    const [modelsRows, promptRows, reqRows] = await Promise.all([
+      listModels(), listPrompts('generate'), listRequirements().catch(() => [] as RequirementItem[]),
     ])
     models.value = modelsRows
     prompts.value = promptRows.filter((row) => row.is_active)
     form.model_id = modelsRows.find((row) => row.is_default)?.id ?? null
-    form.prompt_template_id = prompts.value[0]?.id ?? null
-    spaces.value = spaceRows
+    const defaultPrompt =
+      prompts.value.find((row) => row.visibility === 'system' || !row.visibility) ??
+      prompts.value[0] ??
+      null
+    form.prompt_template_id = defaultPrompt?.id ?? null
     requirements.value = reqRows
-    currentSpace.value = chooseSpace(spaceRows, spaceIdFromQuery(route.query))
-    form.wiki_space_id = currentSpace.value?.id ?? null
-    if (currentSpace.value && spaceIdFromQuery(route.query) !== currentSpace.value.id) await rememberAndRoute(router, currentSpace.value.id, '/')
     await searchReferences()
   } catch (e) { ElMessage.error(`加载选项失败：${(e as Error).message}`) }
 }
@@ -164,17 +191,30 @@ async function importDoc(file: File) {
       if (merged === null) return
       form.description = merged
     }
-    if (!form.title.trim()) form.title = result.title.slice(0, 120)
+    if (!form.title.trim()) {
+      const nextTitle = result.title.slice(0, 120)
+      form.title = nextTitle
+      importedAutoTitle.value = nextTitle || null
+    } else {
+      importedAutoTitle.value = null
+    }
     form.source_filename = file.name
     ElMessage.success(`已导入 ${result.char_count} 字，请检查并手动编辑`)
   } catch (e) { ElMessage.error(`导入需求文档失败：${(e as Error).message}`) }
   finally { importingDoc.value = false }
 }
 
-function changeSpace(id: number) {
-  currentSpace.value = spaces.value.find((row) => row.id === id) || null
-  form.wiki_space_id = currentSpace.value?.id ?? null
-  void rememberAndRoute(router, id, '/')
+function clearImportedDoc() {
+  form.source_filename = null
+  form.description = ''
+  if (!form.requirement_id && importedAutoTitle.value && form.title === importedAutoTitle.value) {
+    form.title = ''
+  }
+  importedAutoTitle.value = null
+  if (docFileInput.value) {
+    docFileInput.value.value = ''
+  }
+  ElMessage.info('已清除导入的文档内容')
 }
 
 async function optimize() {
@@ -190,7 +230,6 @@ async function optimize() {
 
 async function submit() {
   if (!form.title.trim() || !form.description.trim()) return ElMessage.warning('请填写标题和需求描述')
-  if (!form.wiki_space_id || currentSpace.value?.status !== 'active') return ElMessage.warning('请选择活动 Wiki 空间')
   if (!form.test_dimensions.length) return ElMessage.warning('至少选择一个测试维度')
   if (referenceChars.value > 30000) return ElMessage.warning('参考用例快照总长度不能超过 30000 字符')
   submitting.value = true
@@ -200,7 +239,7 @@ async function submit() {
       // Imported source file only applies to a brand-new requirement.
       source_filename: form.requirement_id ? null : (form.source_filename || null),
       focus_tags: tags(form.focusText), model_id: form.model_id, prompt_template_id: form.prompt_template_id,
-      auto_review: form.auto_review, wiki_space_id: form.wiki_space_id, generation_granularity: form.generation_granularity,
+      auto_review: form.auto_review, wiki_space_id: projects.defaultWikiSpaceId.value ?? undefined, generation_granularity: form.generation_granularity,
       test_dimensions: form.test_dimensions, reference_case_ids: selectedReferenceIds.value, reference_text: form.reference_text.trim(),
     })
     await generateTask(task.id, { auto_review: form.auto_review }).catch((e) => ElMessage.warning(`启动生成失败：${(e as Error).message}`))
@@ -209,7 +248,29 @@ async function submit() {
   finally { submitting.value = false }
 }
 
-onMounted(loadOptions)
+async function syncModelsAfterSwitch() {
+  try {
+    const modelsRows = await listModels()
+    models.value = modelsRows
+    const nextDefault = modelsRows.find((row) => row.is_default)?.id ?? null
+    if (nextDefault != null) {
+      form.model_id = nextDefault
+    } else if (form.model_id != null && !modelsRows.some((row) => row.id === form.model_id)) {
+      form.model_id = modelsRows[0]?.id ?? null
+    }
+  } catch {
+    // 忽略后台刷新失败，保留当前表单选择
+  }
+}
+
+onMounted(() => {
+  window.addEventListener(MODELS_UPDATED_EVENT, syncModelsAfterSwitch)
+  void loadOptions()
+})
+
+onUnmounted(() => {
+  window.removeEventListener(MODELS_UPDATED_EVENT, syncModelsAfterSwitch)
+})
 </script>
 
 <template>
@@ -233,7 +294,20 @@ onMounted(loadOptions)
       <el-col :xs="24" :lg="15">
         <el-card shadow="never" class="block"><template #header>需求输入与优化</template>
           <el-form label-position="top" @submit.prevent>
-            <el-form-item label="已有需求"><el-select v-model="form.requirement_id" clearable filterable style="width:100%" placeholder="可选" @change="selectRequirement"><el-option v-for="row in requirements" :key="row.id" :label="`#${row.id} · ${row.title}`" :value="row.id" /></el-select></el-form-item>
+            <el-form-item label="已有需求">
+              <div class="requirement-field">
+                <el-select v-model="form.requirement_id" clearable filterable style="width:100%" placeholder="可选" @change="selectRequirement"><el-option v-for="row in requirements" :key="row.id" :label="`#${row.id} · ${row.title}`" :value="row.id" /></el-select>
+                <el-alert
+                  v-if="form.requirement_id"
+                  class="requirement-overwrite-alert"
+                  type="warning"
+                  :closable="false"
+                  show-icon
+                  title="选择已有需求会覆盖已生成用例"
+                  description="终版时会按 case_key 更新该需求下已存在的用例，并记录操作日志。"
+                />
+              </div>
+            </el-form-item>
             <el-form-item label="标题" required><el-input v-model="form.title" maxlength="120" show-word-limit /></el-form-item>
             <el-form-item label="需求描述" required>
               <div class="description-field">
@@ -245,7 +319,7 @@ onMounted(loadOptions)
                   <el-input v-model="form.description" type="textarea" :rows="8" maxlength="20000" show-word-limit />
                   <div v-if="form.source_filename" class="source-file-row">
                     <span class="hint">来源文件：{{ form.source_filename }}</span>
-                    <el-button link size="small" @click="form.source_filename = null">清除</el-button>
+                    <el-button link size="small" title="清除导入的文档及需求内容" @click="clearImportedDoc">清除</el-button>
                   </div>
                 </div>
               </div>
@@ -294,9 +368,44 @@ onMounted(loadOptions)
             </div>
           </el-form-item>
           <el-form-item label="通用测试维度"><el-checkbox-group v-model="form.test_dimensions" class="dimensions"><el-checkbox v-for="item in dimensionOptions" :key="item[0]" :value="item[0]">{{ item[1] }}</el-checkbox></el-checkbox-group></el-form-item>
-          <el-form-item label="Wiki 空间"><el-select v-model="form.wiki_space_id" style="width:100%" @change="changeSpace"><el-option v-for="row in spaces.filter((item) => item.status === 'active')" :key="row.id" :label="row.name" :value="row.id" /></el-select></el-form-item>
+          <el-form-item label="外部知识库">
+            <div v-if="knowledgeSourceCount > 0" class="knowledge-status-box knowledge-status-box--ready">
+              <span>当前项目已配置 <strong>{{ knowledgeSourceCount }}</strong> 个外部知识库，检索阶段将自动命中并注入引用。</span>
+            </div>
+            <el-alert
+              v-else
+              type="info"
+              :closable="false"
+              show-icon
+              title="当前项目尚未配置外部知识库，可联系管理员在项目管理中添加；仍可纯需求继续生成"
+            />
+          </el-form-item>
           <el-form-item label="模型"><el-select v-model="form.model_id" clearable style="width:100%"><el-option v-for="row in models" :key="row.id" :label="`${row.name} (${row.model_name})`" :value="row.id" /></el-select></el-form-item>
-          <el-form-item label="生成 Prompt"><el-select v-model="form.prompt_template_id" clearable style="width:100%"><el-option v-for="row in prompts" :key="row.id" :label="`${row.name} (v${row.version})`" :value="row.id" /></el-select></el-form-item>
+          <el-form-item label="生成 Prompt">
+            <el-select v-model="form.prompt_template_id" clearable placeholder="请选择生成提示词" style="width:100%">
+              <el-option-group
+                v-for="group in promptGroups"
+                :key="group.key"
+                :label="group.label"
+              >
+                <el-option
+                  v-for="row in group.items"
+                  :key="row.id"
+                  :label="formatPromptOptionLabel(row)"
+                  :value="row.id"
+                >
+                  <div class="prompt-option-row">
+                    <span class="prompt-option-name">
+                      {{ row.name }} <small class="prompt-option-ver">v{{ row.version }}</small>
+                    </span>
+                    <span v-if="row.visibility === 'shared' && row.owner_username" class="prompt-option-author">
+                      @{{ row.owner_username }}
+                    </span>
+                  </div>
+                </el-option>
+              </el-option-group>
+            </el-select>
+          </el-form-item>
           <el-form-item label="生成后自动评审"><el-switch v-model="form.auto_review" /></el-form-item>
         </el-form></el-card>
         <el-card shadow="never" class="block"><template #header>提交摘要</template><el-descriptions :column="1" border size="small"><el-descriptions-item label="粒度">{{ selectedGranularity.label }}</el-descriptions-item><el-descriptions-item label="维度">{{ dimensionSummary }}</el-descriptions-item><el-descriptions-item label="参考">{{ selectedCases.length }} 条库内 + {{ form.reference_text.trim() ? '手动输入' : '无手动输入' }}</el-descriptions-item><el-descriptions-item label="流程">检索确认 → 测试点确认 → 完整用例</el-descriptions-item></el-descriptions><el-button class="submit" type="primary" size="large" :loading="submitting" @click="submit">创建任务并启动检索流水线 →</el-button></el-card>
@@ -354,6 +463,14 @@ small,
 .block {
   margin-bottom: 16px;
   border-radius: var(--cg-radius) !important;
+}
+
+.requirement-field {
+  width: 100%;
+}
+
+.requirement-overwrite-alert {
+  margin-top: 8px;
 }
 
 .questions {
@@ -564,6 +681,51 @@ small,
 .dimensions {
   display: grid;
   grid-template-columns: repeat(2, 1fr);
+}
+
+.knowledge-status-box {
+  width: 100%;
+  padding: 10px 12px;
+  border-radius: var(--cg-radius-sm);
+  border: 1px solid var(--cg-border);
+  background: var(--cg-surface-muted);
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--cg-text-secondary);
+}
+
+.knowledge-status-box--ready {
+  border-color: rgba(16, 185, 129, 0.35);
+  background: #ecfdf5;
+  color: #065f46;
+}
+
+.prompt-option-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+}
+
+.prompt-option-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.prompt-option-ver {
+  margin-left: 4px;
+  font-family: var(--cg-font-mono);
+  font-size: 11px;
+  color: var(--cg-text-muted);
+}
+
+.prompt-option-author {
+  flex-shrink: 0;
+  font-family: var(--cg-font-mono);
+  font-size: 11.5px;
+  color: var(--cg-text-muted);
 }
 
 .submit {

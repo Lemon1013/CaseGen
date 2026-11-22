@@ -11,13 +11,13 @@ from app import config
 from app.db import get_engine
 from app.main import create_app
 from app.models.entities import (
+    AgentConversation,
+    AgentMessage,
     CaseDraft,
     DataPool,
     DataPoolRevision,
-    Document,
     ExampleVariant,
     GenerationTask,
-    IngestJob,
     PlatformArtifact,
     PlatformProfile,
     PlatformRenderRun,
@@ -27,12 +27,10 @@ from app.models.entities import (
     TestCase,
     TestCaseOperationLog,
     User,
-    WikiPageRow,
-    WikiReviewItem,
     WikiSpace,
 )
 
-ADMIN_PASSWORD = "password1234"
+ADMIN_PASSWORD = "CaseGen-Test1!"
 
 
 def _origin() -> dict[str, str]:
@@ -157,84 +155,44 @@ def _review(
     return review
 
 
-def _document(
+def _agent_conversation(
     session: Session,
-    space_id: int,
-    filename: str,
-    *,
-    status: str = "ready",
-    created_at: datetime | None = None,
-) -> Document:
-    document = Document(
-        filename=filename,
-        stored_path=f"raw/{filename}",
-        content_type="text/plain",
-        sha256=f"sha-{filename}",
-        status=status,
-        space_id=space_id,
-    )
-    if created_at is not None:
-        document.created_at = created_at
-    session.add(document)
-    session.commit()
-    session.refresh(document)
-    return document
-
-
-def _ingest_job(
-    session: Session,
-    document_id: int,
-    space_id: int,
-    status: str,
-) -> IngestJob:
-    job = IngestJob(document_id=document_id, space_id=space_id, status=status)
-    session.add(job)
-    session.commit()
-    session.refresh(job)
-    return job
-
-
-def _wiki_page(
-    session: Session,
-    space_id: int,
+    project_id: int,
     title: str,
     *,
-    status: str = "published",
-) -> WikiPageRow:
-    page = WikiPageRow(
-        path=f"pages/{title}.md",
-        title=title,
-        page_type="concept",
-        space_id=space_id,
-        status=status,
-    )
-    session.add(page)
-    session.commit()
-    session.refresh(page)
-    return page
-
-
-def _wiki_review(
-    session: Session,
-    space_id: int,
-    *,
-    status: str,
-    reason: str,
-    page_id: int | None = None,
+    user_id: int | None = None,
+    status: str = "active",
     created_at: datetime | None = None,
-) -> WikiReviewItem:
-    review = WikiReviewItem(
-        page_id=page_id,
-        space_id=space_id,
+) -> AgentConversation:
+    conv = AgentConversation(
+        project_id=str(project_id),
+        user_id=user_id,
+        title=title,
         status=status,
-        reason=reason,
     )
     if created_at is not None:
-        review.created_at = created_at
-    session.add(review)
+        conv.created_at = created_at
+    session.add(conv)
     session.commit()
-    session.refresh(review)
-    return review
+    session.refresh(conv)
+    return conv
+
+
+def _agent_message(
+    session: Session,
+    conversation_id: str,
+    role: str = "user",
+    content: str = "hello",
+) -> AgentMessage:
+    msg = AgentMessage(
+        conversation_id=conversation_id,
+        role=role,
+        content=content,
+    )
+    session.add(msg)
+    session.commit()
+    session.refresh(msg)
+    return msg
 
 
 def _case(
@@ -385,15 +343,13 @@ def test_dashboard_empty_database(tmp_app_data, monkeypatch):
         "new_30d": 1,
     }
     assert counts["projects"]["total"] == 1
-    assert counts["documents"] == {
-        "total": 0,
-        "pending_ingest": 0,
-        "by_status": [],
-    }
-    assert counts["wiki"] == {
-        "pages": 0,
-        "pending_reviews": 0,
-        "by_status": [],
+    assert "documents" not in counts
+    assert "wiki" not in counts
+    assert counts["agent"] == {
+        "conversations": 0,
+        "active_conversations": 0,
+        "messages": 0,
+        "new_30d": 0,
     }
     assert counts["tasks"]["total"] == 0
     assert [item["group"] for item in counts["tasks"]["by_group"]] == [
@@ -425,7 +381,8 @@ def test_dashboard_empty_database(tmp_app_data, monkeypatch):
     assert all(
         point["tasks"] == 0
         and point["cases"] == 0
-        and point["documents"] == 0
+        and point["agent_conversations"] == 0
+        and "documents" not in point
         for point in body["trend"]
     )
     assert body["generated_at"].endswith("Z")
@@ -648,39 +605,22 @@ def test_dashboard_aggregates_counts_across_projects(tmp_app_data, monkeypatch):
             if status == "failed":
                 task_b = task
 
-        document_pending = _document(
-            session, int(space_a.id), "pending.txt", status="pending"
+        conv_one = _agent_conversation(
+            session, int(project_a.id), "Active Chat", status="active"
         )
-        _document(session, int(space_a.id), "ready.txt", status="ready")
-        _document(session, int(space_b.id), "failed.txt", status="failed")
-        _ingest_job(
-            session, int(document_pending.id), int(space_a.id), "queued"
+        conv_two = _agent_conversation(
+            session, int(project_b.id), "Busy Chat", status="busy"
         )
-        _ingest_job(
-            session, int(document_pending.id), int(space_a.id), "running"
-        )
-        _ingest_job(
-            session, int(document_pending.id), int(space_a.id), "completed"
-        )
-
-        page_one = _wiki_page(session, int(space_a.id), "Page One")
-        _wiki_page(session, int(space_a.id), "Page Two")
-        _wiki_page(
-            session, int(space_b.id), "Old Page", status="archived"
-        )
-        _wiki_review(
+        _agent_conversation(
             session,
-            int(space_a.id),
-            status="pending",
-            reason="needs review",
-            page_id=int(page_one.id),
+            int(project_a.id),
+            "Old Closed Chat",
+            status="closed",
+            created_at=now - timedelta(days=40),
         )
-        _wiki_review(
-            session, int(space_b.id), status="pending", reason="conflict"
-        )
-        _wiki_review(
-            session, int(space_b.id), status="approved", reason="ok"
-        )
+        _agent_message(session, conv_one.id, "user", "hi")
+        _agent_message(session, conv_one.id, "assistant", "hello")
+        _agent_message(session, conv_two.id, "user", "working")
 
         case_requirement_id = int(task_a.requirement_id)
         case_p0 = _case(
@@ -745,18 +685,13 @@ def test_dashboard_aggregates_counts_across_projects(tmp_app_data, monkeypatch):
         "public": 3,
         "new_30d": 3,
     }
-    assert counts["documents"]["total"] == 3
-    assert counts["documents"]["pending_ingest"] == 2
-    assert _status_map(counts["documents"]["by_status"]) == {
-        "failed": 1,
-        "pending": 1,
-        "ready": 1,
-    }
-    assert counts["wiki"]["pages"] == 3
-    assert counts["wiki"]["pending_reviews"] == 2
-    assert _status_map(counts["wiki"]["by_status"]) == {
-        "archived": 1,
-        "published": 2,
+    assert "documents" not in counts
+    assert "wiki" not in counts
+    assert counts["agent"] == {
+        "conversations": 3,
+        "active_conversations": 2,
+        "messages": 3,
+        "new_30d": 2,
     }
     assert counts["tasks"]["total"] == 13
     assert {
@@ -797,7 +732,6 @@ def test_dashboard_trend_zero_fills_fourteen_utc_days(tmp_app_data, monkeypatch)
 
     with Session(get_engine()) as session:
         project = _project(session, "dashboard-trend")
-        space = _space(session, int(project.id), "dashboard-trend-space")
 
         _task(
             session,
@@ -827,10 +761,10 @@ def test_dashboard_trend_zero_fills_fourteen_utc_days(tmp_app_data, monkeypatch)
             "Trend case",
             created_at=now - timedelta(days=5),
         )
-        _document(
+        _agent_conversation(
             session,
-            int(space.id),
-            "trend.txt",
+            int(project.id),
+            "Trend chat",
             created_at=now - timedelta(days=9),
         )
 
@@ -847,10 +781,10 @@ def test_dashboard_trend_zero_fills_fourteen_utc_days(tmp_app_data, monkeypatch)
             "Outside case",
             created_at=now - timedelta(days=15),
         )
-        _document(
+        _agent_conversation(
             session,
-            int(space.id),
-            "outside.txt",
+            int(project.id),
+            "Outside chat",
             created_at=now - timedelta(days=15),
         )
 
@@ -867,10 +801,13 @@ def test_dashboard_trend_zero_fills_fourteen_utc_days(tmp_app_data, monkeypatch)
     assert by_date[(today - timedelta(days=2)).isoformat()]["tasks"] == 1
     assert by_date[(today - timedelta(days=3)).isoformat()]["tasks"] == 2
     assert by_date[(today - timedelta(days=5)).isoformat()]["cases"] == 1
-    assert by_date[(today - timedelta(days=9)).isoformat()]["documents"] == 1
+    assert (
+        by_date[(today - timedelta(days=9)).isoformat()]["agent_conversations"]
+        == 1
+    )
     assert sum(point["tasks"] for point in trend) == 4
     assert sum(point["cases"] for point in trend) == 1
-    assert sum(point["documents"] for point in trend) == 1
+    assert sum(point["agent_conversations"] for point in trend) == 1
 
 
 def test_dashboard_recent_activity_limit_order_and_resolution(
@@ -883,34 +820,29 @@ def test_dashboard_recent_activity_limit_order_and_resolution(
     with Session(get_engine()) as session:
         project = _project(session, "dashboard-recent")
         project_id = int(project.id)
-        space = _space(session, int(project.id), "dashboard-recent-space")
+        member = User(
+            username="private-member",
+            password_hash="unused",
+            role="user",
+            is_active=True,
+        )
+        session.add(member)
+        session.commit()
+        session.refresh(member)
+
         task_one = _task(
             session,
             int(project.id),
             "Recent task one",
             created_at=now - timedelta(minutes=1),
         )
-        page = _wiki_page(session, int(space.id), "Review Page")
-        _wiki_review(
+        # 私密 Agent 会话标题绝不可出现在管理员看板 recent_activity 中
+        _agent_conversation(
             session,
-            int(space.id),
-            status="pending",
-            reason="review-reason-page",
-            page_id=int(page.id),
-            created_at=now - timedelta(minutes=2),
-        )
-        _wiki_review(
-            session,
-            int(space.id),
-            status="approved",
-            reason="review-reason-only",
-            created_at=now - timedelta(minutes=3),
-        )
-        _document(
-            session,
-            int(space.id),
-            "recent-document.txt",
-            created_at=now - timedelta(minutes=4),
+            int(project.id),
+            "Secret Private Chat Title",
+            user_id=int(member.id),
+            created_at=now - timedelta(seconds=30),
         )
         case = _case(
             session,
@@ -926,12 +858,6 @@ def test_dashboard_recent_activity_limit_order_and_resolution(
             "Recent task two",
             created_at=now - timedelta(minutes=6),
         )
-        _document(
-            session,
-            int(space.id),
-            "older-document.txt",
-            created_at=now - timedelta(minutes=7),
-        )
         _case(
             session,
             int(task_one.requirement_id),
@@ -944,32 +870,33 @@ def test_dashboard_recent_activity_limit_order_and_resolution(
 
     assert response.status_code == 200, response.text
     activity = response.json()["recent_activity"]
-    assert len(activity) == 6
+    assert len(activity) == 4
     assert [item["type"] for item in activity] == [
         "task",
-        "review",
-        "review",
-        "document",
         "case",
         "task",
+        "case",
     ]
+    assert all(
+        item["created_at"].endswith("Z") for item in activity
+    ), activity
+    assert all(
+        "Secret Private Chat Title" not in item["title"] for item in activity
+    )
     assert [item["created_at"] for item in activity] == sorted(
         [item["created_at"] for item in activity], reverse=True
     )
     assert {item["type"] for item in activity} == {
         "task",
-        "document",
-        "review",
         "case",
     }
     assert activity[0]["title"] == "Recent task one"
     assert activity[0]["project_id"] == project_id
     assert activity[0]["project_name"] == "dashboard-recent"
-    assert activity[1]["title"] == "Review Page"
+    assert activity[1]["title"] == "Recent case"
+    assert activity[1]["id"] == case_id
     assert activity[1]["project_id"] == project_id
-    assert activity[2]["title"] == "review-reason-only"
-    assert activity[3]["title"] == "recent-document.txt"
+    assert activity[2]["title"] == "Recent task two"
+    assert activity[2]["project_id"] == project_id
+    assert activity[3]["title"] == "Older case"
     assert activity[3]["project_id"] == project_id
-    assert activity[4]["title"] == "Recent case"
-    assert activity[4]["id"] == case_id
-    assert activity[4]["project_id"] == project_id

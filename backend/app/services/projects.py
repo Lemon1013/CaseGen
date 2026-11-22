@@ -5,19 +5,13 @@ from app import config
 from app.models.entities import (
     AgentConversation,
     DataPool,
-    Document,
     GenerationTask,
-    IngestJob,
     ManagedPlatformCase,
     PlatformProfile,
     PlatformRenderRun,
     Project,
-    ProjectWikiBinding,
     Requirement,
-    SourceChunk,
     TestCase,
-    WikiPageRow,
-    WikiReviewItem,
     WikiSpace,
 )
 
@@ -35,15 +29,6 @@ def project_space_ids(session: Session, project_id: int, *, include_shared: bool
         )).all()
         if row.id is not None
     ]
-    if include_shared:
-        bindings = session.exec(select(ProjectWikiBinding).where(
-            ProjectWikiBinding.project_id == project_id,
-            ProjectWikiBinding.enabled == True,  # noqa: E712
-        )).all()
-        for binding in bindings:
-            space = session.get(WikiSpace, binding.wiki_space_id)
-            if space is not None and space.scope == "shared" and space.status == "active":
-                ids.append(int(space.id))
     return list(dict.fromkeys(ids))
 
 
@@ -63,11 +48,6 @@ def resource_space_id(session: Session, path: str) -> int | None:
 
     mappings = (
         (r"/api/wiki-spaces/(\d+)(?:/.*)?", WikiSpace, "id"),
-        (r"/api/documents/(\d+)(?:/.*)?", Document, "space_id"),
-        (r"/api/ingest-jobs/(\d+)(?:/.*)?", IngestJob, "space_id"),
-        (r"/api/wiki/pages/(\d+)(?:/.*)?", WikiPageRow, "space_id"),
-        (r"/api/wiki/reviews/(\d+)(?:/.*)?", WikiReviewItem, "space_id"),
-        (r"/api/source-chunks/(\d+)(?:/.*)?", SourceChunk, "space_id"),
         (r"/api/data-pools/(\d+)(?:/.*)?", DataPool, "wiki_space_id"),
         (r"/api/platforms/(\d+)(?:/.*)?", PlatformProfile, "wiki_space_id"),
         (r"/api/platform-cases/(\d+)(?:/.*)?", ManagedPlatformCase, "wiki_space_id"),
@@ -79,12 +59,6 @@ def resource_space_id(session: Session, path: str) -> int | None:
             continue
         row = session.get(model, int(match.group(1)))
         value = getattr(row, field, None) if row is not None else None
-        if value is None and isinstance(row, WikiReviewItem):
-            page = session.get(WikiPageRow, row.page_id) if row.page_id else None
-            value = page.space_id if page is not None else None
-        if value is None and isinstance(row, IngestJob):
-            document = session.get(Document, row.document_id)
-            value = document.space_id if document is not None else None
         return int(value) if value is not None else None
     return None
 
@@ -129,13 +103,7 @@ def validate_request_project_scope(
 
 
 _PROJECT_SCOPED_PREFIXES = (
-    "/api/documents",
     "/api/wiki-spaces",
-    "/api/ingest-jobs",
-    "/api/wiki/pages",
-    "/api/wiki/reviews",
-    "/api/wiki/retrieve",
-    "/api/source-chunks",
     "/api/requirements",
     "/api/tasks",
     "/api/cases",
@@ -162,11 +130,7 @@ _VISIBILITY_SCOPED_PREFIXES = (
     # Detail/sub-resource paths are project data too; the bare list
     # (/api/projects) is excluded by is_project_visibility_path below.
     "/api/projects/",
-    "/api/documents",
     "/api/wiki-spaces",
-    "/api/ingest-jobs",
-    "/api/wiki/",
-    "/api/source-chunks",
     "/api/requirements",
     "/api/tasks",
     "/api/cases",

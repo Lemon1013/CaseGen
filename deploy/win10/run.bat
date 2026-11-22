@@ -32,8 +32,6 @@ rem "~" expands to the Windows user profile; keeps workspaces out of the repo.
 if not defined AGENT_WORKSPACE_ROOT set AGENT_WORKSPACE_ROOT=~/.casegen/agent-workspace
 if not defined AGENT_FIRST_TOKEN_TIMEOUT_SEC set AGENT_FIRST_TOKEN_TIMEOUT_SEC=600
 if not defined AGENT_STALL_TIMEOUT_SEC set AGENT_STALL_TIMEOUT_SEC=300
-if not defined AGENT_STAGE_MAX_CALLS set AGENT_STAGE_MAX_CALLS=4
-if not defined PIPELINE_AGENT_STAGES set PIPELINE_AGENT_STAGES=
 if not defined AGENT_SKILLS_DIR set AGENT_SKILLS_DIR=.agents/skills
 echo 启动中... 浏览器打开 http://127.0.0.1:8000
 ".venv\Scripts\python.exe" -m uvicorn app.main:app --host 0.0.0.0 --port 8000

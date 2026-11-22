@@ -7,8 +7,8 @@ Design rules that shape this module:
   (same discipline as the per-stage commits in task_pipeline).
 - Never auto-retry a prompt.  Re-sending POST /sessions/:id/prompt-stream
   re-runs the whole agent turn, so a transport failure surfaces exactly once.
-- Never set a module-level chat hook.  The line-B pipeline hooks change the
-  execution path of 60+ existing test files; this module does not touch them.
+- Optional external knowledge read-only hooks remain no-op by default so normal
+  DSH turns and tests do not perform unintended DB/HTTP work.
 - Never forward tool_call / tool_result / usage frames.  The gateway already
   drops them; this runner publishes delta / reasoning / notice / status /
   terminal frames to the in-memory broker.  Reasoning is the user-approved
@@ -22,18 +22,19 @@ Design rules that shape this module:
 from __future__ import annotations
 
 import logging
+import json
 import threading
 import time
 from datetime import datetime, timezone
 from contextlib import nullcontext
-from typing import Any, Optional
+from typing import Any, Callable, Optional, Protocol
 
 import httpx
 from sqlmodel import Session, col, select
 
 from app import config
 from app.db import get_engine
-from app.models.entities import AgentConversation, AgentMessage, Project, WikiSpace
+from app.models.entities import AgentConversation, AgentMessage, Project
 from app.services import agent_gateway
 from app.services.agent_gateway import (
     AgentGatewayError,
@@ -42,14 +43,25 @@ from app.services.agent_gateway import (
 )
 from app.services.agent_skills import skill_prompt_prefix
 from app.services.agent_stream import agent_stream
-from app.services.projects import project_space_ids
-from app.services.wiki_spaces import ensure_space_dirs, space_root
+from app.services.knowledge_providers import (
+    ProjectKnowledgeSearchResult,
+    RemoteFileContent,
+    RemoteFileItem,
+    list_source_files,
+    read_source_file,
+    search_project_knowledge,
+)
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "AgentKnowledgeTool",
+    "KnowledgeContextHook",
+    "ProjectKnowledgeReadOnlyTool",
     "STATUS_CONNECTING",
     "TurnHandle",
+    "get_knowledge_context_hook",
+    "set_knowledge_context_hook",
     "start_turn",
     "run_turn",
     "request_cancel",
@@ -263,7 +275,18 @@ def _load_turn_inputs(conversation_id: str) -> Optional[dict[str, Any]]:
             "workspace_dir": project_workspace_dir or conversation.workspace_dir,
             "project_id": conversation.project_id or "",
             "prompt": (last_user.content if last_user is not None else "") or "",
+            "attachments": _parse_message_attachments(last_user),
         }
+
+
+def _parse_message_attachments(message: AgentMessage | None) -> list[dict[str, Any]]:
+    if message is None:
+        return []
+    try:
+        value = json.loads(message.attachments_json or "[]")
+        return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
 
 
 def _persist_session_ids(
@@ -348,75 +371,110 @@ def _release_conversation(conversation_id: str) -> None:
         session.commit()
 
 
-def _knowledge_space_dirs(project_id: str) -> list[str]:
-    """Return absolute Wiki space dirs visible to this project (one short DB session)."""
-    try:
-        pid = int(str(project_id).strip())
-    except (TypeError, ValueError):
-        return []
-    try:
+KnowledgeContextHook = Callable[[int, str], str]
+
+
+class AgentKnowledgeTool(Protocol):
+    """Read-only external knowledge interface reserved for future multi-turn agent retrieval."""
+
+    def search(
+        self, project_id: int, query: str, *, top_k: int | None = None
+    ) -> ProjectKnowledgeSearchResult: ...
+
+    def list_files(self, project_id: int, source_id: int) -> list[RemoteFileItem]: ...
+
+    def read_file(
+        self, project_id: int, source_id: int, file_path: str
+    ) -> RemoteFileContent: ...
+
+
+class ProjectKnowledgeReadOnlyTool:
+    """Short-session adapter delegating read-only external knowledge queries to KnowledgeService."""
+
+    def search(
+        self, project_id: int, query: str, *, top_k: int | None = None
+    ) -> ProjectKnowledgeSearchResult:
         with Session(get_engine()) as session:
-            project = session.get(Project, pid)
-            try:
-                space_ids = project_space_ids(session, pid)
-            except Exception:
-                # Project deleted / inactive must not break the chat turn.
-                space_ids = []
+            return search_project_knowledge(session, project_id, query, top_k=top_k)
 
-            ordered_sids: list[int] = []
-            if project is not None and project.default_wiki_space_id is not None:
-                try:
-                    pref_id = int(project.default_wiki_space_id)
-                    pref_space = session.get(WikiSpace, pref_id)
-                    if pref_space is not None and getattr(pref_space, "status", "active") == "active":
-                        ordered_sids.append(pref_id)
-                except (TypeError, ValueError):
-                    pass
+    def list_files(self, project_id: int, source_id: int) -> list[RemoteFileItem]:
+        with Session(get_engine()) as session:
+            return list_source_files(session, project_id, source_id)
 
-            for sid in space_ids:
-                try:
-                    s_id = int(sid)
-                    if s_id not in ordered_sids:
-                        ordered_sids.append(s_id)
-                except (TypeError, ValueError):
-                    pass
-
-            dirs: list[str] = []
-            for sid in ordered_sids:
-                space = session.get(WikiSpace, int(sid))
-                if space is None or getattr(space, "status", "active") != "active":
-                    continue
-                try:
-                    root = ensure_space_dirs(space)
-                except (OSError, ValueError):
-                    root = space_root(space)
-                if root.is_dir() and str(root) not in dirs:
-                    dirs.append(str(root))
-            return dirs
-    except Exception:
-        # Knowledge lookup is best-effort: never let it fail a chat turn.
-        return []
+    def read_file(
+        self, project_id: int, source_id: int, file_path: str
+    ) -> RemoteFileContent:
+        with Session(get_engine()) as session:
+            return read_source_file(session, project_id, source_id, file_path)
 
 
-def _knowledge_prompt_block(dirs: list[str]) -> str:
-    if not dirs:
+_knowledge_context_hook: KnowledgeContextHook | None = None
+
+
+def set_knowledge_context_hook(hook: KnowledgeContextHook | None) -> None:
+    """Register or clear the optional read-only external knowledge context hook."""
+
+    global _knowledge_context_hook
+    _knowledge_context_hook = hook
+
+
+def get_knowledge_context_hook() -> KnowledgeContextHook | None:
+    """Return the active external knowledge context hook, or None when disabled."""
+
+    return _knowledge_context_hook
+
+
+def _resolve_external_knowledge_block(
+    project_id_raw: str | int | None, query: str
+) -> str:
+    hook = _knowledge_context_hook
+    if hook is None or not str(query or "").strip():
         return ""
-    lines = "\n".join(f"- {p}" for p in dirs)
+    raw = str(project_id_raw or "").strip()
+    if not raw.isdigit():
+        return ""
+    try:
+        block = str(hook(int(raw), str(query)) or "").strip()
+    except Exception:
+        logger.warning("外部知识库只读钩子执行失败，已跳过上下文注入。")
+        return ""
+    if not block:
+        return ""
     return (
-        "[知识空间]\n"
-        "本项目的知识库以 Markdown 文件存放在以下目录（只读）：\n"
-        f"{lines}\n"
-        "需要背景资料时，请自行用文件检索工具（glob / grep / read）在这些目录内查阅相关文档，不要凭空编造。\n"
-        "严格限制：只允许在上述列出的目录内检索和阅读，不要访问其他知识空间目录（包括 data/wiki/spaces/ 下的其它空间），不要读取这些目录之外的任何文件，也不要把检索范围扩大到整个项目或磁盘。\n\n"
+        "[外部知识库只读检索参考]\n"
+        + block
+        + "\n[外部知识库只读检索参考结束]\n\n"
+    )
+
+
+def _knowledge_prompt_block(attachments: list[dict[str, Any]] | None = None) -> str:
+    attachments = attachments or []
+    if not attachments:
+        return ""
+    lines = "\n".join(
+        f"- 文件名：{item.get('filename', '')}（{item.get('char_count', 0)} 字）\n"
+        f"  解析文本路径：{item.get('parsed_path', '')}"
+        for item in attachments
+    )
+    return (
+        "[本轮附件]\n以下附件已上传到当前工作区，允许读取：\n"
+        + lines
+        + "\n需要时请使用文件读取工具读取上述路径；不要仅凭文件名猜测内容。"
+        + "除本轮附件路径外，不得读取其它目录、整个项目或磁盘。\n\n"
     )
 
 
 def _build_prompt(
-    user_text: str, skill_name: Optional[str], knowledge_dirs: Optional[list[str]] = None
+    user_text: str,
+    skill_name: Optional[str],
+    attachments: Optional[list[dict[str, Any]]] = None,
+    external_knowledge_block: str = "",
 ) -> str:
     return (
         skill_prompt_prefix(skill_name or "")
-        + _knowledge_prompt_block(knowledge_dirs or [])
+        + _knowledge_prompt_block(attachments or [])
+        + (external_knowledge_block or "")
+        + ("请先阅读本轮附件，再协助进行测试设计。\n" if attachments and not (user_text or "").strip() else "")
         + (user_text or "")
     )
 
@@ -533,10 +591,18 @@ def run_turn(
             return {"outcome": "failed", "category": "not_found", "text": ""}
 
         raw_user_text = inputs["prompt"] or ""
-        knowledge_dirs = _knowledge_space_dirs(str(inputs.get("project_id") or ""))
+        attachments = inputs.get("attachments") or []
+        external_knowledge_block = _resolve_external_knowledge_block(
+            inputs.get("project_id"), raw_user_text
+        )
         prompt = (
-            _build_prompt(raw_user_text, inputs.get("skill_name"), knowledge_dirs)
-            if raw_user_text.strip()
+            _build_prompt(
+                raw_user_text,
+                inputs.get("skill_name"),
+                attachments,
+                external_knowledge_block=external_knowledge_block,
+            )
+            if raw_user_text.strip() or attachments
             else ""
         )
         if not prompt.strip():

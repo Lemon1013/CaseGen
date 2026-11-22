@@ -14,7 +14,7 @@ from sqlmodel import Session, select
 from app import config
 from app.db import get_engine
 from app.main import create_app
-from app.models.entities import AgentConversation, Project, User
+from app.models.entities import AgentConversation, AgentMessage, Project, User
 from app.services.auth import hash_password
 
 
@@ -27,7 +27,7 @@ def _make_user(username: str, role: str = "user") -> int:
         row = User(
             username=username,
             display_name=username,
-            password_hash=hash_password("password1234"),
+            password_hash=hash_password("CaseGen-Test1!"),
             role=role,
             is_active=True,
         )
@@ -42,7 +42,7 @@ def _client_for(username: str) -> TestClient:
     assert client.post(
         "/api/auth/login",
         headers=_origin(),
-        json={"username": username, "password": "password1234"},
+        json={"username": username, "password": "CaseGen-Test1!"},
     ).status_code == 200
     return client
 
@@ -53,7 +53,7 @@ def _env(tmp_app_data, monkeypatch):
     assert admin.post(
         "/api/auth/setup",
         headers=_origin(),
-        json={"username": "root", "password": "password1234"},
+        json={"username": "root", "password": "CaseGen-Test1!"},
     ).status_code == 200
     with Session(get_engine()) as session:
         project_id = int(session.exec(select(Project)).first().id)
@@ -108,21 +108,52 @@ def test_conversations_are_private_between_users_and_from_admin(tmp_app_data, mo
     assert admin.get(f"/api/agent/conversations/{b_conv['id']}?project_id={pid}").status_code == 404
     assert admin.get(f"/api/agent/conversations?project_id={pid}").json() == []
 
-    # Write paths (message / cancel / delete) and SSE all funnel through
-    # _get_conversation, so they reject a foreign conversation too.
-    assert alice.post(
-        f"/api/agent/conversations/{b_conv['id']}/messages?project_id={pid}",
-        headers=_origin(),
-        json={"content": "hi", "idempotency_key": "k1"},
-    ).status_code == 404
-    assert alice.post(
-        f"/api/agent/conversations/{b_conv['id']}/cancel?project_id={pid}",
-        headers=_origin(),
-    ).status_code == 404
-    assert alice.delete(
-        f"/api/agent/conversations/{b_conv['id']}?project_id={pid}", headers=_origin()
-    ).status_code == 404
-    assert alice.get(f"/api/agent/conversations/{b_conv['id']}/stream?project_id={pid}").status_code == 404
+    # Write paths (message / cancel / delete / patch / attachment / save-cases) and SSE
+    # all funnel through _get_conversation, so they reject foreign users AND admin.
+    with Session(get_engine()) as session:
+        b_msg = AgentMessage(
+            conversation_id=b_conv["id"],
+            role="assistant",
+            content='```json\n[{"case_key": "TC-901", "title": "私密用例", "steps": [{"action": "a", "expected": "b"}]}]\n```',
+        )
+        session.add(b_msg)
+        session.commit()
+        session.refresh(b_msg)
+        b_msg_id = str(b_msg.id)
+
+    for caller in (alice, admin):
+        assert caller.patch(
+            f"/api/agent/conversations/{b_conv['id']}?project_id={pid}",
+            headers=_origin(),
+            json={"title": "Hijacked"},
+        ).status_code == 404
+        assert caller.post(
+            f"/api/agent/conversations/{b_conv['id']}/attachments?project_id={pid}",
+            headers=_origin(),
+            files={"file": ("note.md", b"secret", "text/markdown")},
+        ).status_code == 404
+        assert caller.post(
+            f"/api/agent/conversations/{b_conv['id']}/save-cases?project_id={pid}",
+            headers=_origin(),
+            json={
+                "message_id": b_msg_id,
+                "target_mode": "new_requirement",
+                "requirement_title": "尝试窃取",
+            },
+        ).status_code == 404
+        assert caller.post(
+            f"/api/agent/conversations/{b_conv['id']}/messages?project_id={pid}",
+            headers=_origin(),
+            json={"content": "hi", "idempotency_key": f"k-{id(caller)}"},
+        ).status_code == 404
+        assert caller.post(
+            f"/api/agent/conversations/{b_conv['id']}/cancel?project_id={pid}",
+            headers=_origin(),
+        ).status_code == 404
+        assert caller.delete(
+            f"/api/agent/conversations/{b_conv['id']}?project_id={pid}", headers=_origin()
+        ).status_code == 404
+        assert caller.get(f"/api/agent/conversations/{b_conv['id']}/stream?project_id={pid}").status_code == 404
 
     # Owners keep full access to their own conversation.
     assert alice.get(f"/api/agent/conversations/{a_conv['id']}?project_id={pid}").status_code == 200
@@ -151,3 +182,43 @@ def test_sse_stream_does_not_leak_foreign_snapshot(tmp_app_data, monkeypatch):
     # Bob must not receive Alice's terminal snapshot.
     assert bob.get(f"/api/agent/conversations/{conv['id']}/stream?project_id={pid}").status_code == 404
     assert alice.get(f"/api/agent/conversations/{conv['id']}/stream?project_id={pid}").status_code == 200
+
+
+def test_hidden_project_and_unauthenticated_fail_closed(tmp_app_data, monkeypatch):
+    from fastapi import HTTPException
+    from starlette.requests import Request
+    from app.api import agent_chat
+
+    admin, _pid = _env(tmp_app_data, monkeypatch)
+    _make_user("alice")
+    alice = _client_for("alice")
+
+    # Hidden project (is_public=False) rejects non-admin access with 404 on /api/agent/*.
+    hidden = admin.post(
+        "/api/projects",
+        headers=_origin(),
+        json={"name": "Secret Proj", "slug": "secret-proj"},
+    )
+    assert hidden.status_code in (200, 201), hidden.text
+    hidden_pid = hidden.json()["id"]
+    upd = admin.put(
+        f"/api/projects/{hidden_pid}?project_id={hidden_pid}",
+        headers=_origin(),
+        json={"is_public": False},
+    )
+    assert upd.status_code == 200, upd.text
+    assert upd.json()["is_public"] is False
+    hidden_conv = _create(admin, hidden_pid, "Admin hidden proj conv")
+    assert alice.get(f"/api/agent/conversations?project_id={hidden_pid}").status_code == 404
+    assert alice.get(
+        f"/api/agent/conversations/{hidden_conv['id']}?project_id={hidden_pid}"
+    ).status_code == 404
+
+    # _owner_id must fail closed with 401 when AUTH_ENABLED=True and request.state.user is absent.
+    scope = {"type": "http", "method": "GET", "path": "/api/agent/conversations", "headers": []}
+    req = Request(scope)
+    try:
+        agent_chat._owner_id(req)
+        raise AssertionError("Expected HTTPException(401) when AUTH_ENABLED=True and user is missing")
+    except HTTPException as exc:
+        assert exc.status_code == 401

@@ -17,6 +17,7 @@ from app.db import get_engine
 from app.main import create_app
 from app.models.entities import AgentConversation, AgentMessage
 from app.services.agent_stream import AgentStreamBroker
+from app.services import agent_gateway
 from app.services.task_stream import TaskStreamEvent, TaskStreamPoll
 
 
@@ -73,16 +74,17 @@ def _set_status(conversation_id, status):
         session.commit()
 
 
-def _add_assistant_message(conversation_id, content):
+def _add_assistant_message(conversation_id, content) -> str:
     with Session(get_engine()) as session:
-        session.add(
-            AgentMessage(
-                conversation_id=str(conversation_id),
-                role="assistant",
-                content=content,
-            )
+        row = AgentMessage(
+            conversation_id=str(conversation_id),
+            role="assistant",
+            content=content,
         )
+        session.add(row)
         session.commit()
+        session.refresh(row)
+        return str(row.id)
 
 
 def _parse_sse(text):
@@ -329,6 +331,75 @@ def test_agent_disabled_returns_410(agent_env):
     )
 
 
+def test_upload_message_attachment_and_cleanup(agent_env):
+    client = agent_env.client
+    pid = _make_project(client, "attachments")
+    conv = _make_conversation(client, pid)
+    response = client.post(
+        f"/api/agent/conversations/{conv['id']}/attachments?project_id={pid}",
+        files={"file": ("需求.md", "# 私有正文\nUNIQUE_ATTACHMENT_BODY".encode(), "text/markdown")},
+    )
+    assert response.status_code == 200, response.text
+    attachment = response.json()
+    assert attachment["filename"] == "需求.md"
+    root = agent_gateway.ensure_project_workspace_dir(pid)
+    attachment_dir = root / "attachments" / conv["id"] / attachment["id"]
+    assert (attachment_dir / "original.md").is_file()
+    assert (attachment_dir / "parsed.txt").is_file()
+    assert (attachment_dir / "meta.json").is_file()
+
+    sent = client.post(
+        f"/api/agent/conversations/{conv['id']}/messages?project_id={pid}",
+        json={"content": "", "attachment_ids": [attachment["id"]], "idempotency_key": "attachment-only"},
+    )
+    assert sent.status_code == 200, sent.text
+    assert sent.json()["message"]["content"] == ""
+    assert sent.json()["message"]["attachments"][0]["id"] == attachment["id"]
+    with Session(get_engine()) as session:
+        row = session.get(AgentMessage, sent.json()["message"]["id"])
+        assert row is not None and json.loads(row.attachments_json)[0]["id"] == attachment["id"]
+
+    _set_status(conv["id"], "active")
+    retried = client.post(
+        f"/api/agent/conversations/{conv['id']}/messages?project_id={pid}",
+        json={"content": "", "idempotency_key": "attachment-only"},
+    )
+    assert retried.status_code == 200, retried.text
+    assert retried.json()["duplicated"] is True
+    assert retried.json()["message"]["id"] == sent.json()["message"]["id"]
+
+    deleted = client.delete(f"/api/agent/conversations/{conv['id']}?project_id={pid}")
+    assert deleted.status_code == 200
+    assert not (root / "attachments" / conv["id"]).exists()
+
+
+def test_attachment_message_validation_and_cross_conversation_rejection(agent_env):
+    client = agent_env.client
+    pid = _make_project(client, "attachment-validation")
+    first = _make_conversation(client, pid)
+    second = _make_conversation(client, pid, title="second")
+    empty = client.post(
+        f"/api/agent/conversations/{first['id']}/messages?project_id={pid}",
+        json={"content": "", "attachment_ids": [], "idempotency_key": "empty"},
+    )
+    assert empty.status_code == 422
+    uploaded = client.post(
+        f"/api/agent/conversations/{first['id']}/attachments?project_id={pid}",
+        files={"file": ("a.md", b"text", "text/markdown")},
+    )
+    attachment_id = uploaded.json()["id"]
+    forged = client.post(
+        f"/api/agent/conversations/{first['id']}/messages?project_id={pid}",
+        json={"content": "", "attachment_ids": ["0" * 32], "idempotency_key": "forged"},
+    )
+    assert forged.status_code == 422
+    cross = client.post(
+        f"/api/agent/conversations/{second['id']}/messages?project_id={pid}",
+        json={"content": "", "attachment_ids": [attachment_id], "idempotency_key": "cross"},
+    )
+    assert cross.status_code == 422
+
+
 def test_skills_lists_array(agent_env):
     client = agent_env.client
     pid = _make_project(client)
@@ -340,11 +411,14 @@ def test_skills_lists_array(agent_env):
 
 
 # --------------------------------------------------------------------------
-# save-as-draft
+# save-cases (direct TestCase import by message_id)
 # --------------------------------------------------------------------------
 
 
-def test_save_as_draft_success(agent_env):
+def test_save_cases_success(agent_env):
+    from sqlmodel import select
+    from app.models.entities import CaseDraft, GenerationTask, TestCase
+
     client = agent_env.client
     pid = _make_project(client)
     conv = _make_conversation(client, pid)
@@ -354,28 +428,48 @@ def test_save_as_draft_success(agent_env):
 [{"case_key": "TC-001", "title": "登录成功", "steps": [{"action": "输入正确账号密码", "expected": "进入首页"}]}]
 ```
 """
-    _add_assistant_message(conv["id"], assistant_answer)
+    message_id = _add_assistant_message(conv["id"], assistant_answer)
 
     resp = client.post(
-        f"/api/agent/conversations/{conv['id']}/save-as-draft?project_id={pid}"
+        f"/api/agent/conversations/{conv['id']}/save-cases?project_id={pid}",
+        json={
+            "message_id": message_id,
+            "target_mode": "new_requirement",
+            "requirement_title": "登录功能需求",
+            "requirement_description": "来自 Agent 对话",
+        },
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["imported_count"] >= 1
-    assert body["task_id"] > 0
-    assert body["draft_id"] > 0
-    assert isinstance(body["case_keys"], list)
+    assert body["requirement_id"] > 0
+    assert body["created_requirement"] is True
+    assert body["message_id"] == message_id
+    assert body["case_keys"] == ["TC-001"]
+
+    with Session(get_engine()) as session:
+        assert session.exec(select(GenerationTask)).all() == []
+        assert session.exec(select(CaseDraft)).all() == []
+        cases = session.exec(select(TestCase)).all()
+        assert len(cases) == 1
+        assert cases[0].source_task_id is None
+        assert cases[0].source_draft_id is None
 
 
-def test_save_as_draft_without_assistant_is_422(agent_env):
+def test_save_cases_missing_message_is_404(agent_env):
     client = agent_env.client
     pid = _make_project(client)
     conv = _make_conversation(client, pid)
 
     resp = client.post(
-        f"/api/agent/conversations/{conv['id']}/save-as-draft?project_id={pid}"
+        f"/api/agent/conversations/{conv['id']}/save-cases?project_id={pid}",
+        json={
+            "message_id": "nonexistent-msg-id",
+            "target_mode": "new_requirement",
+            "requirement_title": "测试需求",
+        },
     )
-    assert resp.status_code == 422
+    assert resp.status_code == 404
 
 
 # --------------------------------------------------------------------------

@@ -41,7 +41,7 @@ def _admin_client(tmp_app_data, monkeypatch) -> TestClient:
     response = client.post(
         "/api/auth/setup",
         headers=_origin(),
-        json={"username": "admin", "display_name": "Admin", "password": "password1234"},
+        json={"username": "admin", "display_name": "Admin", "password": "CaseGen-Test1!"},
     )
     assert response.status_code == 200
     with Session(get_engine()) as session:
@@ -256,7 +256,7 @@ def test_point_by_point_loop_exits_after_manual_stop(tmp_app_data, monkeypatch):
 
     with Session(get_engine()) as session:
         gen_task = run_generate(
-            session, task_id, chat_fn=stop_during_first_call, point_by_point=True
+            session, task_id, chat_fn=stop_during_first_call
         )
         assert gen_task.status == "failed"
         assert gen_task.error_message == "已手动停止生成"
@@ -281,7 +281,7 @@ def test_point_by_point_loop_exits_after_manual_stop(tmp_app_data, monkeypatch):
 
 
 def test_complete_generation_aborts_before_draft_after_stop(tmp_app_data, monkeypatch):
-    """Non point-by-point branch: stop observed after the LLM reply, no draft."""
+    """Single-point generation: stop observed after the LLM reply, no draft written."""
     client = TestClient(create_app())
     mid = _create_model(client)
     task_id, _ = _seed_generating_task(model_id=mid, point_count=1)
@@ -301,8 +301,8 @@ def test_complete_generation_aborts_before_draft_after_stop(tmp_app_data, monkey
             session.commit()
         return "# 用例：余额不足下单\n\n## 测试步骤\n1. 提交限价买单\n"
 
-    # No ``point_by_point`` attribute and no explicit flag: the pipeline takes
-    # the single-call complete-case branch inside the test environment.
+    # Single confirmed test point: stop flips status while the final LLM call is
+    # in flight, so the final cooperative guard must exit without writing a draft.
     with Session(get_engine()) as session:
         gen_task = run_generate(session, task_id, chat_fn=stop_then_reply)
         assert gen_task.status == "failed"

@@ -57,6 +57,14 @@ export function deleteModel(id: number) {
   return api<{ ok: boolean }>(`/api/models/${id}`, { method: 'DELETE' })
 }
 
+export const MODELS_UPDATED_EVENT = 'casegen:models-updated'
+
+export function notifyModelsUpdated() {
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent(MODELS_UPDATED_EVENT))
+  }
+}
+
 export function pingModel(id: number) {
   return api<ModelPingResult>(`/api/models/${id}/ping`, { method: 'POST' })
 }

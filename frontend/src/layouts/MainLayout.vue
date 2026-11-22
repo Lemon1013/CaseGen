@@ -1,18 +1,16 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { ElMessage } from 'element-plus'
 import {
   Collection,
   Cpu,
   ChatDotRound,
-  CircleCheck,
-  Document,
+  Check,
   EditPen,
-  FolderOpened,
   DataAnalysis,
   Connection,
   List,
-  Reading,
   ArrowDown,
   ArrowRight,
   UserFilled,
@@ -24,7 +22,7 @@ import {
   Expand,
   Fold,
 } from '@element-plus/icons-vue'
-import { listModels, type ModelConfig } from '../api/models'
+import { listModels, MODELS_UPDATED_EVENT, notifyModelsUpdated, updateModel, type ModelConfig } from '../api/models'
 import { setProjectInvalidHandler } from '../api/client'
 import { useAuthStore } from '../authStore'
 import BrandMark from '../components/BrandMark.vue'
@@ -34,7 +32,9 @@ const route = useRoute()
 const router = useRouter()
 const projects = useProjectStore()
 const auth = useAuthStore()
-const defaultModel = ref<ModelConfig | null>(null)
+const models = ref<ModelConfig[]>([])
+const switchingModel = ref(false)
+const defaultModel = computed(() => models.value.find((m) => m.is_default) || models.value[0] || null)
 const projectQuery = computed(() => {
   const project = projects.current.value
   if (!project) return {}
@@ -50,10 +50,10 @@ const useCaseItems = [
   { path: '/tasks', label: '生成任务', icon: List },
   { path: '/agent', label: 'Agent 对话', icon: ChatDotRound },
   { path: '/cases', label: '用例管理', icon: Collection },
-  { path: '/data-pools', label: '数据池', icon: DataAnalysis, adminOnly: true },
 ]
 
 const platformItems = [
+  { path: '/data-pools', label: '数据池', icon: DataAnalysis, adminOnly: true },
   { path: '/platform-management', label: '平台管理', icon: Connection, adminOnly: true },
   { path: '/platform-case-generate', label: '生成平台用例', icon: SetUp, adminOnly: true },
   { path: '/platform-cases', label: '平台用例管理', icon: Collection, adminOnly: true },
@@ -61,25 +61,15 @@ const platformItems = [
 ]
 
 const systemItems = [
-  { path: '/spaces', label: '空间管理', icon: Grid, adminOnly: true },
+  { path: '/spaces', label: '项目管理', icon: Grid, adminOnly: true },
   { path: '/prompts', label: '提示词管理', icon: EditPen },
   { path: '/models', label: '模型配置', icon: Cpu, adminOnly: true },
   { path: '/users', label: '用户管理', icon: UserFilled, adminOnly: true },
 ]
 
-const wikiItems = [
-  { path: '/wiki', label: '知识浏览', icon: Reading, adminOnly: true },
-  { path: '/documents', label: '文档摄入', icon: Document, adminOnly: true },
-  { path: '/wiki/reviews', label: '变更审核', icon: CircleCheck, adminOnly: true },
-  { path: '/wiki-spaces', label: '知识库管理', icon: FolderOpened, adminOnly: true },
-]
-
-const wikiPaths = wikiItems.map((item) => item.path)
 const platformPaths = [...platformItems.map((item) => item.path), '/platform-adapters']
-const activeWikiPaths = computed(() => (showWikiGroup.value ? wikiPaths : []))
 const activePlatformPaths = computed(() => (showPlatformGroup.value ? platformPaths : []))
 
-const wikiExpanded = ref(false)
 const platformExpanded = ref(false)
 
 const navCollapsed = ref(localStorage.getItem('casegen:nav-collapsed') === '1')
@@ -105,15 +95,12 @@ function visible<T extends { adminOnly?: boolean }>(items: T[]): T[] {
 
 const visibleUseCaseItems = computed(() => visible(useCaseItems))
 const visiblePlatformItems = computed(() => visible(platformItems))
-const visibleWikiItems = computed(() => visible(wikiItems))
 const visibleSystemItems = computed(() => visible(systemItems))
 const showPlatformGroup = computed(() => visiblePlatformItems.value.length > 0)
-const showWikiGroup = computed(() => visibleWikiItems.value.length > 0)
 
 const allMenuItems = computed(() => [
   ...visibleUseCaseItems.value,
   ...visiblePlatformItems.value,
-  ...visibleWikiItems.value,
   ...visibleSystemItems.value,
 ])
 
@@ -134,16 +121,10 @@ const pageDescription = computed(() => {
 
 function isActive(path: string): boolean {
   if (path === '/') return route.path === '/'
-  if (path === '/wiki') return route.path === '/wiki'
   return route.path === path || route.path.startsWith(path + '/')
 }
 
-const isWikiActive = computed(() => activeWikiPaths.value.some((path) => isActive(path)))
 const isPlatformActive = computed(() => activePlatformPaths.value.some((path) => isActive(path)))
-
-function toggleWiki() {
-  wikiExpanded.value = !wikiExpanded.value
-}
 
 function togglePlatform() {
   platformExpanded.value = !platformExpanded.value
@@ -159,49 +140,56 @@ function onPlatformGroupClick() {
   togglePlatform()
 }
 
-function onWikiGroupClick() {
-  if (navCollapsed.value) {
-    navCollapsed.value = false
-    localStorage.setItem('casegen:nav-collapsed', '0')
-    wikiExpanded.value = true
-    return
-  }
-  toggleWiki()
-}
-
 watch(
   () => route.path,
   (path) => {
-    const isWikiRoute = wikiPaths.some((wikiPath) => {
-      if (wikiPath === '/wiki') return path === '/wiki'
-      return path === wikiPath || path.startsWith(wikiPath + '/')
-    })
-    if (isWikiRoute) wikiExpanded.value = true
     if (platformPaths.some((platformPath) => path === platformPath || path.startsWith(platformPath + '/'))) platformExpanded.value = true
   },
   { immediate: true },
 )
 
+let modelLoadSeq = 0
+
 async function loadDefaultModel() {
+  const seq = ++modelLoadSeq
   try {
-    const models = await listModels()
-    defaultModel.value = models.find((m) => m.is_default) || models[0] || null
+    const rows = await listModels()
+    if (seq !== modelLoadSeq) return
+    models.value = rows
   } catch {
-    defaultModel.value = null
+    if (seq !== modelLoadSeq) return
+    models.value = []
   }
 }
 
-// The chip must not go stale after the user edits model configuration in
-// /models: reload it on every route change...
-watch(
-  () => route.path,
-  () => {
-    void loadDefaultModel()
-  },
-)
+function onModelDropdownVisible(visible: boolean) {
+  if (visible) void loadDefaultModel()
+}
 
-// ...and on a 60s fallback timer for long-lived views that never navigate.
-const modelTimer = window.setInterval(loadDefaultModel, 60_000)
+async function onModelCommand(modelId: unknown) {
+  const id = Number(modelId)
+  if (!Number.isInteger(id) || id <= 0) return
+  if (switchingModel.value || defaultModel.value?.id === id) return
+  const target = models.value.find((m) => m.id === id)
+  switchingModel.value = true
+  try {
+    await updateModel(id, { is_default: true })
+    await loadDefaultModel()
+    notifyModelsUpdated()
+    ElMessage.success(`已切换默认模型为 ${target ? `${target.name} · ${target.model_name}` : `#${id}`}`)
+  } catch (e) {
+    ElMessage.error(`切换默认模型失败：${(e as Error).message}`)
+  } finally {
+    switchingModel.value = false
+  }
+}
+
+const MODEL_REFRESH_INTERVAL_MS = 5 * 60_000
+let modelTimer: number | null = null
+
+function onModelsUpdated() {
+  void loadDefaultModel()
+}
 
 let projectRefreshFlight: Promise<void> | null = null
 let lastProjectRefreshAt = 0
@@ -235,15 +223,26 @@ function onVisibilityChange() {
 
 onMounted(async () => {
   window.addEventListener('focus', onWindowFocus)
+  window.addEventListener(MODELS_UPDATED_EVENT, onModelsUpdated)
   document.addEventListener('visibilitychange', onVisibilityChange)
   setProjectInvalidHandler(() => refreshProjects(true))
+  modelTimer = window.setInterval(() => {
+    if (document.visibilityState === 'visible') {
+      void loadDefaultModel()
+    }
+  }, MODEL_REFRESH_INTERVAL_MS)
   await Promise.all([loadDefaultModel(), projects.load(route.query)])
   await projects.ensureRouteProject(router)
 })
 
 onUnmounted(() => {
-  window.clearInterval(modelTimer)
+  modelLoadSeq += 1
+  if (modelTimer != null) {
+    window.clearInterval(modelTimer)
+    modelTimer = null
+  }
   window.removeEventListener('focus', onWindowFocus)
+  window.removeEventListener(MODELS_UPDATED_EVENT, onModelsUpdated)
   document.removeEventListener('visibilitychange', onVisibilityChange)
   setProjectInvalidHandler(null)
 })
@@ -294,39 +293,6 @@ watch(
           </div>
         </section>
 
-        <section v-if="showWikiGroup" class="nav-group wiki-group">
-          <button
-            type="button"
-            class="nav-group-toggle"
-            :class="{ active: isWikiActive }"
-            :aria-expanded="wikiExpanded"
-            aria-controls="wiki-submenu"
-            title="Wiki 知识库"
-            @click="onWikiGroupClick"
-          >
-            <el-icon class="nav-icon" :size="18"><Reading /></el-icon>
-            <span>Wiki 知识库</span>
-            <el-icon class="nav-chevron" :size="14">
-              <ArrowDown v-if="wikiExpanded" />
-              <ArrowRight v-else />
-            </el-icon>
-          </button>
-          <div v-show="wikiExpanded" id="wiki-submenu" class="nav-submenu">
-            <router-link
-              v-for="item in visibleWikiItems"
-              :key="item.path"
-              :to="{ path: item.path, query: projectQuery }"
-              class="nav-item nav-subitem"
-              :class="{ active: isActive(item.path) }"
-            >
-              <el-icon class="nav-icon" :size="17">
-                <component :is="item.icon" />
-              </el-icon>
-              <span>{{ item.label }}</span>
-            </router-link>
-          </div>
-        </section>
-
         <section class="nav-group">
           <div class="nav-group-title">系统配置</div>
           <router-link
@@ -358,7 +324,7 @@ watch(
 
       <div class="sidebar-footer">
         <div class="footer-label">Quality First</div>
-        <div class="footer-hint">文档 → Wiki → 生成 → 评审</div>
+        <div class="footer-hint">需求 → 检索 → 生成 → 评审</div>
       </div>
     </el-aside>
 
@@ -374,10 +340,52 @@ watch(
           <p v-if="pageDescription" class="topbar-desc">{{ pageDescription }}</p>
         </div>
         <div class="topbar-right">
-          <el-select v-if="projects.state.projects.length" :model-value="projects.state.currentId" class="project-select" aria-label="当前项目" @change="(id: number) => projects.select(id, router)" @visible-change="onProjectSelectVisible">
+          <el-select
+            v-if="projects.state.projects.length"
+            :model-value="projects.state.currentId"
+            class="project-select"
+            aria-label="当前空间"
+            @change="(id: number) => projects.select(id, router)"
+            @visible-change="onProjectSelectVisible"
+          >
+            <template #prefix>
+              <span class="project-select-prefix">空间：</span>
+            </template>
             <el-option v-for="project in projects.state.projects.filter((item) => item.status === 'active')" :key="project.id" :label="project.name" :value="project.id" />
           </el-select>
-          <div v-if="defaultModel" class="model-chip" title="当前默认模型">
+          <el-dropdown
+            v-if="defaultModel && route.name !== 'agent-chat' && auth.isAdmin"
+            trigger="click"
+            :disabled="switchingModel"
+            @command="onModelCommand"
+            @visible-change="onModelDropdownVisible"
+          >
+            <button type="button" class="model-chip model-chip--interactive" title="点击切换默认模型">
+              <span class="model-dot" />
+              <span class="model-label">默认模型</span>
+              <span class="model-name">{{ defaultModel.name }} · {{ defaultModel.model_name }}</span>
+              <el-icon class="model-caret"><ArrowDown /></el-icon>
+            </button>
+            <template #dropdown>
+              <el-dropdown-menu>
+                <el-dropdown-item
+                  v-for="item in models"
+                  :key="item.id"
+                  :command="item.id"
+                  :disabled="switchingModel || item.id === defaultModel.id"
+                >
+                  <div class="model-option-row">
+                    <span class="model-option-check">
+                      <el-icon v-if="item.id === defaultModel.id"><Check /></el-icon>
+                    </span>
+                    <span class="model-option-name">{{ item.name }}</span>
+                    <span class="model-option-model">{{ item.model_name }}</span>
+                  </div>
+                </el-dropdown-item>
+              </el-dropdown-menu>
+            </template>
+          </el-dropdown>
+          <div v-else-if="defaultModel && route.name !== 'agent-chat'" class="model-chip" title="当前默认模型">
             <span class="model-dot" />
             <span class="model-label">默认模型</span>
             <span class="model-name">{{ defaultModel.name }} · {{ defaultModel.model_name }}</span>
@@ -399,7 +407,10 @@ watch(
       </header>
 
       <el-main class="main-content">
-        <router-view v-if="(route.meta.skipProjectGate || projects.state.loaded) && (route.meta.skipProjectGate || !projects.state.currentId || route.query.project_id)" :key="projects.state.currentId || 'no-project'" />
+        <router-view
+          v-if="(route.meta.skipProjectGate || projects.state.loaded) && (route.meta.skipProjectGate || !projects.state.currentId || route.query.project_id)"
+          :key="route.meta.skipProjectGate ? 'global' : (projects.state.currentId || 'no-project')"
+        />
       </el-main>
     </el-container>
   </el-container>
@@ -754,13 +765,66 @@ watch(
   max-width: 360px;
 }
 
+.model-chip--interactive {
+  cursor: pointer;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.model-chip--interactive:hover,
+.model-chip--interactive:focus-visible {
+  border-color: var(--cg-primary, #10b981);
+  box-shadow: 0 1px 4px rgba(16, 185, 129, 0.15);
+}
+
+.model-caret {
+  color: var(--cg-text-muted);
+  flex-shrink: 0;
+}
+
+.model-option-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 200px;
+  font-size: 12.5px;
+}
+
+.model-option-check {
+  width: 14px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: #10b981;
+  flex-shrink: 0;
+}
+
+.model-option-name {
+  font-weight: 600;
+  color: var(--cg-text);
+}
+
+.model-option-model {
+  margin-left: auto;
+  color: var(--cg-text-muted);
+  font-family: var(--cg-font-mono);
+  font-size: 11.5px;
+}
+
 .topbar-right {
   display: flex;
   align-items: center;
   gap: 10px;
 }
 
-.project-select { width: 180px; }
+.project-select {
+  width: 220px;
+}
+
+.project-select-prefix {
+  color: var(--cg-text-muted);
+  font-size: 12.5px;
+  white-space: nowrap;
+}
 
 .model-dot {
   width: 8px;

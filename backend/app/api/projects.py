@@ -1,5 +1,4 @@
 from datetime import datetime, timezone
-import shutil
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.exc import IntegrityError
@@ -8,25 +7,19 @@ from sqlmodel import Session, select
 from app.db import get_session
 from app.models.entities import (
     DataPool,
-    Document,
     GenerationTask,
-    IngestJob,
     ManagedPlatformCase,
     PlatformProfile,
     PlatformRenderRun,
     Project,
-    ProjectKnowledgeDecision,
-    ProjectWikiBinding,
     Requirement,
-    SourceChunk,
-    WikiPageRow,
-    WikiReviewItem,
     WikiSpace,
 )
-from app.schemas.projects import ProjectBindingIn, ProjectCreate, ProjectOut, ProjectSpaceOut, ProjectUpdate
+from app.models.external_wiki import ProjectKnowledgeSource
+from app.schemas.projects import ProjectCreate, ProjectOut, ProjectSpaceOut, ProjectUpdate
+from app.services.knowledge_providers.service import _is_source_configured
 from app.services.permissions import current_user, is_admin, require_admin
-from app.services.wiki_spaces import normalize_space_slug, slug_from_name
-from app.services.wiki_spaces import DEFAULT_SPACE_SLUG, ensure_space_dirs, space_root
+from app.services.wiki_spaces import DEFAULT_SPACE_SLUG, normalize_space_slug, slug_from_name
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
 
@@ -42,12 +35,18 @@ def _require_project(request: Request, project_id: int) -> None:
 
 def _out(session: Session, row: Project) -> ProjectOut:
     private = session.exec(select(WikiSpace).where(WikiSpace.project_id == row.id, WikiSpace.scope == "project")).all()
-    bindings = session.exec(select(ProjectWikiBinding).where(ProjectWikiBinding.project_id == row.id).order_by(ProjectWikiBinding.priority)).all()
-    shared_by_id = {space.id: space for space in session.exec(select(WikiSpace).where(WikiSpace.scope == "shared")).all()}
+    sources = session.exec(
+        select(ProjectKnowledgeSource).where(
+            ProjectKnowledgeSource.project_id == row.id,
+            ProjectKnowledgeSource.enabled == True,  # noqa: E712
+        )
+    ).all()
+    knowledge_source_count = sum(1 for src in sources if _is_source_configured(src))
     return ProjectOut(
         **row.model_dump(),
+        knowledge_source_count=knowledge_source_count,
         private_spaces=[ProjectSpaceOut(**space.model_dump(), enabled=True) for space in private],
-        shared_spaces=[ProjectSpaceOut(**shared_by_id[b.wiki_space_id].model_dump(), priority=b.priority, enabled=b.enabled) for b in bindings if b.wiki_space_id in shared_by_id],
+        shared_spaces=[],
     )
 
 
@@ -58,44 +57,15 @@ def _get(session: Session, project_id: int) -> Project:
     return row
 
 
-def _ensure_deletable_space_root(space: WikiSpace):
-    root = space_root(space)
-    if not root.exists():
-        return root
-    allowed_dirs = {"pages", "sources", "rules", "entities", "scenarios", "regressions", "synthesis"}
-    allowed_files = {
-        "index.md": "# Wiki Index\n\n",
-        "overview.md": "# Wiki Overview\n\n",
-        "log.md": "# Wiki Log\n\n",
-    }
-    for path in root.rglob("*"):
-        if path.is_symlink():
-            raise HTTPException(409, "Project Wiki directory contains a symbolic link")
-        relative = path.relative_to(root)
-        if path.is_dir():
-            if len(relative.parts) != 1 or relative.name not in allowed_dirs:
-                raise HTTPException(409, "Project Wiki directory contains non-standard content")
-        elif len(relative.parts) != 1 or relative.name not in allowed_files:
-            raise HTTPException(409, "Project Wiki directory contains non-standard content")
-        elif path.read_text(encoding="utf-8") != allowed_files[relative.name]:
-            raise HTTPException(409, "Project Wiki skeleton contains user content")
-    return root
-
-
 def _project_has_data(session: Session, project_id: int, space_ids: list[int]) -> bool:
     direct = (
         (Requirement, Requirement.project_id),
         (GenerationTask, GenerationTask.project_id),
-        (ProjectKnowledgeDecision, ProjectKnowledgeDecision.project_id),
+        (ProjectKnowledgeSource, ProjectKnowledgeSource.project_id),
     )
     if any(session.exec(select(model.id).where(column == project_id)).first() is not None for model, column in direct):
         return True
     scoped = (
-        (Document, Document.space_id),
-        (IngestJob, IngestJob.space_id),
-        (WikiPageRow, WikiPageRow.space_id),
-        (WikiReviewItem, WikiReviewItem.space_id),
-        (SourceChunk, SourceChunk.space_id),
         (DataPool, DataPool.wiki_space_id),
         (PlatformProfile, PlatformProfile.wiki_space_id),
         (PlatformRenderRun, PlatformRenderRun.wiki_space_id),
@@ -140,7 +110,6 @@ def create_project(body: ProjectCreate, request: Request, session: Session = Dep
         session.rollback()
         raise HTTPException(409, "Project or Wiki space slug already exists") from exc
     session.refresh(row)
-    ensure_space_dirs(space)
     return _out(session, row)
 
 
@@ -192,62 +161,14 @@ def delete_project(project_id: int, request: Request, session: Session = Depends
     space_ids = [int(space.id) for space in spaces if space.id is not None]
     if _project_has_data(session, project_id, space_ids):
         raise HTTPException(409, "Project contains business data")
-    roots = [_ensure_deletable_space_root(space) for space in spaces]
-    bindings = session.exec(select(ProjectWikiBinding).where(ProjectWikiBinding.project_id == project_id)).all()
-    removed_spaces: list[WikiSpace] = []
     try:
-        for binding in bindings:
-            session.delete(binding)
         row.default_wiki_space_id = None
         session.add(row)
         session.flush()
         for space in spaces:
             session.delete(space)
         session.delete(row)
-        session.flush()
-        for space, root in zip(spaces, roots):
-            if root.exists():
-                removed_spaces.append(space)
-                shutil.rmtree(root)
         session.commit()
     except Exception as exc:
         session.rollback()
-        recovery_errors: list[str] = []
-        for space in removed_spaces:
-            try:
-                ensure_space_dirs(space)
-            except Exception as recovery_exc:  # noqa: BLE001
-                recovery_errors.append(str(recovery_exc))
-        detail = f"Failed to delete project safely: {exc}"
-        if recovery_errors:
-            detail += f"; Wiki skeleton recovery failed: {'; '.join(recovery_errors)}"
-        raise HTTPException(500, detail) from exc
-
-
-@router.put("/{project_id}/shared-wikis/{space_id}", response_model=ProjectOut)
-def bind_shared_wiki(project_id: int, space_id: int, body: ProjectBindingIn, request: Request, session: Session = Depends(get_session)):
-    _require_project(request, project_id)
-    _require_admin(request)
-    project = _get(session, project_id)
-    if body.wiki_space_id != space_id:
-        raise HTTPException(422, "wiki_space_id does not match path")
-    space = session.get(WikiSpace, space_id)
-    if space is None or space.scope != "shared" or space.status != "active":
-        raise HTTPException(422, "Only active shared Wiki spaces can be bound")
-    binding = session.exec(select(ProjectWikiBinding).where(ProjectWikiBinding.project_id == project_id, ProjectWikiBinding.wiki_space_id == space_id)).first()
-    if binding is None:
-        binding = ProjectWikiBinding(project_id=project_id, wiki_space_id=space_id)
-    binding.priority, binding.enabled = body.priority, body.enabled
-    session.add(binding); session.commit()
-    return _out(session, project)
-
-
-@router.delete("/{project_id}/shared-wikis/{space_id}", response_model=ProjectOut)
-def unbind_shared_wiki(project_id: int, space_id: int, request: Request, session: Session = Depends(get_session)):
-    _require_project(request, project_id)
-    _require_admin(request)
-    project = _get(session, project_id)
-    binding = session.exec(select(ProjectWikiBinding).where(ProjectWikiBinding.project_id == project_id, ProjectWikiBinding.wiki_space_id == space_id)).first()
-    if binding is not None:
-        session.delete(binding); session.commit()
-    return _out(session, project)
+        raise HTTPException(500, f"Failed to delete project safely: {exc}") from exc

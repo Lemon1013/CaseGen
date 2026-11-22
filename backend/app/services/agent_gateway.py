@@ -7,7 +7,7 @@ broker, or the browser contract; ``app.api.agent_chat`` owns those.
 Design references:
 
 - docs/superpowers/specs/2026-11-04-dsh-agent-integration-design.md §3.3/§6/§8
-- backend/app/services/external_wiki_client.py (client build + error hygiene)
+- backend/app/services/llm.py & knowledge_providers (client build + error hygiene)
 
 Hard rules implemented in this module:
 
@@ -22,7 +22,7 @@ Hard rules implemented in this module:
 3. A prompt is never retried automatically.  Re-sending ``prompt-stream``
    re-runs the whole agent turn, so every transport failure surfaces exactly
    once and the caller decides what to do.
-4. Sync httpx only, matching ``llm.py`` and ``external_wiki_client.py``.
+4. Sync httpx only, matching ``llm.py`` and the external knowledge providers.
    Callers run inside a worker thread and must not hold a DB session.
 """
 
@@ -167,7 +167,7 @@ def safe_agent_error(exc: BaseException) -> dict[str, Any]:
 
 
 def _http_client_error(exc: Exception) -> AgentGatewayError:
-    # Keep the llm.py / external_wiki_client.py style: raw constructor errors
+    # Keep the llm.py / knowledge_providers style: raw constructor errors
     # can include a proxy URL with credentials, so never interpolate them.
     if isinstance(exc, ImportError):
         logger.warning("DSH HTTP client initialization failed: missing proxy dependency.")
@@ -273,7 +273,7 @@ def _create_client(
     timeout: httpx.Timeout | float,
     transport: httpx.BaseTransport | None,
 ) -> httpx.Client:
-    """Build a sync client exactly like external_wiki_client._create_client."""
+    """Build a sync httpx client with explicit environment proxy routing."""
 
     owned_transport: httpx.BaseTransport | None = None
     try:
@@ -1189,7 +1189,7 @@ class DshAgentGateway:
     ) -> dict[str, Any]:
         """POST /sessions/:id/prompt -> {'content', 'tool_calls_count'}.
 
-        Line-B entry point: only the final content is returned, never tool or
+        Synchronous helper: only the final content is returned, never tool or
         reasoning payloads.
         """
 

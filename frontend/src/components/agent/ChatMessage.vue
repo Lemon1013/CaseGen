@@ -4,9 +4,11 @@ import { ElMessage } from 'element-plus'
 import { ArrowRight, CopyDocument, UserFilled } from '@element-plus/icons-vue'
 import MarkdownView from '../MarkdownView.vue'
 import CaseResultCard from './CaseResultCard.vue'
-import { hasAgentCaseJson, parseAgentCaseGroups, stripAgentCaseJson } from './parseAgentCases'
+import { parseAgentCaseGroups, stripAgentCaseJson } from './parseAgentCases'
+import { copyText } from '../../utils/clipboard'
 import { formatDateTime } from '../../utils/datetime'
 import type { DraftPointGroup } from '../../api/tasks'
+import type { AgentAttachmentItem } from '../../api/agent'
 
 /**
  * 单条对话气泡。
@@ -17,6 +19,7 @@ import type { DraftPointGroup } from '../../api/tasks'
  */
 
 const props = defineProps<{
+  messageId: string
   role: 'user' | 'assistant'
   content: string
   createdAt?: string
@@ -24,15 +27,15 @@ const props = defineProps<{
   pending?: boolean
   /** 折叠阈值（字符）；超出则历史消息默认收起。0 = 不折叠。 */
   collapseThreshold?: number
-  /** 是否展示「转存为用例草稿」入口（只对含用例 JSON 的 assistant 消息有意义）。 */
-  canSaveDraft?: boolean
-  savingDraft?: boolean
+  /** 会话忙碌或已关闭时禁用入库操作。 */
+  saveDisabled?: boolean
   /** Agent 思考过程文本；无值时不渲染，不伪造内容。 */
   thought?: string
+  attachments?: AgentAttachmentItem[]
 }>()
 
 const emit = defineEmits<{
-  saveDraft: []
+  saveToCases: [messageId: string]
 }>()
 
 const expanded = ref(false)
@@ -67,22 +70,34 @@ const previewText = computed(() => {
   return `${displayContent.value.slice(0, threshold.value).trimEnd()}…`
 })
 
-/** 只在展开或非流式时解析用例 JSON，避免每条流式帧重复做 JSON.parse。 */
-const caseGroups = computed<DraftPointGroup[] | null>(() => {
-  if (props.role !== 'assistant') return null
-  if (!props.content) return null
-  if (props.streaming) return null
-  if (isCollapsed.value) return null
-  if (!showCases.value) return null
+/** 仅在非流式时单次解析用例 JSON，供按钮显隐、数量统计与结构化卡片复用。 */
+const parsedCaseGroups = computed<DraftPointGroup[] | null>(() => {
+  if (props.role !== 'assistant' || !props.content || props.streaming) return null
   return parseAgentCaseGroups(props.content)
 })
 
-const hasCases = computed(() => {
-  if (props.role !== 'assistant' || !props.content || props.streaming) return false
-  return hasAgentCaseJson(props.content)
+const hasCases = computed(() => Boolean(parsedCaseGroups.value && parsedCaseGroups.value.length > 0))
+const caseCount = computed(() =>
+  (parsedCaseGroups.value ?? []).reduce((sum, group) => sum + (group.cases?.length || 0), 0),
+)
+const caseGroups = computed<DraftPointGroup[] | null>(() => {
+  if (!showCases.value || isCollapsed.value) return null
+  return parsedCaseGroups.value
 })
+const canSaveCases = computed(
+  () =>
+    props.role === 'assistant' &&
+    !props.streaming &&
+    !props.messageId.startsWith('local-') &&
+    hasCases.value,
+)
 
 const isUser = computed(() => props.role === 'user')
+
+function formatAttachmentSize(size: number): string {
+  if (size < 1024 * 1024) return String(Math.max(1, Math.round(size / 1024)) + ' KB')
+  return String((size / 1024 / 1024).toFixed(2) + ' MB')
+}
 
 function toggleExpanded() {
   expanded.value = !expanded.value
@@ -94,20 +109,9 @@ async function copyContent() {
     ElMessage.warning('这条消息没有可复制的内容')
     return
   }
-  try {
-    await navigator.clipboard.writeText(payload)
-    ElMessage.success('消息内容已复制到剪贴板')
-  } catch {
-    const textarea = document.createElement('textarea')
-    textarea.value = payload
-    textarea.style.position = 'fixed'
-    textarea.style.opacity = '0'
-    document.body.appendChild(textarea)
-    textarea.select()
-    document.execCommand('copy')
-    document.body.removeChild(textarea)
-    ElMessage.success('消息内容已复制到剪贴板')
-  }
+  const copied = await copyText(payload)
+  if (copied) ElMessage.success('消息内容已复制到剪贴板')
+  else ElMessage.warning('复制失败，请手动复制')
 }
 </script>
 
@@ -142,7 +146,7 @@ async function copyContent() {
         </div>
       </details>
       <div
-        v-if="displayContent || streaming || isUser"
+        v-if="displayContent || streaming || (isUser && !attachments?.length)"
         class="bubble-body"
         :class="{ 'is-user-body': isUser }"
       >
@@ -158,7 +162,12 @@ async function copyContent() {
           <span class="dot" />
         </div>
       </div>
-      <div v-if="!isUser && !isCollapsed && !streaming && (displayContent || thought || hasCases || canSaveDraft)" class="bubble-actions">
+      <div v-if="isUser && attachments?.length" class="attachment-list">
+        <el-tag v-for="item in attachments" :key="item.id" size="small" effect="plain">
+          {{ item.filename }}（{{ formatAttachmentSize(item.size) }}）
+        </el-tag>
+      </div>
+      <div v-if="!isUser && !isCollapsed && !streaming && (displayContent || thought || hasCases)" class="bubble-actions">
         <el-button v-if="collapsible && expanded" size="small" link @click="toggleExpanded">收起</el-button>
         <el-button v-if="displayContent || thought" size="small" link class="copy-action" @click="copyContent">
           <el-icon><CopyDocument /></el-icon>
@@ -174,14 +183,14 @@ async function copyContent() {
           {{ showCases ? '收起用例卡片' : '查看结构化用例' }}
         </el-button>
         <el-button
-          v-if="canSaveDraft && !streaming"
+          v-if="canSaveCases"
           size="small"
           type="primary"
           plain
-          :loading="savingDraft"
-          @click="emit('saveDraft')"
+          :disabled="Boolean(saveDisabled)"
+          @click="emit('saveToCases', messageId)"
         >
-          转存为用例草稿
+          入库至用例管理（{{ caseCount }}）
         </el-button>
       </div>
       <CaseResultCard
@@ -423,5 +432,12 @@ async function copyContent() {
 
 .bubble-cases {
   margin-top: 4px;
+}
+
+.attachment-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
 }
 </style>

@@ -20,7 +20,7 @@ def _setup(client: TestClient) -> None:
     response = client.post(
         "/api/auth/setup",
         headers=_origin(),
-        json={"username": "admin", "display_name": "Admin", "password": "password1234"},
+        json={"username": "admin", "display_name": "Admin", "password": "CaseGen-Test1!"},
     )
     assert response.status_code == 200
     with Session(get_engine()) as session:
@@ -33,13 +33,13 @@ def test_setup_login_logout_and_origin_guard(tmp_app_data, monkeypatch):
     client = _auth_client(tmp_app_data, monkeypatch)
     assert client.get("/api/health").status_code == 200
     assert client.get("/api/tasks").status_code == 401
-    assert client.post("/api/auth/setup", json={"username": "admin", "password": "password1234"}).status_code == 403
+    assert client.post("/api/auth/setup", json={"username": "admin", "password": "CaseGen-Test1!"}).status_code == 403
 
     _setup(client)
     assert client.post(
         "/api/auth/login",
         headers=_origin(),
-        json={"username": "unknown", "password": "password1234"},
+        json={"username": "unknown", "password": "CaseGen-Test1!"},
     ).status_code == 401
     assert client.post("/api/auth/logout", headers={"Origin": "https://evil.example"}).status_code == 403
     assert client.post("/api/auth/logout", headers=_origin()).status_code == 204
@@ -48,7 +48,7 @@ def test_setup_login_logout_and_origin_guard(tmp_app_data, monkeypatch):
     with Session(get_engine()) as session:
         user = session.exec(select(User)).one()
         assert user.password_hash.startswith("scrypt$")
-        assert "password1234" not in user.password_hash
+        assert "CaseGen-Test1!" not in user.password_hash
         assert session.exec(select(AuthSession)).all() == []
 
 

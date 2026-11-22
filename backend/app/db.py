@@ -1,9 +1,16 @@
-import shutil
+import json
 import logging
+import os
+import re
+import shutil
 import sqlite3
+import tempfile
+from collections.abc import Callable, Sequence
+from contextlib import closing
+from datetime import datetime, timezone
 from pathlib import Path
 
-from sqlalchemy import text
+from sqlalchemy import Engine, text
 from sqlmodel import SQLModel, Session, create_engine
 from app import config
 from app.config import ensure_data_dirs
@@ -11,6 +18,320 @@ from app.config import ensure_data_dirs
 logger = logging.getLogger(__name__)
 
 _engine = None
+
+SCHEMA_MIGRATIONS_TABLE = "schema_migrations"
+MigrationEntry = tuple[str, str, Callable[[Engine], None]]
+
+
+def _noop_baseline_migration(engine: Engine) -> None:
+    """No-op baseline migration marking the v2 refactor starting point."""
+    return None
+
+
+def _migrate_0002_project_knowledge_sources(engine: Engine) -> None:
+    """Create project_knowledge_sources, extend task_citations, and backfill legacy external wikis."""
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS project_knowledge_sources (
+                    id INTEGER PRIMARY KEY,
+                    project_id INTEGER NOT NULL,
+                    name VARCHAR NOT NULL DEFAULT '外部知识库',
+                    provider_type VARCHAR NOT NULL DEFAULT 'llm_wiki_django',
+                    base_url VARCHAR NOT NULL DEFAULT 'http://127.0.0.1:8091',
+                    auth_type VARCHAR NOT NULL DEFAULT 'none',
+                    config_json TEXT NOT NULL DEFAULT '{}',
+                    credentials_json TEXT NOT NULL DEFAULT '{}',
+                    weight FLOAT NOT NULL DEFAULT 1.0,
+                    priority INTEGER NOT NULL DEFAULT 100,
+                    enabled BOOLEAN NOT NULL DEFAULT 1,
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(project_id) REFERENCES projects(id)
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_project_knowledge_sources_project_id "
+                "ON project_knowledge_sources(project_id)"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_project_knowledge_sources_provider_type "
+                "ON project_knowledge_sources(provider_type)"
+            )
+        )
+
+        citation_cols = conn.execute(text("PRAGMA table_info(task_citations)")).fetchall()
+        if citation_cols:
+            existing_citation_cols = {str(row[1]) for row in citation_cols}
+            citation_additions = (
+                ("knowledge_source_id", "INTEGER"),
+                ("file_path", "VARCHAR"),
+                ("heading_path", "VARCHAR"),
+                ("external_metadata_json", "TEXT"),
+            )
+            for col_name, col_type in citation_additions:
+                if col_name not in existing_citation_cols:
+                    conn.execute(
+                        text(
+                            f'ALTER TABLE task_citations ADD COLUMN "{col_name}" {col_type}'
+                        )
+                    )
+            conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_task_citations_knowledge_source_id "
+                    "ON task_citations(knowledge_source_id)"
+                )
+            )
+
+        legacy_exists = conn.execute(
+            text(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='project_external_wikis'"
+            )
+        ).first()
+        if legacy_exists is None:
+            return
+
+        legacy_cols = {
+            str(col_row[1])
+            for col_row in conn.execute(
+                text("PRAGMA table_info(project_external_wikis)")
+            ).fetchall()
+        }
+        if "project_id" not in legacy_cols:
+            return
+
+        select_exprs = [
+            "project_id",
+            "name" if "name" in legacy_cols else "NULL AS name",
+            "base_url" if "base_url" in legacy_cols else "NULL AS base_url",
+            (
+                "external_project_id"
+                if "external_project_id" in legacy_cols
+                else "'' AS external_project_id"
+            ),
+            (
+                "external_project_name"
+                if "external_project_name" in legacy_cols
+                else "'' AS external_project_name"
+            ),
+            "top_k" if "top_k" in legacy_cols else "6 AS top_k",
+            "timeout_sec" if "timeout_sec" in legacy_cols else "3.0 AS timeout_sec",
+            "weight" if "weight" in legacy_cols else "1.0 AS weight",
+            "use_synonyms" if "use_synonyms" in legacy_cols else "1 AS use_synonyms",
+            "enabled" if "enabled" in legacy_cols else "1 AS enabled",
+            "created_at" if "created_at" in legacy_cols else "NULL AS created_at",
+            "updated_at" if "updated_at" in legacy_cols else "NULL AS updated_at",
+        ]
+        legacy_rows = conn.execute(
+            text(
+                f"SELECT {', '.join(select_exprs)} "
+                "FROM project_external_wikis ORDER BY id ASC"
+            )
+        ).fetchall()
+        now_iso = datetime.now(timezone.utc).replace(tzinfo=None).isoformat(sep=" ")
+        for row in legacy_rows:
+            project_id = int(row[0])
+            already_has_source = conn.execute(
+                text(
+                    "SELECT 1 FROM project_knowledge_sources "
+                    "WHERE project_id = :project_id LIMIT 1"
+                ),
+                {"project_id": project_id},
+            ).first()
+            if already_has_source is not None:
+                continue
+            config_payload = {
+                "external_project_id": str(row[3] or ""),
+                "external_project_name": str(row[4] or ""),
+                "top_k": int(row[5] or 6),
+                "timeout_sec": float(row[6] if row[6] is not None else 3.0),
+                "use_synonyms": bool(row[8] if row[8] is not None else True),
+            }
+            created_at = (
+                str(row[10]).strip()
+                if row[10] is not None and str(row[10]).strip()
+                else now_iso
+            )
+            updated_at = (
+                str(row[11]).strip()
+                if row[11] is not None and str(row[11]).strip()
+                else created_at
+            )
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO project_knowledge_sources (
+                        project_id, name, provider_type, base_url, auth_type,
+                        config_json, credentials_json, weight, priority, enabled,
+                        created_at, updated_at
+                    ) VALUES (
+                        :project_id, :name, 'llm_wiki_django', :base_url, 'none',
+                        :config_json, '{}', :weight, 100, :enabled,
+                        :created_at, :updated_at
+                    )
+                    """
+                ),
+                {
+                    "project_id": project_id,
+                    "name": str(row[1] or "外部LLM知识库"),
+                    "base_url": str(row[2] or "http://127.0.0.1:8091"),
+                    "config_json": json.dumps(config_payload, ensure_ascii=False),
+                    "weight": float(row[7] if row[7] is not None else 1.0),
+                    "enabled": 1 if bool(row[9]) else 0,
+                    "created_at": created_at,
+                    "updated_at": updated_at,
+                },
+            )
+
+
+def _migrate_0003_prompt_visibility(engine: Engine) -> None:
+    """Add owner_user_id and visibility columns to prompt_templates and backfill defaults."""
+    with engine.begin() as conn:
+        cols = conn.execute(text("PRAGMA table_info(prompt_templates)")).fetchall()
+        if not cols:
+            return
+        existing_cols = {str(row[1]) for row in cols}
+        if "owner_user_id" not in existing_cols:
+            conn.execute(
+                text("ALTER TABLE prompt_templates ADD COLUMN owner_user_id INTEGER")
+            )
+        if "visibility" not in existing_cols:
+            conn.execute(
+                text(
+                    "ALTER TABLE prompt_templates ADD COLUMN visibility VARCHAR NOT NULL DEFAULT 'system'"
+                )
+            )
+        conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_prompt_templates_owner_user_id "
+                "ON prompt_templates(owner_user_id)"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_prompt_templates_visibility "
+                "ON prompt_templates(visibility)"
+            )
+        )
+        conn.execute(
+            text(
+                "UPDATE prompt_templates SET visibility = 'system' "
+                "WHERE visibility IS NULL OR TRIM(visibility) = ''"
+            )
+        )
+
+
+def _migrate_0004_remove_legacy_wiki_prompts(engine: Engine) -> None:
+    """Remove retired wiki_analyze and wiki_write prompt templates safely."""
+    with engine.begin() as conn:
+        table_exists = conn.execute(
+            text(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'prompt_templates'"
+            )
+        ).first()
+        if not table_exists:
+            return
+
+        retired_rows = conn.execute(
+            text(
+                "SELECT id FROM prompt_templates "
+                "WHERE type IN ('wiki_analyze', 'wiki_write')"
+            )
+        ).fetchall()
+        if not retired_rows:
+            return
+        retired_ids = [int(row[0]) for row in retired_rows]
+
+        referenced_ids: set[int] = set()
+        for ref_table, ref_col in (
+            ("generation_tasks", "prompt_template_id"),
+            ("prompt_revisions", "base_prompt_id"),
+        ):
+            ref_cols = {
+                str(col_row[1])
+                for col_row in conn.execute(
+                    text(f'PRAGMA table_info("{ref_table}")')
+                ).fetchall()
+            }
+            if ref_col in ref_cols:
+                rows = conn.execute(
+                    text(
+                        f'SELECT DISTINCT "{ref_col}" FROM "{ref_table}" '
+                        f'WHERE "{ref_col}" IS NOT NULL'
+                    )
+                ).fetchall()
+                referenced_ids.update(int(r[0]) for r in rows if r[0] is not None)
+
+        for pid in retired_ids:
+            if pid in referenced_ids:
+                conn.execute(
+                    text("UPDATE prompt_templates SET is_active = 0 WHERE id = :pid"),
+                    {"pid": pid},
+                )
+            else:
+                conn.execute(
+                    text("DELETE FROM prompt_templates WHERE id = :pid"),
+                    {"pid": pid},
+                )
+
+
+def _migrate_0005_checkpoint_coverage_metadata(engine: Engine) -> None:
+    """为旧版 task_test_point_checkpoints 表补齐 coverage_metadata_json 列。"""
+    with engine.begin() as conn:
+        exists = conn.execute(
+            text(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='task_test_point_checkpoints'"
+            )
+        ).first()
+        if exists is None:
+            return
+        cols = {
+            str(row[1])
+            for row in conn.execute(
+                text('PRAGMA table_info("task_test_point_checkpoints")')
+            ).fetchall()
+        }
+        if "coverage_metadata_json" not in cols:
+            conn.execute(
+                text(
+                    'ALTER TABLE "task_test_point_checkpoints" '
+                    'ADD COLUMN "coverage_metadata_json" TEXT NOT NULL DEFAULT \'{}\''
+                )
+            )
+
+
+VERSIONED_MIGRATIONS: tuple[MigrationEntry, ...] = (
+    ("0001_v2_refactor_baseline", "Record v2 refactor baseline", _noop_baseline_migration),
+    (
+        "0002_project_knowledge_sources",
+        "Add project_knowledge_sources, citation external columns and backfill legacy external wikis",
+        _migrate_0002_project_knowledge_sources,
+    ),
+    (
+        "0003_prompt_visibility",
+        "Add owner_user_id and visibility columns to prompt_templates",
+        _migrate_0003_prompt_visibility,
+    ),
+    (
+        "0004_remove_legacy_wiki_prompts",
+        "Remove retired wiki_analyze and wiki_write prompt templates",
+        _migrate_0004_remove_legacy_wiki_prompts,
+    ),
+    (
+        "0005_checkpoint_coverage_metadata",
+        "Add coverage_metadata_json column to task_test_point_checkpoints",
+        _migrate_0005_checkpoint_coverage_metadata,
+    ),
+)
 
 
 def get_engine():
@@ -111,6 +432,8 @@ def _migrate_sqlite_columns(engine) -> None:
                         "ADD COLUMN reasoning TEXT DEFAULT ''"
                     )
                 )
+            if "attachments_json" not in agent_message_names:
+                conn.execute(text("ALTER TABLE agent_messages ADD COLUMN attachments_json TEXT DEFAULT '[]'"))
 
 
 def _migrate_model_defaults(engine) -> None:
@@ -653,10 +976,6 @@ def _migrate_project_schema(engine, *, backfill: bool = False) -> None:
                 "project_id": "INTEGER",
                 "namespace": "VARCHAR",
             },
-            "wiki_pages": {
-                "canonical_topic": "VARCHAR",
-                "assertion_summary": "TEXT",
-            },
             "requirements": {"project_id": "INTEGER", "source_filename": "VARCHAR"},
             "generation_tasks": {"project_id": "INTEGER"},
         }
@@ -668,13 +987,6 @@ def _migrate_project_schema(engine, *, backfill: bool = False) -> None:
             for name, definition in columns.items():
                 if existing and name not in existing:
                     conn.execute(text(f'ALTER TABLE "{table}" ADD COLUMN "{name}" {definition}'))
-
-        decision_columns = {str(row[1]) for row in conn.execute(text('PRAGMA table_info("task_knowledge_decisions")')).fetchall()}
-        if decision_columns and ({"checkpoint_id", "checkpoint_version"} - decision_columns):
-            # Pre-checkpoint decisions were not tied to an evidence snapshot
-            # and are unsafe to reuse. Recreate the pre-release table instead
-            # of preserving its incompatible task/conflict unique index.
-            conn.execute(text('DROP TABLE "task_knowledge_decisions"'))
 
         if not backfill:
             return
@@ -981,24 +1293,174 @@ def _migrate_prompt_single_active(engine, *, create_index: bool = False) -> None
             )
 
 
+def _safe_migration_version(version: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", version.strip()).strip("._-")
+    return cleaned or "unknown"
+
+
+def _has_business_tables(engine: Engine) -> bool:
+    database = engine.url.database
+    if database and database != ":memory:" and not Path(database).is_file():
+        return False
+    with engine.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name NOT LIKE 'sqlite_%' "
+                "AND name <> :migrations_table LIMIT 1"
+            ),
+            {"migrations_table": SCHEMA_MIGRATIONS_TABLE},
+        ).first()
+    return row is not None
+
+
+def get_applied_migrations(engine: Engine | None = None) -> list[str]:
+    """Return applied migration versions ordered by version ascending."""
+    target_engine = engine if engine is not None else get_engine()
+    with target_engine.connect() as conn:
+        exists = conn.execute(
+            text(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=:table_name"
+            ),
+            {"table_name": SCHEMA_MIGRATIONS_TABLE},
+        ).first()
+        if exists is None:
+            return []
+        rows = conn.execute(
+            text(
+                f'SELECT version FROM "{SCHEMA_MIGRATIONS_TABLE}" ORDER BY version ASC'
+            )
+        ).fetchall()
+    return [str(row[0]) for row in rows]
+
+
+def _backup_db_before_versioned_migration(
+    engine: Engine, target_version: str
+) -> Path | None:
+    """Create a non-overwriting SQLite snapshot before running versioned migrations."""
+    database = engine.url.database
+    if not database or database == ":memory:":
+        return None
+    db_path = Path(database)
+    if not db_path.is_file():
+        return None
+    if not _has_business_tables(engine):
+        return None
+
+    safe_version = _safe_migration_version(target_version)
+    backup_path = db_path.with_name(f"{db_path.name}.pre-migration-{safe_version}.bak")
+    backup_path.parent.mkdir(parents=True, exist_ok=True)
+    if backup_path.exists():
+        return backup_path
+
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{backup_path.name}.tmp-",
+        dir=str(backup_path.parent),
+    )
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        with closing(sqlite3.connect(str(db_path), timeout=30.0)) as src, closing(
+            sqlite3.connect(str(tmp_path), timeout=30.0)
+        ) as dst:
+            src.backup(dst)
+        try:
+            os.link(tmp_path, backup_path)
+        except FileExistsError:
+            pass
+    finally:
+        tmp_path.unlink(missing_ok=True)
+    return backup_path
+
+
+def run_versioned_migrations(
+    engine: Engine | None = None,
+    migrations: Sequence[MigrationEntry] | None = None,
+    *,
+    backup: bool = True,
+) -> list[str]:
+    """Ensure schema_migrations exists and execute unapplied migrations in order."""
+    target_engine = engine if engine is not None else get_engine()
+    with target_engine.begin() as conn:
+        conn.execute(
+            text(
+                f"""
+                CREATE TABLE IF NOT EXISTS "{SCHEMA_MIGRATIONS_TABLE}" (
+                    version TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+
+    entries = VERSIONED_MIGRATIONS if migrations is None else migrations
+    applied = set(get_applied_migrations(target_engine))
+    pending = [
+        (version, name, migration_fn)
+        for version, name, migration_fn in entries
+        if version not in applied
+    ]
+    if not pending:
+        return []
+
+    if backup:
+        _backup_db_before_versioned_migration(target_engine, pending[0][0])
+
+    newly_applied: list[str] = []
+    for version, name, migration_fn in pending:
+        # Execute migration first; on any exception, no row is recorded in
+        # schema_migrations so the failed step will be retried on next run.
+        migration_fn(target_engine)
+        with target_engine.begin() as conn:
+            conn.execute(
+                text(
+                    f'INSERT INTO "{SCHEMA_MIGRATIONS_TABLE}" (version, name) '
+                    "VALUES (:version, :name)"
+                ),
+                {"version": version, "name": name},
+            )
+        newly_applied.append(version)
+    return newly_applied
+
+
+def _ensure_default_wiki_space(engine: Engine) -> None:
+    """Ensure the compatibility default WikiSpace row exists for module 1 and legacy tasks."""
+    with engine.begin() as conn:
+        row = conn.execute(
+            text('SELECT id FROM "wiki_spaces" WHERE slug = :slug'),
+            {"slug": "default"},
+        ).first()
+        if row is None:
+            conn.execute(
+                text(
+                    'INSERT INTO "wiki_spaces" '
+                    '(name, slug, description, status, scope, created_at, updated_at) '
+                    "VALUES (:name, :slug, :description, 'active', 'project', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+                ),
+                {
+                    "name": "默认空间",
+                    "slug": "default",
+                    "description": "兼容旧数据与平台模块的默认空间",
+                },
+            )
+
+
 def init_db() -> None:
     from app.models import entities  # noqa: F401
-    from app.services.wiki_migrate import backup_before_wiki_migration, migrate_wiki_schema
 
     engine = get_engine()
+    is_fresh_db = not _has_business_tables(engine)
     _backup_before_case_migration(engine)
     # Clean legacy duplicate defaults before SQLModel.metadata.create_all
     # attempts to create the partial unique index on an existing database.
-    backup_before_wiki_migration(engine)
     _migrate_model_defaults(engine)
     _migrate_project_schema(engine)
     # Clean legacy multi-active prompt rows before create_all can encounter
     # the partial unique index on prompt_templates.
     _migrate_prompt_single_active(engine)
-    # Wiki migration performs its backup before any create/alter/backfill
-    # operation.  It also calls create_all so the new Wiki tables are present
-    # before the remaining compatibility migration runs.
-    migrate_wiki_schema(engine)
+    SQLModel.metadata.create_all(engine)
+    _ensure_default_wiki_space(engine)
     _migrate_prompt_single_active(engine, create_index=True)
     _migrate_project_schema(engine, backfill=True)
     _migrate_sqlite_columns(engine)
@@ -1012,6 +1474,7 @@ def init_db() -> None:
     # Runs after the visibility migration so the conversation table/columns
     # definitely exist; idempotent and offline (never calls DSH).
     _migrate_agent_conversation_models(engine)
+    run_versioned_migrations(engine, backup=not is_fresh_db)
 
 
 def get_session():
