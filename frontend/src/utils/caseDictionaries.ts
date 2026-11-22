@@ -145,3 +145,29 @@ export function caseStatusTagType(status?: string | null): CaseStatusTagType {
   if (!status) return 'info'
   return CASE_STATUS_TAG_TYPES[status] ?? 'info'
 }
+
+export type CaseConflictStrategy = 'error' | 'overwrite' | 'skip'
+
+export interface CaseConflictStrategyOption {
+  value: CaseConflictStrategy
+  label: string
+  description: string
+}
+
+export const CASE_CONFLICT_STRATEGY_OPTIONS: CaseConflictStrategyOption[] = [
+  {
+    value: 'error',
+    label: '遇重名报错提示',
+    description: '发现目标需求中已有同编号用例时中止入库并列出冲突，由你确认后再决定处理方式',
+  },
+  {
+    value: 'overwrite',
+    label: '覆盖更新已有用例',
+    description: '用当前 Agent 生成的标题、优先级与正文覆盖同编号用例，并递增修订号与记录日志',
+  },
+  {
+    value: 'skip',
+    label: '跳过已有同编号用例',
+    description: '保留目标需求中的原有同编号用例不变，仅写入不冲突的新编号用例',
+  },
+]

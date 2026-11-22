@@ -7,8 +7,8 @@ Design rules that shape this module:
   (same discipline as the per-stage commits in task_pipeline).
 - Never auto-retry a prompt.  Re-sending POST /sessions/:id/prompt-stream
   re-runs the whole agent turn, so a transport failure surfaces exactly once.
-- Never set a module-level chat hook.  The line-B pipeline hooks change the
-  execution path of 60+ existing test files; this module does not touch them.
+- Optional external knowledge read-only hooks remain no-op by default so normal
+  DSH turns and tests do not perform unintended DB/HTTP work.
 - Never forward tool_call / tool_result / usage frames.  The gateway already
   drops them; this runner publishes delta / reasoning / notice / status /
   terminal frames to the in-memory broker.  Reasoning is the user-approved
@@ -27,7 +27,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from contextlib import nullcontext
-from typing import Any, Optional
+from typing import Any, Callable, Optional, Protocol
 
 import httpx
 from sqlmodel import Session, col, select
@@ -43,12 +43,25 @@ from app.services.agent_gateway import (
 )
 from app.services.agent_skills import skill_prompt_prefix
 from app.services.agent_stream import agent_stream
+from app.services.knowledge_providers import (
+    ProjectKnowledgeSearchResult,
+    RemoteFileContent,
+    RemoteFileItem,
+    list_source_files,
+    read_source_file,
+    search_project_knowledge,
+)
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "AgentKnowledgeTool",
+    "KnowledgeContextHook",
+    "ProjectKnowledgeReadOnlyTool",
     "STATUS_CONNECTING",
     "TurnHandle",
+    "get_knowledge_context_hook",
+    "set_knowledge_context_hook",
     "start_turn",
     "run_turn",
     "request_cancel",
@@ -358,6 +371,82 @@ def _release_conversation(conversation_id: str) -> None:
         session.commit()
 
 
+KnowledgeContextHook = Callable[[int, str], str]
+
+
+class AgentKnowledgeTool(Protocol):
+    """Read-only external knowledge interface reserved for future multi-turn agent retrieval."""
+
+    def search(
+        self, project_id: int, query: str, *, top_k: int | None = None
+    ) -> ProjectKnowledgeSearchResult: ...
+
+    def list_files(self, project_id: int, source_id: int) -> list[RemoteFileItem]: ...
+
+    def read_file(
+        self, project_id: int, source_id: int, file_path: str
+    ) -> RemoteFileContent: ...
+
+
+class ProjectKnowledgeReadOnlyTool:
+    """Short-session adapter delegating read-only external knowledge queries to KnowledgeService."""
+
+    def search(
+        self, project_id: int, query: str, *, top_k: int | None = None
+    ) -> ProjectKnowledgeSearchResult:
+        with Session(get_engine()) as session:
+            return search_project_knowledge(session, project_id, query, top_k=top_k)
+
+    def list_files(self, project_id: int, source_id: int) -> list[RemoteFileItem]:
+        with Session(get_engine()) as session:
+            return list_source_files(session, project_id, source_id)
+
+    def read_file(
+        self, project_id: int, source_id: int, file_path: str
+    ) -> RemoteFileContent:
+        with Session(get_engine()) as session:
+            return read_source_file(session, project_id, source_id, file_path)
+
+
+_knowledge_context_hook: KnowledgeContextHook | None = None
+
+
+def set_knowledge_context_hook(hook: KnowledgeContextHook | None) -> None:
+    """Register or clear the optional read-only external knowledge context hook."""
+
+    global _knowledge_context_hook
+    _knowledge_context_hook = hook
+
+
+def get_knowledge_context_hook() -> KnowledgeContextHook | None:
+    """Return the active external knowledge context hook, or None when disabled."""
+
+    return _knowledge_context_hook
+
+
+def _resolve_external_knowledge_block(
+    project_id_raw: str | int | None, query: str
+) -> str:
+    hook = _knowledge_context_hook
+    if hook is None or not str(query or "").strip():
+        return ""
+    raw = str(project_id_raw or "").strip()
+    if not raw.isdigit():
+        return ""
+    try:
+        block = str(hook(int(raw), str(query)) or "").strip()
+    except Exception:
+        logger.warning("外部知识库只读钩子执行失败，已跳过上下文注入。")
+        return ""
+    if not block:
+        return ""
+    return (
+        "[外部知识库只读检索参考]\n"
+        + block
+        + "\n[外部知识库只读检索参考结束]\n\n"
+    )
+
+
 def _knowledge_prompt_block(attachments: list[dict[str, Any]] | None = None) -> str:
     attachments = attachments or []
     if not attachments:
@@ -379,10 +468,12 @@ def _build_prompt(
     user_text: str,
     skill_name: Optional[str],
     attachments: Optional[list[dict[str, Any]]] = None,
+    external_knowledge_block: str = "",
 ) -> str:
     return (
         skill_prompt_prefix(skill_name or "")
         + _knowledge_prompt_block(attachments or [])
+        + (external_knowledge_block or "")
         + ("请先阅读本轮附件，再协助进行测试设计。\n" if attachments and not (user_text or "").strip() else "")
         + (user_text or "")
     )
@@ -501,8 +592,16 @@ def run_turn(
 
         raw_user_text = inputs["prompt"] or ""
         attachments = inputs.get("attachments") or []
+        external_knowledge_block = _resolve_external_knowledge_block(
+            inputs.get("project_id"), raw_user_text
+        )
         prompt = (
-            _build_prompt(raw_user_text, inputs.get("skill_name"), attachments)
+            _build_prompt(
+                raw_user_text,
+                inputs.get("skill_name"),
+                attachments,
+                external_knowledge_block=external_knowledge_block,
+            )
             if raw_user_text.strip() or attachments
             else ""
         )

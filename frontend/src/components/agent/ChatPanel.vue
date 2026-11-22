@@ -2,10 +2,9 @@
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { ChatDotRound, CircleClose, Connection, MagicStick } from '@element-plus/icons-vue'
 import { useAgentChatStore } from '../../stores/agentChatStore'
-import { hasAgentCaseJson } from './parseAgentCases'
 import ChatMessage from './ChatMessage.vue'
 import ChatComposer from './ChatComposer.vue'
-import type { AgentAttachmentItem, AgentSaveAsDraftResult } from '../../api/agent'
+import type { AgentAttachmentItem } from '../../api/agent'
 
 /**
  * 中列：消息流 + 状态条 + 输入区。
@@ -16,7 +15,7 @@ import type { AgentAttachmentItem, AgentSaveAsDraftResult } from '../../api/agen
  */
 
 const emit = defineEmits<{
-  draftSaved: [result: AgentSaveAsDraftResult]
+  saveToCases: [messageId: string]
 }>()
 
 const store = useAgentChatStore()
@@ -43,24 +42,13 @@ const currentSkillInfo = computed(() => {
 const quickPrompts = [
   '请结合当前项目需求、附件与外部知识库，帮我拆解核心业务与非功能/架构瓶颈测试点清单',
   '针对并发请求、幂等性与超时重试场景，设计一组高优先级（P0/P1）边界测试用例',
-  '请把刚才讨论的测试点按 CaseGen 标准 JSON 契约输出结构化测试用例，以便转存草稿',
+  '请把刚才讨论的测试点按 CaseGen 标准 JSON 契约输出结构化测试用例，以便入库至用例管理',
 ]
 
 function fillQuickPrompt(text: string) {
   if (busy.value || closed.value) return
   composerRef.value?.setDraft(text)
 }
-
-/** 只有「最后一条 assistant 且含用例 JSON」才允许转存草稿（spec §3.5 取最近一条 assistant）。 */
-const canSaveDraft = computed(() => {
-  if (!conversation.value || closed.value) return false
-  if (busy.value) return false
-  const list = store.persistedMessages
-  for (let index = list.length - 1; index >= 0; index -= 1) {
-    if (list[index].role === 'assistant') return hasAgentCaseJson(list[index].content)
-  }
-  return false
-})
 
 function onScroll() {
   const host = scrollHost.value
@@ -118,15 +106,6 @@ async function onCancel() {
   }
 }
 
-async function onSaveDraft() {
-  try {
-    const result = await store.saveAsDraft()
-    if (result) emit('draftSaved', result)
-  } catch {
-    // store 内已记录 savingDraftError
-  }
-}
-
 const composerPlaceholder = computed(() => {
   if (closed.value) return '该会话已关闭，新建会话后可继续对话'
   if (busy.value) return 'Agent 正在生成回复，可等待或中止本轮'
@@ -167,22 +146,13 @@ const composerDisabled = computed(() =>
       :format="() => (progress.determinate ? `${progress.current}/${progress.total}` : '')"
     />
 
-    <div v-if="store.streamError || store.savingDraftError" class="panel-alerts">
+    <div v-if="store.streamError" class="panel-alerts">
       <el-alert
-        v-if="store.streamError"
         class="panel-alert"
         type="error"
         :closable="false"
         show-icon
         :title="store.streamError"
-      />
-      <el-alert
-        v-if="store.savingDraftError"
-        class="panel-alert"
-        type="warning"
-        :closable="false"
-        show-icon
-        :title="store.savingDraftError"
       />
     </div>
 
@@ -220,6 +190,7 @@ const composerDisabled = computed(() =>
         <ChatMessage
           v-for="message in messages"
           :key="message.id"
+          :message-id="message.id"
           :role="message.role"
           :content="message.content"
           :attachments="message.attachments"
@@ -227,9 +198,8 @@ const composerDisabled = computed(() =>
           :created-at="message.created_at"
           :streaming="Boolean(message.streaming)"
           :pending="Boolean(message.pending)"
-          :can-save-draft="canSaveDraft && !message.streaming && message.role === 'assistant'"
-          :saving-draft="store.savingDraft"
-          @save-draft="onSaveDraft"
+          :save-disabled="busy || closed"
+          @save-to-cases="emit('saveToCases', $event)"
         />
       </div>
     </div>
@@ -257,16 +227,6 @@ const composerDisabled = computed(() =>
           >
             <el-icon><CircleClose /></el-icon>
             <span>中止本轮</span>
-          </el-button>
-          <el-button
-            v-if="canSaveDraft"
-            size="small"
-            type="primary"
-            plain
-            :loading="store.savingDraft"
-            @click="onSaveDraft"
-          >
-            转存为用例草稿
           </el-button>
         </template>
       </ChatComposer>

@@ -14,7 +14,7 @@ import {
   listAgentModels,
   listAgentSkills,
   normalizeProjectId,
-  saveAgentConversationAsDraft,
+  saveAgentMessageCases,
   sendAgentMessage,
   updateAgentConversation,
   type AgentConversationItem,
@@ -23,7 +23,8 @@ import {
   type AgentModelItem,
   type AgentModelsResponse,
   type AgentProjectId,
-  type AgentSaveAsDraftResult,
+  type AgentSaveCasesPayload,
+  type AgentSaveCasesResult,
   type AgentSkillItem,
   type AgentStreamPayload,
 } from '../api/agent'
@@ -145,9 +146,9 @@ export const useAgentChatStore = defineStore('agentChat', () => {
   // ---- 动作态 ----
   const sending = ref(false)
   const cancelling = ref(false)
-  const savingDraft = ref(false)
-  const savingDraftError = ref('')
-  const lastSaveResult = ref<AgentSaveAsDraftResult | null>(null)
+  const savingCases = ref(false)
+  const savingCasesError = ref('')
+  const lastSaveResult = ref<AgentSaveCasesResult | null>(null)
 
   // ---- 技能与模型 ----
   const skills = ref<AgentSkillItem[]>([])
@@ -236,6 +237,11 @@ export const useAgentChatStore = defineStore('agentChat', () => {
     conversations.value = []
     currentId.value = null
     messagesByConversation.value = {}
+    lastSaveResult.value = null
+    savingCasesError.value = ''
+    savingCases.value = false
+    detailError.value = ''
+    conversationsError.value = ''
     resetStage()
   }
 
@@ -256,7 +262,7 @@ export const useAgentChatStore = defineStore('agentChat', () => {
    *
    * 用于终态帧永远不会到达的路径：重连被拒时 scheduleReconnect 走 teardown + finish('refused')，
    * finalizeTurn / failTurn 都不会被调用。此时若不清 streamingActive，isBusy 会永久为真：
-   * 输入框禁用、displayMessages 一直挂着一条 stale 的流式气泡、canSaveDraft 恒 false，
+   * 输入框禁用、displayMessages 一直挂着一条 stale 的流式气泡、入库按钮永久禁用，
    * 而 AgentChatView 没有任何手动解卡控件，用户只能切会话或刷新页面。
    *
    * 内容不会丢：后端 _finish_turn 在轮次结束（含取消）时就把 assistant 全文落库，
@@ -888,21 +894,24 @@ export const useAgentChatStore = defineStore('agentChat', () => {
     }
   }
 
-  async function saveAsDraft() {
-    const id = currentId.value
-    if (!id) return null
-    savingDraft.value = true
-    savingDraftError.value = ''
-    lastSaveResult.value = null
+  async function saveMessageCases(
+    payload: AgentSaveCasesPayload,
+    opts?: { conversationId?: string; projectId?: number | null },
+  ): Promise<AgentSaveCasesResult> {
+    const id = opts?.conversationId || currentId.value
+    const targetProjectId = opts?.projectId !== undefined ? opts.projectId : projectId.value
+    if (!id) throw new Error('未选择会话，无法入库用例')
+    savingCases.value = true
+    savingCasesError.value = ''
     try {
-      const result = await saveAgentConversationAsDraft(id, projectId.value)
+      const result = await saveAgentMessageCases(id, payload, targetProjectId)
       lastSaveResult.value = result
       return result
     } catch (error) {
-      savingDraftError.value = errorMessage(error)
+      savingCasesError.value = errorMessage(error)
       throw error
     } finally {
-      savingDraft.value = false
+      savingCases.value = false
     }
   }
 
@@ -924,6 +933,11 @@ export const useAgentChatStore = defineStore('agentChat', () => {
     conversations.value = []
     currentId.value = null
     messagesByConversation.value = {}
+    lastSaveResult.value = null
+    savingCasesError.value = ''
+    savingCases.value = false
+    detailError.value = ''
+    conversationsError.value = ''
   }
 
   return {
@@ -946,8 +960,8 @@ export const useAgentChatStore = defineStore('agentChat', () => {
     reconnectMax,
     sending,
     cancelling,
-    savingDraft,
-    savingDraftError,
+    savingCases,
+    savingCasesError,
     lastSaveResult,
     skills,
     skillsLoading,
@@ -978,7 +992,7 @@ export const useAgentChatStore = defineStore('agentChat', () => {
     sendMessage,
     cancelTurn,
     closeConversation,
-    saveAsDraft,
+    saveMessageCases,
     refreshConversation,
     openStream,
     releaseView,

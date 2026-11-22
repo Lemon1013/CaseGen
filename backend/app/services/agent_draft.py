@@ -1,27 +1,14 @@
-"""Save an agent conversation answer as a structured case draft (spec 3.5 plan a).
+"""Save one assistant message's structured cases directly to TestCase rows.
 
-The agent has no test-point checkpoint chain, so `finalize_task` cannot be
-reused (it requires a confirmed `TaskTestPointCheckpoint`).  Instead this
-module builds the same durable shape the pipeline produces:
+Unlike pipeline tasks, an agent conversation has no test-point checkpoint
+chain and no longer creates a shell ``GenerationTask`` or ``CaseDraft``.
+Instead, each assistant reply is parsed by ``message_id``, validated atomically,
+and written straight into ``TestCase`` under either an existing project
+``Requirement`` or a newly created ``Requirement``.
 
-    virtual Requirement  ->  shell GenerationTask(status='generated')
-                           ->  CaseDraft(v N)  ->  TestCase rows
-
-Atomicity inherits the `finalize_task` principle verbatim: *a malformed draft
-must leave the task retryable and must never commit a partial case set*.  Every
-row is created inside the caller's session and committed exactly once at the
-end; any parse, validation or collision failure raises before that commit, so
-the caller rolls the whole transaction back and the conversation stays usable.
-
-The JSON contract mirrors `app.schemas.tasks` draft output models
-(`DraftPointGroupOut` / `DraftCaseItemOut`) so the same structured draft UI can
-render an agent answer.  Both a bare case array and a point-group array are
-accepted, matching the frontend parser in
-`frontend/src/components/agent/parseAgentCases.ts`.
-
-Structured fields are authoritative for rendering: `raw_md` is accepted but not
-emitted, so an agent cannot inject an arbitrary heading that `split_case_draft`
-would treat as an extra case.
+Atomicity still matches ``finalize_task``: any parse, validation, ownership,
+or conflict failure raises before ``session.commit()`` so the caller rolls back
+without leaving an empty requirement or partial case set behind.
 """
 
 from __future__ import annotations
@@ -29,25 +16,24 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Literal, Optional
 
 from pydantic import ValidationError
-from sqlmodel import Session, col, func, select
+from sqlmodel import Session
 
 from app.models.entities import (
     AgentConversation,
     AgentMessage,
-    CaseDraft,
-    GenerationTask,
     Project,
     Requirement,
-    TestCase,
 )
 from app.schemas.agent import AgentDraftCaseIn, AgentDraftPointGroupIn
 from app.services.case_management import (
     CaseDraftParseError,
-    import_cases_from_draft,
+    CaseKeyConflictError,
+    import_cases_to_requirement,
     normalize_case_key,
+    split_case_draft,
 )
 
 logger = logging.getLogger(__name__)
@@ -57,35 +43,31 @@ __all__ = [
     "extract_case_json_blocks",
     "parse_agent_case_groups",
     "render_draft_markdown",
-    "save_conversation_as_draft",
+    "save_message_cases_to_requirement",
 ]
 
-# Failure codes the API layer maps onto HTTP statuses.  `conflict` -> 409,
-# everything else -> 422 with a directly presentable Chinese detail.
+# Failure codes the API layer maps onto HTTP statuses:
+# `not_found` -> 404, `conflict` -> 409, everything else -> 422.
 _JSON_FENCE_RE = re.compile(r"```json\s*([\s\S]*?)```", re.IGNORECASE)
 
-_NO_ASSISTANT = "对话中还没有 Agent 回答，无法导入为草稿。"
+_NO_ASSISTANT = "该条 Agent 回复内容为空，无法入库至用例管理。"
+_INVALID_MESSAGE_ROLE = "仅支持将 Agent 回复入库至用例管理。"
 _NO_JSON_BLOCK = (
-    "本轮回答中没有可导入的用例 JSON（需要 ```json 代码块）。"
+    "本条回答中没有可入库的用例 JSON（需要 ```json 代码块）。"
     "你可以让 Agent 重新按用例 JSON 格式输出，或直接导出 Markdown 手动整理。"
 )
 _INVALID_JSON = (
-    "用例 JSON 无法解析，导入已整体取消，未产生任何用例。"
+    "用例 JSON 无法解析，入库已整体取消，未产生任何用例。"
     "请让 Agent 修正格式后重试，或导出 Markdown 手动整理。"
 )
 _INVALID_SHAPE = (
-    "用例 JSON 结构不符合契约（需要测试点分组数组或用例数组），导入已整体取消。"
+    "用例 JSON 结构不符合契约（需要测试点分组数组或用例数组），入库已整体取消。"
     "请让 Agent 按 DraftPointGroup/DraftCaseItem 结构重新输出，或导出 Markdown。"
 )
 _EMPTY_CASES = "用例 JSON 中没有可用用例（每组至少需要一条含步骤或用例编号的用例）。"
-_DUPLICATE_KEYS = "用例编号重复：{keys}。导入已整体取消，请让 Agent 修正编号后重试。"
-_CONFLICT = (
-    "用例编号已存在于本对话导入的用例集中：{keys}。"
-    "导入已整体取消；请在用例列表中删除旧用例，或让 Agent 换用新的用例编号。"
-)
-_NO_PROJECT = "会话所属项目不存在，无法导入用例。"
-_INVALID_PROJECT = "会话的 project_id 不是有效的项目编号，无法导入用例。"
-_IMPORTED = "已从 Agent 回答导入 {count} 条用例（草稿 v{version}）。"
+_DUPLICATE_KEYS = "用例编号重复：{keys}。入库已整体取消，请让 Agent 修正编号后重试。"
+_NO_PROJECT = "会话所属项目不存在或已停用，无法入库用例。"
+_INVALID_PROJECT = "会话的 project_id 不是有效的项目编号，无法入库用例。"
 
 _MAX_CASE_KEY_CHARS = 60
 _MAX_TITLE_CHARS = 400
@@ -93,10 +75,17 @@ _PRIORITY_VALUES = ("P0", "P1", "P2")
 
 
 class AgentDraftError(ValueError):
-    """Raised when an agent answer cannot become a draft without data loss."""
+    """Raised when an agent answer cannot be imported without data loss."""
 
-    def __init__(self, message: str, *, code: str = "invalid_draft") -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "invalid_draft",
+        conflicts: Optional[list[dict[str, Any]]] = None,
+    ) -> None:
         self.code = str(code or "invalid_draft")
+        self.conflicts = [dict(item) for item in conflicts] if conflicts else []
         super().__init__(message)
 
 
@@ -272,7 +261,11 @@ def _render_case(case: AgentDraftCaseIn, key: str, title: str, group: AgentDraft
         lines.append("   预期结果：无")
     lines.append("")
 
-    pending = [item for item in (_block_lines(p) for p in case.pending_items) if item]
+    pending = [
+        line
+        for item_text in case.pending_items
+        for line in _block_lines(item_text)
+    ]
     lines.append("### 待定事项")
     if pending:
         lines.extend(f"- {_one_line(item, 500)}" for item in pending)
@@ -315,17 +308,6 @@ def render_draft_markdown(groups: Iterable[AgentDraftPointGroupIn]) -> tuple[str
 # ---------------------------------------------------------------------------
 
 
-def _next_draft_version(session: Session, task_id: int) -> int:
-    """Replicated from task_pipeline._next_draft_version (module-private there)."""
-
-    current = session.exec(
-        select(func.max(CaseDraft.version)).where(CaseDraft.task_id == task_id)
-    ).one()
-    if current is None:
-        return 1
-    return int(current) + 1
-
-
 def _project_id_of(conversation: AgentConversation) -> Optional[int]:
     raw = str(getattr(conversation, "project_id", "") or "").strip()
     if not raw.isdigit():
@@ -333,122 +315,122 @@ def _project_id_of(conversation: AgentConversation) -> Optional[int]:
     return int(raw)
 
 
-def _find_shell_task(session: Session, conversation_id: str) -> Optional[GenerationTask]:
-    """Find the conversation's existing virtual requirement + shell task."""
-
-    suffix = ":" + str(conversation_id)
-    drafts = session.exec(
-        select(CaseDraft).where(
-            col(CaseDraft.prompt_version_ref).like("agent:%" + suffix)
-        )
-    ).all()
-    for draft in drafts:
-        task = session.get(GenerationTask, int(draft.task_id))
-        if task is not None:
-            return task
-    return None
-
-
-def _load_latest_assistant_content(session: Session, conversation_id: str) -> str:
-    row = session.exec(
-        select(AgentMessage)
-        .where(AgentMessage.conversation_id == str(conversation_id))
-        .where(AgentMessage.role == "assistant")
-        .order_by(col(AgentMessage.created_at).desc(), col(AgentMessage.id).desc())
-    ).first()
-    return (row.content if row is not None else "") or ""
-
-
-def save_conversation_as_draft(
-    session: Session, conversation: AgentConversation
+def save_message_cases_to_requirement(
+    session: Session,
+    conversation: AgentConversation,
+    *,
+    message_id: str,
+    target_mode: Literal["existing_requirement", "new_requirement"],
+    requirement_id: Optional[int] = None,
+    requirement_title: Optional[str] = None,
+    requirement_description: Optional[str] = None,
+    conflict_strategy: Literal["error", "overwrite", "skip"] = "error",
+    operator: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Import the latest assistant answer as cases.  Never commits on failure.
+    """Import one assistant message's cases directly into ``TestCase``.
 
-    The caller owns the transaction: this function only flushes, and commits
-    exactly once after the case import succeeded.  Any `AgentDraftError` or
-    `CaseDraftParseError` leaves the session dirty, so the caller must roll back.
+    Never creates a shell ``GenerationTask`` or ``CaseDraft``. Any parse,
+    ownership, validation, or conflict error raises before ``session.commit()``,
+    so the caller rolls back the transaction cleanly (including any flushed new
+    ``Requirement``).
     """
-
-    conversation_id = str(conversation.id)
-    content = _load_latest_assistant_content(session, conversation_id)
-    if not content.strip():
-        raise AgentDraftError(_NO_ASSISTANT, code="no_assistant_message")
-
-    groups = parse_agent_case_groups(content)
-    content_md, case_keys = render_draft_markdown(groups)
+    if conflict_strategy not in {"error", "overwrite", "skip"}:
+        raise AgentDraftError("不支持的冲突处理策略。", code="invalid_strategy")
 
     project_id = _project_id_of(conversation)
     if project_id is None:
         raise AgentDraftError(_INVALID_PROJECT, code="invalid_project")
-    if session.get(Project, project_id) is None:
-        raise AgentDraftError(_NO_PROJECT, code="no_project")
+    project = session.get(Project, project_id)
+    if project is None or getattr(project, "status", "active") != "active":
+        raise AgentDraftError(_NO_PROJECT, code="invalid_project")
 
-    task = _find_shell_task(session, conversation_id)
-    if task is None:
-        # A virtual Requirement is required because TestCase.requirement_id is
-        # NOT NULL with a FK, while CaseDraft.task_id and
-        # GenerationTask.requirement_id are NOT NULL without one.
-        requirement = Requirement(
+    message = session.get(AgentMessage, str(message_id))
+    if message is None or str(message.conversation_id) != str(conversation.id):
+        raise AgentDraftError("Resource not found in project", code="not_found")
+    if message.role != "assistant":
+        raise AgentDraftError(_INVALID_MESSAGE_ROLE, code="invalid_message_role")
+
+    content = str(message.content or "")
+    if not content.strip():
+        raise AgentDraftError(_NO_ASSISTANT, code="no_assistant_message")
+
+    groups = parse_agent_case_groups(content)
+    content_md, _ = render_draft_markdown(groups)
+    sections = split_case_draft(content_md)
+
+    created_requirement = False
+    if target_mode == "existing_requirement":
+        if requirement_id is None or int(requirement_id) < 1:
+            raise AgentDraftError("请选择要绑定的目标需求。", code="invalid_target")
+        req = session.get(Requirement, int(requirement_id))
+        if req is None or req.project_id != project_id:
+            raise AgentDraftError("Resource not found in project", code="not_found")
+    elif target_mode == "new_requirement":
+        req_title = _one_line(requirement_title or "", 200)
+        if not req_title:
+            raise AgentDraftError("请输入新需求标题。", code="invalid_target")
+        req_desc = str(requirement_description or "").strip()
+        req = Requirement(
             project_id=project_id,
-            title=_one_line(conversation.title or "未命名对话", 180) + "（Agent 对话导入）",
-            description=(
-                "由 Agent 对话导入生成的虚拟需求，用于承载对话产出的测试用例。\n"
-                f"conversation_id={conversation_id}"
-            ),
+            title=req_title,
+            description=req_desc,
+            focus_tags_json="[]",
             source_filename=None,
         )
-        session.add(requirement)
+        session.add(req)
         session.flush()
-        task = GenerationTask(
-            requirement_id=int(requirement.id),
-            project_id=project_id,
-            # Set directly: the agent has no test-point checkpoint chain, so the
-            # task_state machine and finalize_task are deliberately bypassed.
-            status="generated",
+        created_requirement = True
+    else:
+        raise AgentDraftError("不支持的归属目标模式。", code="invalid_target")
+
+    try:
+        imported = import_cases_to_requirement(
+            session,
+            int(req.id),
+            sections,
+            conflict_strategy=conflict_strategy,
+            operator=operator,
+            reason=f"agent:{conversation.id}:{message.id}",
         )
-        session.add(task)
-        session.flush()
-    requirement_id = int(task.requirement_id)
+    except CaseKeyConflictError as exc:
+        raise AgentDraftError(
+            str(exc), code="conflict", conflicts=exc.conflicts
+        ) from None
 
-    existing_keys = {
-        str(row.case_key).upper()
-        for row in session.exec(
-            select(TestCase.case_key).where(TestCase.requirement_id == requirement_id)
-        ).all()
-    }
-    collisions = sorted(key for key in case_keys if key.upper() in existing_keys)
-    if collisions:
-        raise AgentDraftError(_CONFLICT.format(keys="、".join(collisions)), code="conflict")
-
-    skill = _one_line(conversation.skill_name or "", 80) or "none"
-    draft = CaseDraft(
-        task_id=int(task.id),
-        version=_next_draft_version(session, int(task.id)),
-        content_md=content_md,
-        prompt_version_ref=f"agent:{skill}:{conversation_id}",
-    )
-    session.add(draft)
-    session.flush()
-
-    # Flush-only by contract: the import validates every collision before it
-    # writes, and this function commits once so a malformed draft can never
-    # leave a partially imported case set behind.
-    imported = import_cases_from_draft(session, task, draft)
     session.commit()
 
+    imported_count = int(imported["imported_count"])
+    created_count = int(imported["created_count"])
+    overwritten_count = int(imported["overwritten_count"])
+    skipped_count = int(imported["skipped_count"])
+    if overwritten_count == 0 and skipped_count == 0:
+        summary = f"已入库 {imported_count} 条用例至需求「{req.title}」。"
+    else:
+        summary = (
+            f"已处理 {imported_count + skipped_count} 条用例至需求「{req.title}」"
+            f"（新增 {created_count}、覆盖 {overwritten_count}、跳过 {skipped_count}）。"
+        )
+
     logger.info(
-        "Agent 对话导入用例：conversation=%s task=%s draft=%s count=%s",
-        conversation_id,
-        task.id,
-        draft.id,
-        len(imported),
+        "Agent 消息直入用例库：conversation=%s message=%s requirement=%s imported=%s skipped=%s",
+        conversation.id,
+        message.id,
+        req.id,
+        imported_count,
+        skipped_count,
     )
     return {
-        "task_id": int(task.id),
-        "draft_id": int(draft.id),
-        "requirement_id": requirement_id,
-        "imported_count": len(imported),
-        "case_keys": [str(row.case_key) for row in imported],
-        "version": int(draft.version),
-        "message": _IMPORTED.format(count=len(imported), version=draft.version),
+        "requirement_id": int(req.id),
+        "requirement_title": req.title,
+        "created_requirement": created_requirement,
+        "message_id": str(message.id),
+        "conflict_strategy": conflict_strategy,
+        "imported_count": imported_count,
+        "created_count": created_count,
+        "overwritten_count": overwritten_count,
+        "skipped_count": skipped_count,
+        "case_keys": list(imported["case_keys"]),
+        "overwritten_keys": list(imported["overwritten_keys"]),
+        "skipped_keys": list(imported["skipped_keys"]),
+        "message": summary,
     }

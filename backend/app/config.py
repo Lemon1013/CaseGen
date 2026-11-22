@@ -71,12 +71,6 @@ AGENT_WORKSPACE_ROOT = os.getenv("AGENT_WORKSPACE_ROOT", "").strip()
 AGENT_FIRST_TOKEN_TIMEOUT_SEC = max(30, int(os.getenv("AGENT_FIRST_TOKEN_TIMEOUT_SEC", "600")))
 # Wall-clock budget for a stalled turn (no event at all) before it is failed.
 AGENT_STALL_TIMEOUT_SEC = max(10, int(os.getenv("AGENT_STALL_TIMEOUT_SEC", "300")))
-# Line-B budget gate: an agent-backed pipeline stage may not exceed this many
-# DSH calls per task before it falls back to the legacy path.
-AGENT_STAGE_MAX_CALLS = max(1, int(os.getenv("AGENT_STAGE_MAX_CALLS", "4")))
-# Comma-separated pipeline stage names allowed to run through the agent.
-# Empty keeps every stage on the legacy deterministic path.
-PIPELINE_AGENT_STAGES = os.getenv("PIPELINE_AGENT_STAGES", "").strip()
 # Repository-relative directory holding expert skills (``*/SKILL.md``).
 AGENT_SKILLS_DIR = os.getenv("AGENT_SKILLS_DIR", ".agents/skills").strip()
 # DSH agent preset id used when CaseGen creates a DSH session. Empty keeps the
@@ -92,16 +86,6 @@ def agent_workspace_root() -> Path:
         return Path(DATA_DIR) / "agent-workspace"
     candidate = Path(raw).expanduser()
     return candidate if candidate.is_absolute() else ROOT / candidate
-
-
-def agent_pipeline_stages() -> set[str]:
-    """Parse ``PIPELINE_AGENT_STAGES`` into a set of stage names."""
-
-    return {
-        item.strip()
-        for item in (PIPELINE_AGENT_STAGES or "").split(",")
-        if item.strip()
-    }
 
 
 def ensure_data_dirs() -> None:

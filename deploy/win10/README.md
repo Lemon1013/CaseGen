@@ -116,8 +116,6 @@ CaseGen 后端通过本地 **DeepSeek Harness（DSH）web-service** 提供「Age
 | `AGENT_WORKSPACE_ROOT` | `~/.casegen/agent-workspace` | `~` 展开为用户目录，工作区不落在项目内；设为空则回退 `<APP_DATA_DIR>/agent-workspace` |
 | `AGENT_FIRST_TOKEN_TIMEOUT_SEC` | `600` | 首字读超时；模型冷加载可能 5–8 分钟 |
 | `AGENT_STALL_TIMEOUT_SEC` | `300` | 无任何帧的停滞看门狗时长 |
-| `AGENT_STAGE_MAX_CALLS` | `4` | 仅 line B 流水线预算，当前未使用 |
-| `PIPELINE_AGENT_STAGES` | 空 | 空表示全部阶段仍走旧路径 |
 | `AGENT_SKILLS_DIR` | `.agents/skills` | 技能目录（相对仓库根） |
 
 ### 工作目录与安全边界

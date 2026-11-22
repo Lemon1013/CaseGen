@@ -74,16 +74,17 @@ def _set_status(conversation_id, status):
         session.commit()
 
 
-def _add_assistant_message(conversation_id, content):
+def _add_assistant_message(conversation_id, content) -> str:
     with Session(get_engine()) as session:
-        session.add(
-            AgentMessage(
-                conversation_id=str(conversation_id),
-                role="assistant",
-                content=content,
-            )
+        row = AgentMessage(
+            conversation_id=str(conversation_id),
+            role="assistant",
+            content=content,
         )
+        session.add(row)
         session.commit()
+        session.refresh(row)
+        return str(row.id)
 
 
 def _parse_sse(text):
@@ -410,11 +411,14 @@ def test_skills_lists_array(agent_env):
 
 
 # --------------------------------------------------------------------------
-# save-as-draft
+# save-cases (direct TestCase import by message_id)
 # --------------------------------------------------------------------------
 
 
-def test_save_as_draft_success(agent_env):
+def test_save_cases_success(agent_env):
+    from sqlmodel import select
+    from app.models.entities import CaseDraft, GenerationTask, TestCase
+
     client = agent_env.client
     pid = _make_project(client)
     conv = _make_conversation(client, pid)
@@ -424,28 +428,48 @@ def test_save_as_draft_success(agent_env):
 [{"case_key": "TC-001", "title": "登录成功", "steps": [{"action": "输入正确账号密码", "expected": "进入首页"}]}]
 ```
 """
-    _add_assistant_message(conv["id"], assistant_answer)
+    message_id = _add_assistant_message(conv["id"], assistant_answer)
 
     resp = client.post(
-        f"/api/agent/conversations/{conv['id']}/save-as-draft?project_id={pid}"
+        f"/api/agent/conversations/{conv['id']}/save-cases?project_id={pid}",
+        json={
+            "message_id": message_id,
+            "target_mode": "new_requirement",
+            "requirement_title": "登录功能需求",
+            "requirement_description": "来自 Agent 对话",
+        },
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["imported_count"] >= 1
-    assert body["task_id"] > 0
-    assert body["draft_id"] > 0
-    assert isinstance(body["case_keys"], list)
+    assert body["requirement_id"] > 0
+    assert body["created_requirement"] is True
+    assert body["message_id"] == message_id
+    assert body["case_keys"] == ["TC-001"]
+
+    with Session(get_engine()) as session:
+        assert session.exec(select(GenerationTask)).all() == []
+        assert session.exec(select(CaseDraft)).all() == []
+        cases = session.exec(select(TestCase)).all()
+        assert len(cases) == 1
+        assert cases[0].source_task_id is None
+        assert cases[0].source_draft_id is None
 
 
-def test_save_as_draft_without_assistant_is_422(agent_env):
+def test_save_cases_missing_message_is_404(agent_env):
     client = agent_env.client
     pid = _make_project(client)
     conv = _make_conversation(client, pid)
 
     resp = client.post(
-        f"/api/agent/conversations/{conv['id']}/save-as-draft?project_id={pid}"
+        f"/api/agent/conversations/{conv['id']}/save-cases?project_id={pid}",
+        json={
+            "message_id": "nonexistent-msg-id",
+            "target_mode": "new_requirement",
+            "requirement_title": "测试需求",
+        },
     )
-    assert resp.status_code == 422
+    assert resp.status_code == 404
 
 
 # --------------------------------------------------------------------------

@@ -13,7 +13,7 @@ import hashlib
 import json
 import re
 from datetime import datetime, timezone
-from typing import Any, Iterable
+from typing import Any, Iterable, Literal, Optional
 
 from sqlalchemy import func
 from sqlmodel import Session, col, select
@@ -499,6 +499,146 @@ def import_cases_from_draft(
         imported.append(case)
     session.flush()
     return imported
+
+
+def import_cases_to_requirement(
+    session: Session,
+    requirement_id: int,
+    sections: list[dict[str, Any]],
+    *,
+    conflict_strategy: Literal["error", "overwrite", "skip"] = "error",
+    operator: Optional[str] = None,
+    reason: Optional[str] = None,
+) -> dict[str, Any]:
+    """Import parsed case sections directly into a requirement without a shell task.
+
+    Validates all keys and requirement-scoped collisions before mutating any row,
+    flushes without committing so callers control the outer transaction atomically.
+    """
+    if conflict_strategy not in {"error", "overwrite", "skip"}:
+        raise ValueError(f"Unsupported conflict_strategy: {conflict_strategy}")
+    if not sections:
+        raise CaseDraftParseError("no case sections to import")
+
+    normalized_items: list[tuple[dict[str, Any], TestCase | None]] = []
+    seen_keys: set[str] = set()
+    conflicts: list[dict[str, Any]] = []
+
+    for raw_section in sections:
+        key = normalize_case_key(str(raw_section.get("case_key") or ""))
+        if key in seen_keys:
+            raise CaseDraftParseError(f"duplicate case_key: {key}")
+        seen_keys.add(key)
+
+        title = str(raw_section.get("title") or key).strip() or key
+        content_md = str(raw_section.get("content_md") or "")
+        priority = str(raw_section.get("priority") or "P1").strip().upper()
+        if priority not in {"P0", "P1", "P2"}:
+            priority = "P1"
+
+        section = {
+            **raw_section,
+            "case_key": key,
+            "title": title,
+            "content_md": content_md,
+            "priority": priority,
+        }
+        existing = _find_requirement_case(session, int(requirement_id), key)
+        if existing is not None:
+            conflicts.append(_conflict_payload(section, existing))
+        normalized_items.append((section, existing))
+
+    if conflicts and conflict_strategy == "error":
+        keys = "、".join(str(item["case_key"]) for item in conflicts)
+        raise CaseKeyConflictError(
+            conflicts,
+            f"用例编号已存在于目标需求：{keys}。请选择覆盖更新或跳过冲突用例后重试。",
+        )
+
+    affected_cases: list[TestCase] = []
+    affected_keys: list[str] = []
+    overwritten_keys: list[str] = []
+    skipped_keys: list[str] = []
+    created_count = 0
+
+    for section, existing in normalized_items:
+        key = section["case_key"]
+        if existing is not None:
+            if conflict_strategy == "skip":
+                skipped_keys.append(key)
+                continue
+
+            before = existing.content_md
+            title_changed = existing.title != section["title"]
+            changed_fields: set[str] = set()
+            if title_changed:
+                changed_fields.add("title")
+            if before != section["content_md"]:
+                changed_fields.add("content_md")
+            if (existing.priority or "P1") != section["priority"]:
+                changed_fields.add("priority")
+
+            existing.title = section["title"]
+            existing.content_md = section["content_md"]
+            existing.priority = section["priority"]
+            existing.revision = int(existing.revision or 0) + 1
+            existing.updated_at = utcnow()
+            session.add(existing)
+            session.flush()
+            append_case_log(
+                session,
+                existing,
+                "update",
+                before=before,
+                after=existing.content_md,
+                reason=reason or "Agent 对话用例覆盖更新",
+                operator=operator,
+                changed_fields=changed_fields,
+                title_changed=title_changed,
+            )
+            overwritten_keys.append(key)
+            affected_keys.append(key)
+            affected_cases.append(existing)
+            continue
+
+        case = TestCase(
+            requirement_id=int(requirement_id),
+            case_key=key,
+            source_case_key=None,
+            title=section["title"],
+            content_md=section["content_md"],
+            priority=section["priority"],
+            source_task_id=None,
+            source_draft_id=None,
+            status="active",
+            revision=1,
+        )
+        session.add(case)
+        session.flush()
+        append_case_log(
+            session,
+            case,
+            "create",
+            before=None,
+            after=case.content_md,
+            reason=reason or "Agent 对话直入用例库",
+            operator=operator,
+        )
+        created_count += 1
+        affected_keys.append(key)
+        affected_cases.append(case)
+
+    session.flush()
+    return {
+        "cases": affected_cases,
+        "imported_count": created_count + len(overwritten_keys),
+        "created_count": created_count,
+        "overwritten_count": len(overwritten_keys),
+        "skipped_count": len(skipped_keys),
+        "case_keys": affected_keys,
+        "overwritten_keys": overwritten_keys,
+        "skipped_keys": skipped_keys,
+    }
 
 
 def cases_for_requirement(

@@ -1,12 +1,14 @@
 export class ApiError extends Error {
   status: number
   detail: string
+  rawDetail?: unknown
 
-  constructor(status: number, detail: string) {
+  constructor(status: number, detail: string, rawDetail?: unknown) {
     super(detail)
     this.name = 'ApiError'
     this.status = status
     this.detail = detail
+    this.rawDetail = rawDetail
   }
 }
 
@@ -108,10 +110,14 @@ function prepareRequest(path: string, init?: RequestInit, jsonContentType = true
   return { url: resolvedPath, headers, requestEpoch }
 }
 
-function extractErrorDetail(text: string): string {
+function extractErrorDetail(text: string): { detail: string; rawDetail: unknown } {
   let detail = text
+  let rawDetail: unknown = text
   try {
     const payload = JSON.parse(text)
+    if (payload && 'detail' in payload) {
+      rawDetail = payload.detail
+    }
     if (typeof payload?.detail === 'string') {
       detail = payload.detail
     } else if (Array.isArray(payload?.detail)) {
@@ -119,16 +125,21 @@ function extractErrorDetail(text: string): string {
         .map((item: { msg?: string }) => item.msg || '')
         .filter(Boolean)
         .join('；')
+    } else if (payload?.detail && typeof payload.detail === 'object') {
+      const msg = (payload.detail as { message?: unknown }).message
+      if (typeof msg === 'string' && msg) {
+        detail = msg
+      }
     }
   } catch {
     // Non-JSON gateway errors fall through to the status-aware message.
   }
-  return detail
+  return { detail, rawDetail }
 }
 
 async function throwApiError(res: Response, path: string, requestEpoch: number): Promise<never> {
   const text = await res.text()
-  const detail = extractErrorDetail(text)
+  const { detail, rawDetail } = extractErrorDetail(text)
   if (res.status === 404 && /Project not found or inactive/i.test(detail)) {
     void projectInvalidHandler?.()
   }
@@ -136,7 +147,7 @@ async function throwApiError(res: Response, path: string, requestEpoch: number):
   if (res.status === 401 && !path.startsWith('/api/auth/')) {
     void unauthorizedHandler?.(requestEpoch)
   }
-  throw new ApiError(res.status, translated)
+  throw new ApiError(res.status, translated, rawDetail)
 }
 
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {

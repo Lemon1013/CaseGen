@@ -2,7 +2,7 @@
 
 These routes are deliberately thin: conversation ownership, optimistic locking
 and idempotency live here, while the DSH conversation, the turn runner and the
-save-as-draft import live in ``app.services``.  Three rules inherited from the
+direct TestCase import live in ``app.services``.  Three rules inherited from the
 task plane apply unchanged:
 
 - the SSE handler is a ``sync def`` whose inner ``event_stream()`` is the async
@@ -23,14 +23,12 @@ from __future__ import annotations
 
 import json
 import logging
-import shutil
-from pathlib import Path
 from typing import Optional
 
-import httpx
-from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, col, select
 
 from app import config
@@ -50,7 +48,8 @@ from app.schemas.agent import (
     AgentAttachmentOut,
     AgentModelItem,
     AgentModelsOut,
-    AgentSaveAsDraftOut,
+    AgentSaveCasesIn,
+    AgentSaveCasesOut,
     AgentSkillOut,
 )
 from app.services import agent_draft, agent_attachments, agent_gateway, agent_skills, agent_turn
@@ -96,9 +95,9 @@ _DETAIL_DELETE_BUSY = "本轮对话仍在进行中，请先取消再删除会话
 _DETAIL_DELETE_OK = "会话已删除。"
 _DETAIL_STREAM_IDLE = "当前没有进行中的 Agent 轮次。"
 _DETAIL_STREAM_UNAVAILABLE = "Agent 实时流不可用，请通过会话详情轮询。"
-_DETAIL_DRAFT_BUSY = "本轮对话仍在进行中，请等待结束后再导入草稿。"
+_DETAIL_DRAFT_BUSY = "本轮对话仍在进行中，请等待结束后再入库用例。"
 _DETAIL_DRAFT_FALLBACK = (
-    "用例草稿导入失败，未产生任何用例。请让 Agent 修正格式后重试，或导出 Markdown 手动整理。"
+    "用例入库失败，未产生任何用例。请让 Agent 修正格式后重试，或导出 Markdown 手动整理。"
 )
 
 
@@ -119,15 +118,19 @@ def _require_project(request: Request) -> int:
 
 
 def _owner_id(request: Request) -> Optional[int]:
-    """Return the signed-in user's id, or ``None`` when auth is disabled.
+    """Return the signed-in user's id, failing closed when auth is enabled.
 
-    ``tests/conftest.py`` turns authentication off for the legacy pipeline
-    suite, so ``request.state.user`` is absent.  In that compatibility mode
-    conversation ownership checks are skipped; production always has a user.
+    ``tests/conftest.py`` turns authentication off for legacy pipeline tests.
+    When ``AUTH_ENABLED`` is true, a missing user must raise 401 rather than
+    silently skipping ownership filters.
     """
 
     user = current_user(request)
-    return int(user.id) if user is not None and user.id is not None else None
+    if user is not None and user.id is not None:
+        return int(user.id)
+    if bool(config.AUTH_ENABLED):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    return None
 
 
 def _project_workspace_dir(session: Session, project_id: int, conversation: AgentConversation) -> str:
@@ -257,30 +260,6 @@ def _check_version(conversation: AgentConversation, expected_version: Optional[i
         return
     if int(conversation.version or 1) != int(expected_version):
         raise HTTPException(status_code=409, detail=_DETAIL_VERSION)
-
-
-def _cleanup_workspace(workspace_dir: str) -> None:
-    """Remove one agent scratch directory (best effort, never raises).
-
-    Only a directory strictly under the configured workspace root is removed,
-    so a stale or hand-edited row can never delete files outside
-    ``data/agent-workspace``.  The application database lives in ``data/meta``,
-    a sibling of the root, and is therefore unreachable by construction.
-    """
-
-    text = str(workspace_dir or "").strip()
-    if not text:
-        return
-    try:
-        root = Path(config.agent_workspace_root()).resolve()
-        target = Path(text).resolve()
-        target.relative_to(root)
-    except (OSError, ValueError):
-        logger.warning("跳过工作区根目录之外的 Agent 目录清理。")
-        return
-    if target == root:
-        return
-    shutil.rmtree(target, ignore_errors=True)
 
 
 def _close_dsh_session(dsh_session_id: str) -> None:
@@ -499,9 +478,8 @@ def delete_conversation(
 ) -> AgentDeleteOut:
     """Delete a conversation, its messages and its broker stream.
 
-    The DSH workspace directory under ``data/agent-workspace/<conv_id>/`` is
-    removed best-effort: it only ever holds agent scratch files, never the
-    application database.  A busy conversation must be cancelled first.
+    Conversation attachments are removed best-effort while preserving the shared
+    project workspace directory.  A busy conversation must be cancelled first.
     """
 
     _require_agent_enabled()
@@ -739,42 +717,69 @@ def stream_conversation(
 
 
 @router.post(
-    "/conversations/{conversation_id}/save-as-draft",
-    response_model=AgentSaveAsDraftOut,
+    "/conversations/{conversation_id}/save-cases",
+    response_model=AgentSaveCasesOut,
 )
-def save_as_draft(
+def save_cases(
     conversation_id: str,
+    body: AgentSaveCasesIn,
     request: Request,
     session: Session = Depends(get_session),
-) -> AgentSaveAsDraftOut:
-    """Import the latest agent answer as a case draft plus TestCase rows.
-
-    Spec 3.5 plan a: a virtual Requirement carries a shell GenerationTask set
-    straight to ``generated`` (the agent has no test-point checkpoint chain, so
-    neither the task state machine nor ``finalize_task`` applies), a CaseDraft
-    version is written from the rendered Markdown and
-    ``import_cases_from_draft`` produces the cases.  The whole thing is atomic:
-    a malformed answer leaves the conversation retryable and never commits a
-    partial case set.
-    """
+) -> AgentSaveCasesOut:
+    """Import cases from a specific assistant message directly into TestCase."""
 
     _require_agent_enabled()
     project_id = _require_project(request)
-    conversation = _get_conversation(session, conversation_id, project_id, _owner_id(request))
+    owner_id = _owner_id(request)
+    conversation = _get_conversation(session, conversation_id, project_id, owner_id)
     if conversation.status == _BUSY_STATUS:
         raise HTTPException(status_code=409, detail=_DETAIL_DRAFT_BUSY)
+
+    user = current_user(request)
+    operator = user.username if user is not None else None
     try:
-        result = agent_draft.save_conversation_as_draft(session, conversation)
+        result = agent_draft.save_message_cases_to_requirement(
+            session,
+            conversation,
+            message_id=body.message_id,
+            target_mode=body.target_mode,
+            requirement_id=body.requirement_id,
+            requirement_title=body.requirement_title,
+            requirement_description=body.requirement_description,
+            conflict_strategy=body.conflict_strategy,
+            operator=operator,
+        )
     except agent_draft.AgentDraftError as exc:
         session.rollback()
         code = str(getattr(exc, "code", "") or "")
+        if code == "not_found":
+            raise HTTPException(status_code=404, detail=_DETAIL_FOREIGN) from None
+        if code == "conflict":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": str(exc),
+                    "code": "conflict",
+                    "conflicts": list(getattr(exc, "conflicts", []) or []),
+                },
+            ) from None
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    except IntegrityError:
+        session.rollback()
         raise HTTPException(
-            status_code=409 if code == "conflict" else 422, detail=str(exc)
+            status_code=409,
+            detail={
+                "message": "存在并发重复的用例编号，请刷新后重试。",
+                "code": "conflict",
+                "conflicts": [],
+            },
         ) from None
     except CaseDraftParseError:
         session.rollback()
         logger.warning(
-            "Agent 草稿导入解析失败：conversation=%s", conversation_id
+            "Agent 消息用例解析失败：conversation=%s message=%s",
+            conversation_id,
+            body.message_id,
         )
         raise HTTPException(
             status_code=422, detail=_DETAIL_DRAFT_FALLBACK
@@ -782,17 +787,21 @@ def save_as_draft(
     except Exception:
         session.rollback()
         logger.exception(
-            "Agent 草稿导入发生未预期错误：conversation=%s", conversation_id
+            "Agent 消息直入用例库发生未预期错误：conversation=%s message=%s",
+            conversation_id,
+            body.message_id,
         )
         raise HTTPException(
             status_code=422, detail=_DETAIL_DRAFT_FALLBACK
         ) from None
+
     logger.info(
-        "Agent 对话已导入用例草稿：conversation=%s task=%s count=%s",
+        "Agent 消息已直入用例库：conversation=%s message=%s requirement=%s count=%s",
         conversation_id,
-        result.get("task_id"),
+        body.message_id,
+        result.get("requirement_id"),
         result.get("imported_count"),
     )
-    return AgentSaveAsDraftOut(**result)
+    return AgentSaveCasesOut(**result)
 
 

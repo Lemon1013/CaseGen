@@ -1,9 +1,11 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { ArrowDown, ArrowRight, Clock, Download, Refresh } from '@element-plus/icons-vue'
 import MarkdownView from '../components/MarkdownView.vue'
-import { api, apiBlob } from '../api/client'
+import { apiBlob } from '../api/client'
+import { listRequirements } from '../api/requirements'
 import {
   archiveCase,
   casesExportUrl,
@@ -22,6 +24,9 @@ interface RequirementSummary {
   title: string
   description: string
 }
+
+const route = useRoute()
+const router = useRouter()
 
 const loading = ref(false)
 const cases = ref<TestCaseItem[]>([])
@@ -65,6 +70,24 @@ const editorVisible = computed({
 const requirementTitle = (id: number) =>
   requirements.value.find((row) => row.id === id)?.title || `需求 #${id}`
 
+const filterRequirementId = computed<number | undefined>(() => {
+  const raw = Array.isArray(route.query.requirement_id)
+    ? route.query.requirement_id[0]
+    : route.query.requirement_id
+  const parsed = Number(raw)
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined
+})
+
+function clearRequirementFilter() {
+  const query: Record<string, string> = {}
+  for (const [key, value] of Object.entries(route.query)) {
+    if (value === undefined || key === 'requirement_id') continue
+    const normalized = Array.isArray(value) ? String(value[0] ?? '') : String(value)
+    if (normalized) query[key] = normalized
+  }
+  void router.replace({ query })
+}
+
 const groupedCases = computed(() => {
   const groups = new Map<number, TestCaseItem[]>()
   for (const row of cases.value) {
@@ -106,12 +129,13 @@ async function load() {
   try {
     const [caseRows, reqRows] = await Promise.all([
       listCases({
+        requirement_id: filterRequirementId.value,
         include_archived: includeArchived.value,
         keyword: keyword.value,
         status: statusFilter.value,
         priority: priorityFilter.value,
       }),
-      api<RequirementSummary[]>('/api/requirements'),
+      listRequirements(),
     ])
     cases.value = caseRows
     requirements.value = reqRows
@@ -263,6 +287,13 @@ function onSelectionChange(groupRows: TestCaseItem[], rows: TestCaseItem[]) {
   selectedIds.value = next
 }
 
+watch(
+  () => route.query.requirement_id,
+  () => {
+    void load()
+  },
+)
+
 onMounted(load)
 </script>
 
@@ -303,12 +334,27 @@ onMounted(load)
     </div>
 
     <el-alert
+      v-if="filterRequirementId !== undefined"
+      type="info"
+      show-icon
+      :closable="false"
+      class="requirement-filter-alert"
+    >
+      <template #title>
+        <span>当前仅显示需求「{{ requirementTitle(filterRequirementId) }}」（#{{ filterRequirementId }}）下的用例</span>
+        <el-button size="small" type="primary" link class="clear-filter-btn" @click="clearRequirementFilter">
+          查看全部需求
+        </el-button>
+      </template>
+    </el-alert>
+
+    <el-alert
       v-if="!loading && !cases.length"
       type="info"
       show-icon
       :closable="false"
       title="暂无已入库用例"
-      description="在任务详情选择具体草稿并定稿后，用例会按 ## TC-xxx 拆分进入这里。"
+      description="在任务详情定稿或从 Agent 对话选择消息入库后，用例会按 ## TC-xxx 拆分进入这里。"
       style="margin-bottom: 16px"
     />
 
@@ -376,7 +422,7 @@ onMounted(load)
             <span v-if="row.source_task_id">
               任务 #{{ row.source_task_id }} · 草稿 v{{ row.source_draft_version || '-' }}
             </span>
-            <span v-else class="muted">手工创建</span>
+            <span v-else class="muted">直接入库 / 手工创建</span>
           </template>
         </el-table-column>
         <el-table-column label="更新" width="170">
@@ -428,7 +474,7 @@ onMounted(load)
             <router-link v-if="detailCase.source_task_id" :to="`/tasks/${detailCase.source_task_id}`">
               任务 #{{ detailCase.source_task_id }} · 草稿 v{{ detailCase.source_draft_version || '-' }}
             </router-link>
-            <span v-else>手工创建</span>
+            <span v-else>直接入库 / 手工创建</span>
           </el-descriptions-item>
           <el-descriptions-item label="创建时间">{{ formatTime(detailCase.created_at) }}</el-descriptions-item>
           <el-descriptions-item label="更新时间">{{ formatTime(detailCase.updated_at) }}</el-descriptions-item>
@@ -604,5 +650,13 @@ onMounted(load)
 
 .detail-content {
   padding: 4px 8px 24px;
+}
+
+.requirement-filter-alert {
+  margin-bottom: 14px;
+}
+
+.clear-filter-btn {
+  margin-left: 10px;
 }
 </style>
