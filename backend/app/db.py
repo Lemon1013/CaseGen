@@ -309,6 +309,52 @@ def _migrate_0005_checkpoint_coverage_metadata(engine: Engine) -> None:
             )
 
 
+def _migrate_0006_submitter_user_columns(engine: Engine) -> None:
+    """为 generation_tasks 和 test_cases 补齐提交用户字段及索引。"""
+    targets = ("generation_tasks", "test_cases")
+    with engine.begin() as conn:
+        for table_name in targets:
+            exists = conn.execute(
+                text(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' "
+                    "AND name=:table_name"
+                ),
+                {"table_name": table_name},
+            ).first()
+            if exists is None:
+                continue
+            cols = {
+                str(row[1])
+                for row in conn.execute(text(f'PRAGMA table_info("{table_name}")')).fetchall()
+            }
+            if "created_by_user_id" not in cols:
+                conn.execute(
+                    text(
+                        f'ALTER TABLE "{table_name}" '
+                        'ADD COLUMN "created_by_user_id" INTEGER'
+                    )
+                )
+            if "created_by_username" not in cols:
+                conn.execute(
+                    text(
+                        f'ALTER TABLE "{table_name}" '
+                        'ADD COLUMN "created_by_username" VARCHAR'
+                    )
+                )
+            conn.execute(
+                text(
+                    f'CREATE INDEX IF NOT EXISTS "ix_{table_name}_created_by_user_id" '
+                    f'ON "{table_name}"("created_by_user_id")'
+                )
+            )
+            conn.execute(
+                text(
+                    f'CREATE INDEX IF NOT EXISTS "ix_{table_name}_created_by_username" '
+                    f'ON "{table_name}"("created_by_username")'
+                )
+            )
+
+
 VERSIONED_MIGRATIONS: tuple[MigrationEntry, ...] = (
     ("0001_v2_refactor_baseline", "Record v2 refactor baseline", _noop_baseline_migration),
     (
@@ -330,6 +376,11 @@ VERSIONED_MIGRATIONS: tuple[MigrationEntry, ...] = (
         "0005_checkpoint_coverage_metadata",
         "Add coverage_metadata_json column to task_test_point_checkpoints",
         _migrate_0005_checkpoint_coverage_metadata,
+    ),
+    (
+        "0006_submitter_user_columns",
+        "Add created_by_user_id and created_by_username to generation_tasks and test_cases",
+        _migrate_0006_submitter_user_columns,
     ),
 )
 

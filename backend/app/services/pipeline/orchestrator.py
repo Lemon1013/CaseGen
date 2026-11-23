@@ -194,6 +194,7 @@ def finalize_task(
     *,
     overwrite_existing: bool = False,
     operator: str | None = None,
+    operator_user_id: int | None = None,
 ) -> GenerationTask:
     task = session.get(GenerationTask, task_id)
     if task is None:
@@ -209,6 +210,15 @@ def finalize_task(
     if draft.task_id != task.id:
         raise ValueError("Selected draft does not belong to task")
 
+    effective_submitter = (
+        operator
+        if operator and operator != "system"
+        else (task.created_by_username or operator)
+    )
+    effective_submitter_id = (
+        operator_user_id if operator_user_id is not None else task.created_by_user_id
+    )
+
     if task.status == "finalized":
         if task.finalized_draft_id not in (None, draft.id):
             raise ValueError("Task is already finalized with another draft")
@@ -219,7 +229,8 @@ def finalize_task(
             task,
             draft,
             overwrite_existing=overwrite_existing,
-            operator=operator,
+            operator=effective_submitter,
+            operator_user_id=effective_submitter_id,
         )
         task.finalized_draft_id = draft.id
         task.finalized_at = task.finalized_at or utcnow()
@@ -265,7 +276,8 @@ def finalize_task(
         task,
         draft,
         overwrite_existing=overwrite_existing,
-        operator=operator,
+        operator=effective_submitter,
+        operator_user_id=effective_submitter_id,
     )
 
     try:

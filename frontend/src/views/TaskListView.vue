@@ -155,6 +155,11 @@ onMounted(load)
           {{ row.latest_draft_snippet || row.description || '-' }}
         </template>
       </el-table-column>
+      <el-table-column label="提交用户" width="120" show-overflow-tooltip>
+        <template #default="{ row }">
+          {{ row.created_by_display_name || row.created_by_username || '-' }}
+        </template>
+      </el-table-column>
       <el-table-column label="更新时间" width="170">
         <template #default="{ row }">
           {{ formatTime(row.updated_at) }}

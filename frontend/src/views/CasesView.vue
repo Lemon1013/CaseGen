@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { ArrowDown, ArrowRight, Clock, Download, Refresh } from '@element-plus/icons-vue'
+import CasesTable from '../components/CasesTable.vue'
 import MarkdownView from '../components/MarkdownView.vue'
 import { apiBlob } from '../api/client'
 import { listRequirements } from '../api/requirements'
@@ -12,10 +13,13 @@ import {
   getCase,
   listCases,
   listCaseLogs,
+  listCaseSubmitters,
   restoreCase,
   updateCase,
+  type CaseSortOrder,
   type TestCaseItem,
   type TestCaseOperationLog,
+  type TestCaseSubmitter,
 } from '../api/cases'
 import { formatDateTime as formatTime } from '../utils/datetime'
 
@@ -31,10 +35,17 @@ const router = useRouter()
 const loading = ref(false)
 const cases = ref<TestCaseItem[]>([])
 const requirements = ref<RequirementSummary[]>([])
+const submitters = ref<TestCaseSubmitter[]>([])
 const includeArchived = ref(false)
 const keyword = ref('')
 const statusFilter = ref<'active' | 'archived' | ''>('')
 const priorityFilter = ref<'P0' | 'P1' | 'P2' | ''>('')
+const submitterFilter = ref('')
+const sourceTypeFilter = ref<'task' | 'direct' | ''>('')
+const createdDateRange = ref<[string, string] | null>(null)
+const sortOrder = ref<CaseSortOrder>('created_desc')
+const viewMode = ref<'grouped' | 'flat'>('grouped')
+const selectedRequirementId = ref<number | undefined>(undefined)
 const selectedIds = ref<Set<number>>(new Set())
 const collapsedRequirementIds = ref<Set<number>>(new Set())
 const selected = computed(() => cases.value.filter((row) => selectedIds.value.has(row.id)))
@@ -78,14 +89,77 @@ const filterRequirementId = computed<number | undefined>(() => {
   return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined
 })
 
-function clearRequirementFilter() {
+const activeRequirementId = computed<number | undefined>(
+  () => selectedRequirementId.value ?? filterRequirementId.value,
+)
+
+const hasActiveFilters = computed(() =>
+  Boolean(
+    keyword.value.trim()
+    || activeRequirementId.value !== undefined
+    || statusFilter.value
+    || priorityFilter.value
+    || submitterFilter.value
+    || sourceTypeFilter.value
+    || (createdDateRange.value && createdDateRange.value.length === 2)
+    || includeArchived.value,
+  ),
+)
+
+function formatSubmitter(row: { created_by_display_name?: string | null; created_by_username?: string | null }) {
+  return row.created_by_display_name || row.created_by_username || '-'
+}
+
+function formatSubmitterOption(item: TestCaseSubmitter) {
+  if (item.display_name && item.display_name !== item.username) {
+    return `${item.display_name} (@${item.username})`
+  }
+  return item.username
+}
+
+function timestampMs(value: string | null | undefined): number {
+  if (!value) return 0
+  const raw = String(value).trim()
+  if (!raw) return 0
+  const hasOffset = /(?:Z|[+-]\d{2}:\d{2})$/i.test(raw)
+  const parsed = Date.parse(hasOffset ? raw : `${raw}Z`)
+  return Number.isNaN(parsed) ? 0 : parsed
+}
+
+function syncRequirementQuery(nextId: number | undefined) {
   const query: Record<string, string> = {}
   for (const [key, value] of Object.entries(route.query)) {
     if (value === undefined || key === 'requirement_id') continue
     const normalized = Array.isArray(value) ? String(value[0] ?? '') : String(value)
     if (normalized) query[key] = normalized
   }
+  if (nextId !== undefined) query.requirement_id = String(nextId)
   void router.replace({ query })
+}
+
+function clearRequirementFilter() {
+  selectedRequirementId.value = undefined
+  syncRequirementQuery(undefined)
+}
+
+function onRequirementFilterChange(val: number | undefined) {
+  selectedRequirementId.value = val || undefined
+  syncRequirementQuery(selectedRequirementId.value)
+  void load()
+}
+
+function resetFilters() {
+  keyword.value = ''
+  statusFilter.value = ''
+  priorityFilter.value = ''
+  submitterFilter.value = ''
+  sourceTypeFilter.value = ''
+  createdDateRange.value = null
+  includeArchived.value = false
+  sortOrder.value = 'created_desc'
+  selectedRequirementId.value = undefined
+  syncRequirementQuery(undefined)
+  void load()
 }
 
 const groupedCases = computed(() => {
@@ -95,7 +169,32 @@ const groupedCases = computed(() => {
     group.push(row)
     groups.set(row.requirement_id, group)
   }
-  return [...groups.entries()].sort((a, b) => a[0] - b[0])
+  const entries = [...groups.entries()]
+  if (sortOrder.value === 'case_key_asc') {
+    return entries.sort((a, b) => a[0] - b[0])
+  }
+  if (sortOrder.value === 'created_asc') {
+    return entries.sort((a, b) => {
+      const aMin = Math.min(...a[1].map((item) => timestampMs(item.created_at)))
+      const bMin = Math.min(...b[1].map((item) => timestampMs(item.created_at)))
+      if (aMin !== bMin) return aMin - bMin
+      return Math.min(...a[1].map((item) => item.id)) - Math.min(...b[1].map((item) => item.id))
+    })
+  }
+  if (sortOrder.value === 'updated_desc') {
+    return entries.sort((a, b) => {
+      const aMax = Math.max(...a[1].map((item) => timestampMs(item.updated_at)))
+      const bMax = Math.max(...b[1].map((item) => timestampMs(item.updated_at)))
+      if (aMax !== bMax) return bMax - aMax
+      return Math.max(...b[1].map((item) => item.id)) - Math.max(...a[1].map((item) => item.id))
+    })
+  }
+  return entries.sort((a, b) => {
+    const aMax = Math.max(...a[1].map((item) => timestampMs(item.created_at)))
+    const bMax = Math.max(...b[1].map((item) => timestampMs(item.created_at)))
+    if (aMax !== bMax) return bMax - aMax
+    return Math.max(...b[1].map((item) => item.id)) - Math.max(...a[1].map((item) => item.id))
+  })
 })
 
 const allGroupsCollapsed = computed(
@@ -127,18 +226,31 @@ function expandAllGroups() {
 async function load() {
   loading.value = true
   try {
-    const [caseRows, reqRows] = await Promise.all([
+    const createdFrom = createdDateRange.value?.[0]
+      ? `${createdDateRange.value[0]}T00:00:00+08:00`
+      : undefined
+    const createdTo = createdDateRange.value?.[1]
+      ? `${createdDateRange.value[1]}T23:59:59.999+08:00`
+      : undefined
+    const [caseRows, reqRows, submitterRows] = await Promise.all([
       listCases({
-        requirement_id: filterRequirementId.value,
+        requirement_id: activeRequirementId.value,
         include_archived: includeArchived.value,
         keyword: keyword.value,
         status: statusFilter.value,
         priority: priorityFilter.value,
+        created_by: submitterFilter.value || undefined,
+        source_type: sourceTypeFilter.value,
+        created_from: createdFrom,
+        created_to: createdTo,
+        sort: sortOrder.value,
       }),
       listRequirements(),
+      listCaseSubmitters().catch(() => [] as TestCaseSubmitter[]),
     ])
     cases.value = caseRows
     requirements.value = reqRows
+    submitters.value = submitterRows
     selectedIds.value = new Set([...selectedIds.value].filter((id) => caseRows.some((item) => item.id === id)))
   } catch (err) {
     ElMessage.error(`加载用例失败：${(err as Error).message}`)
@@ -290,11 +402,15 @@ function onSelectionChange(groupRows: TestCaseItem[], rows: TestCaseItem[]) {
 watch(
   () => route.query.requirement_id,
   () => {
+    selectedRequirementId.value = filterRequirementId.value
     void load()
   },
+  { immediate: true },
 )
 
-onMounted(load)
+watch(viewMode, () => {
+  selectedIds.value = new Set()
+})
 </script>
 
 <template>
@@ -302,27 +418,15 @@ onMounted(load)
     <div class="page-header">
       <div>
         <h1 class="page-title">用例管理</h1>
-        <p class="page-subtitle">按需求查看已入库用例，编辑当前内容并导出 Markdown</p>
+        <p class="page-subtitle">按入库时间或需求查看已入库用例，支持多维筛选、编辑与导出 Markdown</p>
       </div>
       <div class="page-actions">
-        <el-input
-          v-model="keyword"
-          clearable
-          placeholder="搜索编号、标题、正文或需求"
-          style="width: 230px"
-          @keyup.enter="load"
-        />
-        <el-select v-model="statusFilter" clearable placeholder="状态" style="width: 120px" @change="load">
-          <el-option label="当前" value="active" />
-          <el-option label="已归档" value="archived" />
-        </el-select>
-        <el-select v-model="priorityFilter" clearable placeholder="优先级" style="width: 120px" @change="load">
-          <el-option label="P0 高风险" value="P0" />
-          <el-option label="P1 主要" value="P1" />
-          <el-option label="P2 补充" value="P2" />
-        </el-select>
-        <el-checkbox v-model="includeArchived" @change="load">显示已归档</el-checkbox>
+        <el-radio-group v-model="viewMode" size="small">
+          <el-radio-button value="grouped">按需求分组</el-radio-button>
+          <el-radio-button value="flat">按入库列表</el-radio-button>
+        </el-radio-group>
         <el-button
+          v-if="viewMode === 'grouped'"
           :disabled="!groupedCases.length"
           @click="allGroupsCollapsed ? expandAllGroups() : collapseAllGroups()"
         >
@@ -332,6 +436,106 @@ onMounted(load)
         <el-button :icon="Refresh" :loading="loading" @click="load">刷新</el-button>
       </div>
     </div>
+
+    <el-card shadow="never" class="filter-card">
+      <div class="filter-bar">
+        <el-input
+          v-model="keyword"
+          clearable
+          placeholder="搜索编号、标题、正文或需求"
+          class="filter-item filter-keyword"
+          @keyup.enter="load"
+          @clear="load"
+        />
+        <el-select
+          :model-value="activeRequirementId"
+          clearable
+          filterable
+          placeholder="所属需求"
+          class="filter-item filter-req"
+          @update:model-value="onRequirementFilterChange"
+        >
+          <el-option
+            v-for="req in requirements"
+            :key="req.id"
+            :label="`#${req.id} · ${req.title}`"
+            :value="req.id"
+          />
+        </el-select>
+        <el-select
+          v-model="submitterFilter"
+          clearable
+          filterable
+          placeholder="提交用户"
+          class="filter-item filter-select"
+          @change="load"
+        >
+          <el-option
+            v-for="item in submitters"
+            :key="item.username"
+            :label="formatSubmitterOption(item)"
+            :value="item.username"
+          />
+        </el-select>
+        <el-select
+          v-model="statusFilter"
+          clearable
+          placeholder="状态"
+          class="filter-item filter-sm"
+          @change="load"
+        >
+          <el-option label="当前" value="active" />
+          <el-option label="已归档" value="archived" />
+        </el-select>
+        <el-select
+          v-model="priorityFilter"
+          clearable
+          placeholder="优先级"
+          class="filter-item filter-sm"
+          @change="load"
+        >
+          <el-option label="P0 高风险" value="P0" />
+          <el-option label="P1 主要" value="P1" />
+          <el-option label="P2 补充" value="P2" />
+        </el-select>
+        <el-select
+          v-model="sourceTypeFilter"
+          clearable
+          placeholder="入库来源"
+          class="filter-item filter-select"
+          @change="load"
+        >
+          <el-option label="任务终版入库" value="task" />
+          <el-option label="直接入库 / 手工" value="direct" />
+        </el-select>
+        <el-date-picker
+          v-model="createdDateRange"
+          type="daterange"
+          value-format="YYYY-MM-DD"
+          range-separator="至"
+          start-placeholder="入库开始"
+          end-placeholder="入库结束"
+          class="filter-item filter-date"
+          @change="load"
+        />
+        <el-select
+          v-model="sortOrder"
+          placeholder="排序方式"
+          class="filter-item filter-select"
+          @change="load"
+        >
+          <el-option label="最新入库在前" value="created_desc" />
+          <el-option label="最早入库在前" value="created_asc" />
+          <el-option label="最近更新在前" value="updated_desc" />
+          <el-option label="按编号升序" value="case_key_asc" />
+        </el-select>
+        <el-checkbox v-model="includeArchived" @change="load">显示已归档</el-checkbox>
+        <el-button type="primary" plain @click="load">筛选</el-button>
+        <el-button v-if="hasActiveFilters || sortOrder !== 'created_desc'" link @click="resetFilters">
+          重置
+        </el-button>
+      </div>
+    </el-card>
 
     <el-alert
       v-if="filterRequirementId !== undefined"
@@ -358,87 +562,63 @@ onMounted(load)
       style="margin-bottom: 16px"
     />
 
-    <el-card v-for="[requirementId, rows] in groupedCases" :key="requirementId" shadow="never" class="case-group">
+    <el-card v-if="viewMode === 'flat' && cases.length" shadow="never" class="case-group">
       <template #header>
         <div class="group-header">
-          <button
-            type="button"
-            class="group-toggle"
-            :aria-expanded="!isGroupCollapsed(requirementId)"
-            @click="toggleGroup(requirementId)"
-          >
-            <el-icon class="group-toggle-icon">
-              <ArrowRight v-if="isGroupCollapsed(requirementId)" />
-              <ArrowDown v-else />
-            </el-icon>
-            <strong>{{ requirementTitle(requirementId) }}</strong>
-            <span class="group-count">{{ rows.length }} 条用例</span>
-          </button>
-          <div class="group-actions">
-            <span v-if="isGroupCollapsed(requirementId)" class="collapsed-hint">点击展开</span>
-            <el-button link type="primary" @click.stop="exportRequirement(requirementId)">导出需求</el-button>
+          <div>
+            <strong>全部入库用例</strong>
+            <span class="group-count">共 {{ cases.length }} 条用例</span>
           </div>
         </div>
       </template>
-      <el-table
-        v-show="!isGroupCollapsed(requirementId)"
-        :data="rows"
-        stripe
-        class="case-table"
+      <CasesTable
+        :rows="cases"
+        show-requirement
+        :requirement-title="requirementTitle"
         @row-click="onRowClick"
-        @selection-change="onSelectionChange(rows, $event)"
-      >
-        <el-table-column type="selection" width="48" />
-        <el-table-column prop="case_key" label="编号" width="130">
-          <template #default="{ row }">
-            <el-button link type="primary" class="case-link" @click.stop="openDetail(row)">
-              {{ row.case_key }}
-            </el-button>
-          </template>
-        </el-table-column>
-        <el-table-column prop="title" label="标题" min-width="180" show-overflow-tooltip>
-          <template #default="{ row }">
-            <el-button link class="case-title-link" @click.stop="openDetail(row)">
-              {{ row.title }}
-            </el-button>
-          </template>
-        </el-table-column>
-        <el-table-column label="状态" width="100">
-          <template #default="{ row }">
-            <el-tag :type="row.status === 'archived' ? 'info' : 'success'" size="small">
-              {{ row.status === 'archived' ? '已归档' : '当前' }}
-            </el-tag>
-          </template>
-        </el-table-column>
-        <el-table-column label="优先级" width="90">
-          <template #default="{ row }">
-            <el-tag :type="row.priority === 'P0' ? 'danger' : row.priority === 'P1' ? 'warning' : 'info'" size="small">
-              {{ row.priority || 'P1' }}
-            </el-tag>
-          </template>
-        </el-table-column>
-        <el-table-column label="来源" min-width="150">
-          <template #default="{ row }">
-            <span v-if="row.source_task_id">
-              任务 #{{ row.source_task_id }} · 草稿 v{{ row.source_draft_version || '-' }}
-            </span>
-            <span v-else class="muted">直接入库 / 手工创建</span>
-          </template>
-        </el-table-column>
-        <el-table-column label="更新" width="170">
-          <template #default="{ row }">{{ formatTime(row.updated_at) }}</template>
-        </el-table-column>
-        <el-table-column label="操作" width="180" fixed="right">
-          <template #default="{ row }">
-            <el-button link type="primary" @click.stop="openEditor(row)">编辑</el-button>
-            <el-button link type="info" :icon="Clock" @click.stop="openLogs(row)">日志</el-button>
-            <el-button link type="warning" @click.stop="toggleArchive(row)">
-              {{ row.status === 'archived' ? '恢复' : '归档' }}
-            </el-button>
-          </template>
-        </el-table-column>
-      </el-table>
+        @selection-change="onSelectionChange(cases, $event)"
+        @detail="openDetail"
+        @edit="openEditor"
+        @logs="openLogs"
+        @toggle-archive="toggleArchive"
+      />
     </el-card>
+
+    <template v-else>
+      <el-card v-for="[requirementId, rows] in groupedCases" :key="requirementId" shadow="never" class="case-group">
+        <template #header>
+          <div class="group-header">
+            <button
+              type="button"
+              class="group-toggle"
+              :aria-expanded="!isGroupCollapsed(requirementId)"
+              @click="toggleGroup(requirementId)"
+            >
+              <el-icon class="group-toggle-icon">
+                <ArrowRight v-if="isGroupCollapsed(requirementId)" />
+                <ArrowDown v-else />
+              </el-icon>
+              <strong>{{ requirementTitle(requirementId) }}</strong>
+              <span class="group-count">{{ rows.length }} 条用例</span>
+            </button>
+            <div class="group-actions">
+              <span v-if="isGroupCollapsed(requirementId)" class="collapsed-hint">点击展开</span>
+              <el-button link type="primary" @click.stop="exportRequirement(requirementId)">导出需求</el-button>
+            </div>
+          </div>
+        </template>
+        <CasesTable
+          v-show="!isGroupCollapsed(requirementId)"
+          :rows="rows"
+          @row-click="onRowClick"
+          @selection-change="onSelectionChange(rows, $event)"
+          @detail="openDetail"
+          @edit="openEditor"
+          @logs="openLogs"
+          @toggle-archive="toggleArchive"
+        />
+      </el-card>
+    </template>
 
     <el-drawer
       v-model="detailVisible"
@@ -470,13 +650,14 @@ onMounted(load)
               {{ detailCase.priority || 'P1' }}
             </el-tag>
           </el-descriptions-item>
+          <el-descriptions-item label="提交用户">{{ formatSubmitter(detailCase) }}</el-descriptions-item>
           <el-descriptions-item label="来源">
             <router-link v-if="detailCase.source_task_id" :to="`/tasks/${detailCase.source_task_id}`">
               任务 #{{ detailCase.source_task_id }} · 草稿 v{{ detailCase.source_draft_version || '-' }}
             </router-link>
             <span v-else>直接入库 / 手工创建</span>
           </el-descriptions-item>
-          <el-descriptions-item label="创建时间">{{ formatTime(detailCase.created_at) }}</el-descriptions-item>
+          <el-descriptions-item label="入库时间">{{ formatTime(detailCase.created_at) }}</el-descriptions-item>
           <el-descriptions-item label="更新时间">{{ formatTime(detailCase.updated_at) }}</el-descriptions-item>
         </el-descriptions>
 
@@ -532,6 +713,42 @@ onMounted(load)
 </template>
 
 <style scoped>
+.filter-card {
+  margin-bottom: 16px;
+  border-radius: var(--cg-radius) !important;
+}
+
+.filter-card :deep(.el-card__body) {
+  padding: 12px 16px;
+}
+
+.filter-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.filter-keyword {
+  width: 220px;
+}
+
+.filter-req {
+  width: 210px;
+}
+
+.filter-select {
+  width: 145px;
+}
+
+.filter-sm {
+  width: 112px;
+}
+
+.filter-date {
+  width: 240px;
+}
+
 .case-group {
   margin-bottom: 16px;
   border-radius: var(--cg-radius) !important;

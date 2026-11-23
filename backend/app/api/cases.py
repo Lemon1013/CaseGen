@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import List
 from urllib.parse import quote
 
@@ -19,6 +19,7 @@ from app.schemas.tasks import (
     TestCaseCreate,
     TestCaseOperationLogOut,
     TestCaseOut,
+    TestCaseSubmitterOut,
     TestCaseUpdate,
 )
 from app.services.case_management import (
@@ -26,6 +27,11 @@ from app.services.case_management import (
     append_case_log,
     normalize_case_key,
     stable_cases,
+)
+from app.services.permissions import (
+    load_user_profiles,
+    request_user_identity,
+    resolve_submitter_info,
 )
 
 router = APIRouter(prefix="/api/cases", tags=["cases"])
@@ -40,11 +46,20 @@ def _operator(request: Request) -> str:
     return str(getattr(user, "username", None) or "system")[:128]
 
 
-def _case_out(session: Session, row: TestCase) -> TestCaseOut:
+def _case_out_from_maps(
+    row: TestCase,
+    draft_map: dict[int, CaseDraft],
+    user_profiles: dict[int, tuple[str, str]],
+) -> TestCaseOut:
     source_draft = (
-        session.get(CaseDraft, row.source_draft_id)
+        draft_map.get(int(row.source_draft_id))
         if row.source_draft_id is not None
         else None
+    )
+    created_by_username, created_by_display_name = resolve_submitter_info(
+        getattr(row, "created_by_user_id", None),
+        getattr(row, "created_by_username", None),
+        user_profiles,
     )
     return TestCaseOut(
         id=int(row.id or 0),
@@ -64,10 +79,39 @@ def _case_out(session: Session, row: TestCase) -> TestCaseOut:
             if source_draft is not None and source_draft.task_id == row.source_task_id
             else None
         ),
+        created_by_user_id=getattr(row, "created_by_user_id", None),
+        created_by_username=created_by_username,
+        created_by_display_name=created_by_display_name,
         archived_at=row.archived_at,
         created_at=row.created_at,
         updated_at=row.updated_at,
     )
+
+
+def _cases_out(session: Session, rows: list[TestCase]) -> list[TestCaseOut]:
+    if not rows:
+        return []
+    draft_ids = list({int(row.source_draft_id) for row in rows if row.source_draft_id is not None})
+    draft_map: dict[int, CaseDraft] = (
+        {
+            int(draft.id): draft
+            for draft in session.exec(
+                select(CaseDraft).where(col(CaseDraft.id).in_(draft_ids))
+            ).all()
+            if draft.id is not None
+        }
+        if draft_ids
+        else {}
+    )
+    user_profiles = load_user_profiles(
+        session,
+        [getattr(row, "created_by_user_id", None) for row in rows],
+    )
+    return [_case_out_from_maps(row, draft_map, user_profiles) for row in rows]
+
+
+def _case_out(session: Session, row: TestCase) -> TestCaseOut:
+    return _cases_out(session, [row])[0]
 
 
 def _get_case(session: Session, case_id: int) -> TestCase:
@@ -179,6 +223,31 @@ def _export_response(content: str, filename: str = "casegen-cases.md") -> Respon
     )
 
 
+_DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_ALLOWED_SORTS = {"created_desc", "created_asc", "updated_desc", "case_key_asc"}
+
+
+def _parse_datetime_bound(raw: str, *, is_end: bool) -> tuple[datetime, bool]:
+    text = raw.strip()
+    if _DATE_ONLY_RE.match(text):
+        try:
+            day = date.fromisoformat(text)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="Invalid date format; expected YYYY-MM-DD") from exc
+        base = datetime(day.year, day.month, day.day)
+        if is_end:
+            return base + timedelta(days=1), True
+        return base, False
+    normalized = text[:-1] + "+00:00" if text.endswith(("Z", "z")) else text
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Invalid datetime format") from exc
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed, False
+
+
 @router.get("", response_model=List[TestCaseOut])
 def list_cases(
     project_id: int | None = Query(default=None, ge=1),
@@ -187,6 +256,11 @@ def list_cases(
     keyword: str | None = Query(default=None, max_length=200),
     status: str | None = Query(default=None),
     priority: str | None = Query(default=None),
+    created_by: str | None = Query(default=None, max_length=128),
+    source_type: str | None = Query(default=None),
+    created_from: str | None = Query(default=None, max_length=64),
+    created_to: str | None = Query(default=None, max_length=64),
+    sort: str = Query(default="created_desc"),
     session: Session = Depends(get_session),
 ) -> list[TestCaseOut]:
     statement = select(TestCase)
@@ -204,6 +278,30 @@ def list_cases(
         raise HTTPException(status_code=422, detail="priority must be P0, P1 or P2")
     if priority:
         statement = statement.where(TestCase.priority == priority)
+    if created_by and created_by.strip():
+        statement = statement.where(
+            func.lower(func.trim(TestCase.created_by_username)) == created_by.strip().casefold()
+        )
+    if source_type not in {None, "", "task", "direct"}:
+        raise HTTPException(status_code=422, detail="source_type must be task or direct")
+    if source_type == "task":
+        statement = statement.where(col(TestCase.source_task_id).is_not(None))
+    elif source_type == "direct":
+        statement = statement.where(col(TestCase.source_task_id).is_(None))
+    if created_from and created_from.strip():
+        start_dt, _ = _parse_datetime_bound(created_from, is_end=False)
+        statement = statement.where(TestCase.created_at >= start_dt)
+    if created_to and created_to.strip():
+        end_dt, exclusive = _parse_datetime_bound(created_to, is_end=True)
+        if exclusive:
+            statement = statement.where(TestCase.created_at < end_dt)
+        else:
+            statement = statement.where(TestCase.created_at <= end_dt)
+    if sort not in _ALLOWED_SORTS:
+        raise HTTPException(
+            status_code=422,
+            detail="sort must be created_desc, created_asc, updated_desc or case_key_asc",
+        )
     if keyword and keyword.strip():
         pattern = f"%{keyword.strip()}%"
         statement = statement.join(Requirement, TestCase.requirement_id == Requirement.id).where(
@@ -214,10 +312,46 @@ def list_cases(
                 Requirement.title.ilike(pattern),
             )
         )
-    rows = session.exec(
-        statement.order_by(col(TestCase.requirement_id).asc(), col(TestCase.case_key).asc(), col(TestCase.id).asc())
-    ).all()
-    return [_case_out(session, row) for row in rows]
+    if sort == "created_asc":
+        order_cols = (col(TestCase.created_at).asc(), col(TestCase.id).asc())
+    elif sort == "updated_desc":
+        order_cols = (col(TestCase.updated_at).desc(), col(TestCase.id).desc())
+    elif sort == "case_key_asc":
+        order_cols = (col(TestCase.requirement_id).asc(), col(TestCase.case_key).asc(), col(TestCase.id).asc())
+    else:
+        order_cols = (col(TestCase.created_at).desc(), col(TestCase.id).desc())
+    rows = list(session.exec(statement.order_by(*order_cols)).all())
+    return _cases_out(session, rows)
+
+
+@router.get("/submitters", response_model=List[TestCaseSubmitterOut])
+def list_case_submitters(
+    project_id: int | None = Query(default=None, ge=1),
+    session: Session = Depends(get_session),
+) -> list[TestCaseSubmitterOut]:
+    statement = select(TestCase.created_by_user_id, TestCase.created_by_username).where(
+        col(TestCase.created_by_username).is_not(None),
+        func.trim(TestCase.created_by_username) != "",
+    )
+    if project_id is not None:
+        statement = statement.where(
+            TestCase.requirement_id.in_(select(Requirement.id).where(Requirement.project_id == project_id))
+        )
+    raw_pairs = session.exec(statement.distinct()).all()
+    user_profiles = load_user_profiles(session, [uid for uid, _ in raw_pairs])
+    seen: dict[str, TestCaseSubmitterOut] = {}
+    for uid, uname in raw_pairs:
+        resolved_username, resolved_display = resolve_submitter_info(uid, uname, user_profiles)
+        if not resolved_username:
+            continue
+        key = resolved_username.casefold()
+        if key not in seen:
+            seen[key] = TestCaseSubmitterOut(
+                user_id=uid,
+                username=resolved_username,
+                display_name=resolved_display,
+            )
+    return sorted(seen.values(), key=lambda item: item.username.casefold())
 
 
 @router.get("/export")
@@ -308,12 +442,15 @@ def create_case(
             status_code=409,
             detail=f"Case key {case_key} already exists for this requirement",
         )
+    created_by_user_id, created_by_username = request_user_identity(request)
     case = TestCase(
         requirement_id=body.requirement_id,
         case_key=case_key,
         title=title,
         content_md=content,
         priority=body.priority,
+        created_by_user_id=created_by_user_id,
+        created_by_username=created_by_username,
         status="active",
         revision=1,
     )

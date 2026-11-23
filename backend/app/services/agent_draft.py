@@ -326,6 +326,7 @@ def save_message_cases_to_requirement(
     requirement_description: Optional[str] = None,
     conflict_strategy: Literal["error", "overwrite", "skip"] = "error",
     operator: Optional[str] = None,
+    operator_user_id: Optional[int] = None,
 ) -> dict[str, Any]:
     """Import one assistant message's cases directly into ``TestCase``.
 
@@ -390,6 +391,7 @@ def save_message_cases_to_requirement(
             sections,
             conflict_strategy=conflict_strategy,
             operator=operator,
+            operator_user_id=operator_user_id,
             reason=f"agent:{conversation.id}:{message.id}",
         )
     except CaseKeyConflictError as exc:

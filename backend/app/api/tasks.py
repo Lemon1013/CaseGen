@@ -58,7 +58,13 @@ from app.schemas.tasks import (
     TestPointInput,
     TestPointOut,
 )
-from app.services.permissions import Identity, current_user
+from app.services.permissions import (
+    Identity,
+    current_user,
+    load_user_profiles,
+    request_user_identity,
+    resolve_submitter_info,
+)
 from app.services.prompt_permissions import can_view_prompt
 from app.services.task_events import append_event
 from app.services.task_jobs import (
@@ -500,6 +506,12 @@ def to_task_out(
         )
         else None
     )
+    user_profiles = load_user_profiles(session, [task.created_by_user_id])
+    created_by_username, created_by_display_name = resolve_submitter_info(
+        task.created_by_user_id,
+        task.created_by_username,
+        user_profiles,
+    )
 
     return TaskOut(
         id=task.id,
@@ -526,6 +538,9 @@ def to_task_out(
         test_dimensions=task_dimensions(task),
         reference_case_count=reference_count,
         test_point_count=test_point_count,
+        created_by_user_id=task.created_by_user_id,
+        created_by_username=created_by_username,
+        created_by_display_name=created_by_display_name,
         created_at=task.created_at,
         updated_at=task.updated_at,
     )
@@ -697,6 +712,8 @@ def _batch_to_task_out(
             row = prompt_rows.get(pid)
             prompt_visibility[pid] = True if row is None else can_view_prompt(row, user)
 
+    user_profiles = load_user_profiles(session, [t.created_by_user_id for t in tasks])
+
     results: list[TaskOut] = []
     for task in tasks:
         tid = int(task.id or 0)
@@ -719,6 +736,11 @@ def _batch_to_task_out(
                 or prompt_visibility.get(int(task.prompt_template_id), True)
             )
             else None
+        )
+        created_by_username, created_by_display_name = resolve_submitter_info(
+            task.created_by_user_id,
+            task.created_by_username,
+            user_profiles,
         )
         results.append(
             TaskOut(
@@ -746,6 +768,9 @@ def _batch_to_task_out(
                 test_dimensions=task_dimensions(task),
                 reference_case_count=ref_counts.get(tid, 0),
                 test_point_count=test_point_counts.get(tid, 0),
+                created_by_user_id=task.created_by_user_id,
+                created_by_username=created_by_username,
+                created_by_display_name=created_by_display_name,
                 created_at=task.created_at,
                 updated_at=task.updated_at,
             )
@@ -914,6 +939,7 @@ def create_task(
         session.commit()
         session.refresh(requirement)
 
+    created_by_user_id, created_by_username = request_user_identity(request)
     task = GenerationTask(
         requirement_id=requirement.id,
         project_id=project_id,
@@ -923,6 +949,8 @@ def create_task(
         prompt_template_id=body.prompt_template_id,
         generation_granularity=body.generation_granularity,
         test_dimensions_json=json.dumps(dimensions, ensure_ascii=False),
+        created_by_user_id=created_by_user_id,
+        created_by_username=created_by_username,
     )
     session.add(task)
     session.commit()
@@ -1874,6 +1902,11 @@ def _finalize_task_locked(
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
 
+    operator_user_id = (
+        int(user.id)
+        if user is not None and getattr(user, "id", None) is not None
+        else None
+    )
     try:
         task = finalize_task(
             session,
@@ -1881,6 +1914,7 @@ def _finalize_task_locked(
             draft_id=body.draft_id if body else None,
             overwrite_existing=body.overwrite_existing if body else False,
             operator=operator,
+            operator_user_id=operator_user_id,
         )
     except CaseKeyConflictError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
