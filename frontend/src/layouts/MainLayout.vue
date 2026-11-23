@@ -45,10 +45,9 @@ const projectQuery = computed(() => {
 })
 
 const useCaseItems = [
-  { path: '/dashboard', label: '数据看板', icon: DataAnalysis, adminOnly: true },
+  { path: '/agent', label: 'Agent 对话', icon: ChatDotRound },
   { path: '/', label: '用例生成', icon: Tickets },
   { path: '/tasks', label: '生成任务', icon: List },
-  { path: '/agent', label: 'Agent 对话', icon: ChatDotRound },
   { path: '/cases', label: '用例管理', icon: Collection },
 ]
 
@@ -65,6 +64,7 @@ const systemItems = [
   { path: '/prompts', label: '提示词管理', icon: EditPen },
   { path: '/models', label: '模型配置', icon: Cpu, adminOnly: true },
   { path: '/users', label: '用户管理', icon: UserFilled, adminOnly: true },
+  { path: '/dashboard', label: '数据看板', icon: DataAnalysis, adminOnly: true },
 ]
 
 const platformPaths = [...platformItems.map((item) => item.path), '/platform-adapters']
