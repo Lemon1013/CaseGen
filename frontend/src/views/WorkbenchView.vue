@@ -24,6 +24,16 @@ const referenceTab = ref('library')
 const questions = ref<string[]>([])
 const showQuestions = ref(false)
 const knowledgeSourceCount = computed(() => projects.current.value?.knowledge_source_count ?? 0)
+const knowledgeSources = computed(() => projects.current.value?.knowledge_sources ?? [])
+
+function formatKnowledgeSourceName(item: { name: string; external_project_name?: string | null }) {
+  const name = item.name?.trim() || '外部知识库'
+  const extName = item.external_project_name?.trim()
+  if (extName && extName !== name) {
+    return `${name}（${extName}）`
+  }
+  return extName || name
+}
 
 type GenerationGranularity = 'compact' | 'standard' | 'detailed'
 
@@ -128,7 +138,10 @@ async function searchReferences() {
 async function loadOptions() {
   try {
     const [modelsRows, promptRows, reqRows] = await Promise.all([
-      listModels(), listPrompts('generate'), listRequirements().catch(() => [] as RequirementItem[]),
+      listModels(),
+      listPrompts('generate'),
+      listRequirements().catch(() => [] as RequirementItem[]),
+      projects.refresh().catch(() => undefined),
     ])
     models.value = modelsRows
     prompts.value = promptRows.filter((row) => row.is_active)
@@ -370,7 +383,18 @@ onUnmounted(() => {
           <el-form-item label="通用测试维度"><el-checkbox-group v-model="form.test_dimensions" class="dimensions"><el-checkbox v-for="item in dimensionOptions" :key="item[0]" :value="item[0]">{{ item[1] }}</el-checkbox></el-checkbox-group></el-form-item>
           <el-form-item label="外部知识库">
             <div v-if="knowledgeSourceCount > 0" class="knowledge-status-box knowledge-status-box--ready">
-              <span>当前项目已配置 <strong>{{ knowledgeSourceCount }}</strong> 个外部知识库，检索阶段将自动命中并注入引用。</span>
+              <span>当前项目已配置 <strong>{{ knowledgeSourceCount }}</strong> 个外部知识库，检索阶段将自动命中并注入引用：</span>
+              <div v-if="knowledgeSources.length" class="knowledge-source-tags">
+                <el-tag
+                  v-for="item in knowledgeSources"
+                  :key="item.id"
+                  size="small"
+                  type="success"
+                  effect="light"
+                >
+                  {{ formatKnowledgeSourceName(item) }}
+                </el-tag>
+              </div>
             </div>
             <el-alert
               v-else
@@ -698,6 +722,13 @@ small,
   border-color: rgba(16, 185, 129, 0.35);
   background: #ecfdf5;
   color: #065f46;
+}
+
+.knowledge-source-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
 }
 
 .prompt-option-row {

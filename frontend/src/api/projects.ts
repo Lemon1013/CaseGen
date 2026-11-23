@@ -6,6 +6,13 @@ export interface ProjectSpace extends Pick<WikiSpace, 'id' | 'name' | 'slug' | '
   enabled: boolean
 }
 
+export interface ProjectKnowledgeSourceSummary {
+  id: number
+  name: string
+  provider_type: string
+  external_project_name?: string | null
+}
+
 export interface Project {
   id: number
   name: string
@@ -15,6 +22,7 @@ export interface Project {
   is_public: boolean
   default_wiki_space_id: number | null
   knowledge_source_count?: number
+  knowledge_sources?: ProjectKnowledgeSourceSummary[]
   private_spaces: ProjectSpace[]
   shared_spaces: ProjectSpace[]
   created_at: string

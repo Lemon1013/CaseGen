@@ -16,7 +16,14 @@ from app.models.entities import (
     WikiSpace,
 )
 from app.models.external_wiki import ProjectKnowledgeSource
-from app.schemas.projects import ProjectCreate, ProjectOut, ProjectSpaceOut, ProjectUpdate
+from app.schemas.projects import (
+    ProjectCreate,
+    ProjectKnowledgeSourceSummary,
+    ProjectOut,
+    ProjectSpaceOut,
+    ProjectUpdate,
+)
+from app.services.knowledge_providers.base import parse_json_dict
 from app.services.knowledge_providers.service import _is_source_configured
 from app.services.permissions import current_user, is_admin, require_admin
 from app.services.wiki_spaces import DEFAULT_SPACE_SLUG, normalize_space_slug, slug_from_name
@@ -33,18 +40,32 @@ def _require_project(request: Request, project_id: int) -> None:
     require_request_project(request, project_id)
 
 
+def _knowledge_source_summary(src: ProjectKnowledgeSource) -> ProjectKnowledgeSourceSummary:
+    cfg = parse_json_dict(src.config_json)
+    ext_name = str(cfg.get("external_project_name") or "").strip() or None
+    return ProjectKnowledgeSourceSummary(
+        id=int(src.id or 0),
+        name=str(src.name or "").strip() or "外部知识库",
+        provider_type=src.provider_type,
+        external_project_name=ext_name,
+    )
+
+
 def _out(session: Session, row: Project) -> ProjectOut:
     private = session.exec(select(WikiSpace).where(WikiSpace.project_id == row.id, WikiSpace.scope == "project")).all()
     sources = session.exec(
-        select(ProjectKnowledgeSource).where(
+        select(ProjectKnowledgeSource)
+        .where(
             ProjectKnowledgeSource.project_id == row.id,
             ProjectKnowledgeSource.enabled == True,  # noqa: E712
         )
+        .order_by(ProjectKnowledgeSource.priority.asc(), ProjectKnowledgeSource.id.asc())
     ).all()
-    knowledge_source_count = sum(1 for src in sources if _is_source_configured(src))
+    configured = [src for src in sources if _is_source_configured(src)]
     return ProjectOut(
         **row.model_dump(),
-        knowledge_source_count=knowledge_source_count,
+        knowledge_source_count=len(configured),
+        knowledge_sources=[_knowledge_source_summary(src) for src in configured],
         private_spaces=[ProjectSpaceOut(**space.model_dump(), enabled=True) for space in private],
         shared_spaces=[],
     )

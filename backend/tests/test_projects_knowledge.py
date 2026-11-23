@@ -330,7 +330,21 @@ def test_project_out_counts_configured_knowledge_sources(tmp_app_data):
                     name="已启用且配置Scope",
                     provider_type="llm_wiki_django",
                     base_url="http://127.0.0.1:8091",
-                    config_json=json.dumps({"external_project_id": "proj-1"}),
+                    config_json=json.dumps(
+                        {"external_project_id": "proj-1", "external_project_name": "交易规则"}
+                    ),
+                    priority=20,
+                    enabled=True,
+                ),
+                ProjectKnowledgeSource(
+                    project_id=project["id"],
+                    name="更高优先级知识库",
+                    provider_type="llm_wiki_django",
+                    base_url="http://127.0.0.1:8091",
+                    config_json=json.dumps(
+                        {"external_project_id": "proj-0", "external_project_name": "清算规则"}
+                    ),
+                    priority=10,
                     enabled=True,
                 ),
                 ProjectKnowledgeSource(
@@ -354,4 +368,12 @@ def test_project_out_counts_configured_knowledge_sources(tmp_app_data):
         session.commit()
 
     refreshed = client.get(f"/api/projects/{project['id']}").json()
-    assert refreshed["knowledge_source_count"] == 1
+    assert refreshed["knowledge_source_count"] == 2
+    assert [item["name"] for item in refreshed["knowledge_sources"]] == [
+        "更高优先级知识库",
+        "已启用且配置Scope",
+    ]
+    assert [item["external_project_name"] for item in refreshed["knowledge_sources"]] == [
+        "清算规则",
+        "交易规则",
+    ]
