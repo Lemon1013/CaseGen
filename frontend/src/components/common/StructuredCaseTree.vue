@@ -78,6 +78,24 @@ function getCitationTitle(id: number): string {
   return citationTitleMap.value.get(id) || `引用 #${id}`
 }
 
+function formatCaseCitation(rawId: string): string {
+  const trimmed = String(rawId).trim()
+  const numericMatch = /^#?(\d+)$/.exec(trimmed)
+  if (numericMatch) {
+    const numericId = Number(numericMatch[1])
+    const title = citationTitleMap.value.get(numericId)
+    if (title) return `#${numericId} ${title}`
+  }
+  return trimmed
+}
+
+function handleCaseCitationClick(rawId: string) {
+  const numericMatch = /^#?(\d+)$/.exec(String(rawId).trim())
+  if (numericMatch) {
+    emit('click-citation', Number(numericMatch[1]))
+  }
+}
+
 function displayDimension(dimension?: string): string {
   return dimensionLabel(dimension) || '默认'
 }
@@ -90,12 +108,12 @@ async function handleCopyCase(item: DraftCaseItem) {
   const fallback = `## ${item.case_key} ${item.title}`.trim()
   const payload = item.raw_md || fallback
   if (!payload) {
-    ElMessage.warning('该用例没有可复制的 Markdown 内容')
+    ElMessage.warning('该场景没有可复制的 Markdown 内容')
     return
   }
   const ok = await copyText(payload)
   if (ok) {
-    ElMessage.success('用例 Markdown 已成功复制到剪贴板')
+    ElMessage.success('场景 Markdown 已成功复制到剪贴板')
     emit('copy-case', item)
   } else {
     ElMessage.error('复制失败，请手动选中文本复制')
@@ -144,7 +162,7 @@ async function handleCopyCase(item: DraftCaseItem) {
                   round
                   class="case-count-pill"
                 >
-                  {{ group.cases.length }} 条用例
+                  {{ group.cases.length }} 个场景
                 </el-tag>
               </div>
             </div>
@@ -197,6 +215,15 @@ async function handleCopyCase(item: DraftCaseItem) {
                     >
                       {{ displayPriority(c.priority) }}
                     </el-tag>
+                    <el-tag
+                      v-if="c.pending_items?.length"
+                      size="small"
+                      type="warning"
+                      effect="light"
+                      class="case-pending-tag"
+                    >
+                      待确认
+                    </el-tag>
                   </div>
                   <div class="case-actions-right">
                     <el-button
@@ -207,15 +234,28 @@ async function handleCopyCase(item: DraftCaseItem) {
                       @click="handleCopyCase(c)"
                     >
                       <el-icon><CopyDocument /></el-icon>
-                      <span>复制用例</span>
+                      <span>复制场景</span>
                     </el-button>
                   </div>
                 </div>
 
                 <div class="case-card-body">
                   <div v-if="c.preconditions" class="case-section-block">
-                    <div class="section-label">前置条件</div>
+                    <div class="section-label">前置状态</div>
                     <div class="section-text pre-box">{{ c.preconditions }}</div>
+                  </div>
+
+                  <div v-if="c.trigger_action" class="case-section-block">
+                    <div class="section-label">触发动作</div>
+                    <div class="section-text trigger-box">{{ c.trigger_action }}</div>
+                  </div>
+
+                  <div v-if="c.expected_result" class="case-section-block">
+                    <div class="section-label">预期业务结果</div>
+                    <div class="expected-result-box">
+                      <span class="expected-check-icon">✓</span>
+                      <span class="expected-text-body">{{ c.expected_result }}</span>
+                    </div>
                   </div>
 
                   <div v-if="c.test_data" class="case-section-block">
@@ -245,9 +285,26 @@ async function handleCopyCase(item: DraftCaseItem) {
                     </div>
                   </div>
 
+                  <div v-if="c.citation_ids?.length" class="case-citations-row">
+                    <span class="citations-label">
+                      <el-icon><Link /></el-icon>
+                      规则引用：
+                    </span>
+                    <el-tag
+                      v-for="cid in c.citation_ids"
+                      :key="cid"
+                      size="small"
+                      type="info"
+                      class="citation-chip"
+                      @click="handleCaseCitationClick(cid)"
+                    >
+                      {{ formatCaseCitation(cid) }}
+                    </el-tag>
+                  </div>
+
                   <div v-if="c.pending_items?.length" class="case-pending-block">
                     <div class="pending-head">
-                      <el-icon><Warning /></el-icon> 待定事项
+                      <el-icon><Warning /></el-icon> 待确认项
                     </div>
                     <ul class="pending-list">
                       <li v-for="(pItem, pIdx) in c.pending_items" :key="pIdx">{{ pItem }}</li>
@@ -259,7 +316,7 @@ async function handleCopyCase(item: DraftCaseItem) {
 
             <el-empty
               v-else
-              description="该测试点尚未生成衍生测试用例"
+              description="该测试点尚未生成衍生测试场景"
               :image-size="48"
               class="empty-cases-placeholder"
             />
@@ -498,6 +555,13 @@ async function handleCopyCase(item: DraftCaseItem) {
   border: 1px solid #e4e4e7 !important;
 }
 
+.case-pending-tag {
+  font-weight: 700;
+  background: #fef3c7 !important;
+  color: #b45309 !important;
+  border: 1px solid #f59e0b !important;
+}
+
 .case-main-title {
   font-size: 14px;
   font-weight: 600;
@@ -545,6 +609,7 @@ async function handleCopyCase(item: DraftCaseItem) {
 }
 
 .pre-box,
+.trigger-box,
 .data-box {
   background: #f8fafc;
   border: 1px solid #f1f5f9;
@@ -554,6 +619,29 @@ async function handleCopyCase(item: DraftCaseItem) {
   color: #334155;
   line-height: 1.5;
   white-space: pre-wrap;
+}
+
+.expected-result-box {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  background: #f0fdf4;
+  border: 1px solid #bbf7d0;
+  border-radius: 6px;
+  padding: 8px 12px;
+  color: #166534;
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+.case-citations-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--cg-text-secondary, #64748b);
 }
 
 .case-steps-flow {

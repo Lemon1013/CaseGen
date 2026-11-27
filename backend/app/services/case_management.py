@@ -66,10 +66,10 @@ def normalize_case_key(value: str) -> str:
 
 # Deliberately anchored at the beginning of a line.  A heading in the body
 # such as ``### TC-001`` is not silently treated as an imported case.  Accept
-# both the documented ``## TC-001 - title`` form and the common model output
-# ``## TC-001 title`` so finalization does not collapse a multi-case draft.
+# both ``TC-`` and ``TS-`` prefixes as well as both ``## TC-001 - title`` and
+# ``## TC-001 title`` so finalization does not collapse a multi-scenario draft.
 CASE_HEADING_RE = re.compile(
-    r"^##[ \t]+(TC-[A-Za-z0-9][A-Za-z0-9_.-]*)(?:(?:[ \t]*(?:[-:：|])[ \t]*|[ \t]+)(.*?))?[ \t]*$",
+    r"^##[ \t]+((?:TC|TS)-[A-Za-z0-9][A-Za-z0-9_.-]*)(?:(?:[ \t]*(?:[-:：|])[ \t]*|[ \t]+)(.*?))?[ \t]*$",
     re.MULTILINE,
 )
 
@@ -344,6 +344,7 @@ def import_cases_from_draft(
     *,
     overwrite_existing: bool = False,
     operator: str | None = None,
+    operator_user_id: int | None = None,
 ) -> list[TestCase]:
     """Idempotently import a selected draft and return affected/current rows.
 
@@ -415,6 +416,13 @@ def import_cases_from_draft(
                     test_point_id=int(point.id),
                     test_case_id=int(case.id),
                 ))
+    effective_log_operator = operator
+    submitter_username = (
+        str(operator).strip()[:128]
+        if operator and str(operator).strip() and str(operator).strip() != "system"
+        else None
+    )
+
     imported: list[TestCase] = []
     for action in actions:
         section = action["section"]
@@ -451,6 +459,10 @@ def import_cases_from_draft(
             existing.source_task_id = task.id
             existing.source_draft_id = draft.id
             existing.source_case_key = key
+            if existing.created_by_username is None and submitter_username:
+                existing.created_by_username = submitter_username
+            if existing.created_by_user_id is None and operator_user_id is not None:
+                existing.created_by_user_id = operator_user_id
             session.add(existing)
             session.flush()
             append_case_log(
@@ -460,7 +472,7 @@ def import_cases_from_draft(
                 before=before,
                 after=existing.content_md,
                 reason="终版更新已有用例",
-                operator=operator,
+                operator=effective_log_operator,
                 source_task_id=task.id,
                 source_draft_id=draft.id,
                 source_case_key=key,
@@ -480,6 +492,8 @@ def import_cases_from_draft(
             priority=section.get("priority") or "P1",
             source_task_id=task.id,
             source_draft_id=draft.id,
+            created_by_user_id=operator_user_id,
+            created_by_username=submitter_username,
             status="active",
             revision=1,
         )
@@ -491,6 +505,7 @@ def import_cases_from_draft(
             "import",
             before=None,
             after=case.content_md,
+            operator=effective_log_operator,
             source_task_id=task.id,
             source_draft_id=draft.id,
             source_case_key=key,
@@ -508,6 +523,7 @@ def import_cases_to_requirement(
     *,
     conflict_strategy: Literal["error", "overwrite", "skip"] = "error",
     operator: Optional[str] = None,
+    operator_user_id: Optional[int] = None,
     reason: Optional[str] = None,
 ) -> dict[str, Any]:
     """Import parsed case sections directly into a requirement without a shell task.
@@ -583,6 +599,10 @@ def import_cases_to_requirement(
             existing.priority = section["priority"]
             existing.revision = int(existing.revision or 0) + 1
             existing.updated_at = utcnow()
+            if existing.created_by_username is None and operator:
+                existing.created_by_username = operator
+            if existing.created_by_user_id is None and operator_user_id is not None:
+                existing.created_by_user_id = operator_user_id
             session.add(existing)
             session.flush()
             append_case_log(
@@ -610,6 +630,8 @@ def import_cases_to_requirement(
             priority=section["priority"],
             source_task_id=None,
             source_draft_id=None,
+            created_by_user_id=operator_user_id,
+            created_by_username=operator or None,
             status="active",
             revision=1,
         )
@@ -672,8 +694,37 @@ def stable_cases(cases: Iterable[TestCase]) -> list[TestCase]:
     )
 
 
+_EMPTY_CITATION_PLACEHOLDERS = {"无", "暂无", "none", "n/a", "-"}
+_EMPTY_PENDING_PLACEHOLDERS = {"无", "暂无", "无待确认项", "none", "n/a", "-"}
+
+
+def _extract_case_citation_ids(raw_md: str) -> list[str]:
+    """Extract normalized citation labels (e.g. E1, S2, 1, REQ) from metadata line."""
+    match = re.search(
+        r"(?im)^\s*(?:[-*]\s*)?(?:规则引用|引用证据|关联引用)\s*[:：|]\s*(.+)$",
+        raw_md,
+    )
+    if not match:
+        return []
+    line = match.group(1).strip()
+    if not line or line.casefold() in _EMPTY_CITATION_PLACEHOLDERS:
+        return []
+    found: list[str] = []
+    seen: set[str] = set()
+    for token_match in re.finditer(
+        r"\[(\d+)\]|(?<![A-Za-z0-9_])\[?(E\d+|S\d+|W\d+|REQ)\]?(?![A-Za-z0-9_])",
+        line,
+        re.IGNORECASE,
+    ):
+        token = (token_match.group(1) or token_match.group(2) or "").strip().upper()
+        if token and token not in seen:
+            seen.add(token)
+            found.append(token)
+    return found
+
+
 def parse_case_detail(section: dict[str, Any]) -> dict[str, Any]:
-    """Extract structured details from a single case markdown section."""
+    """Extract structured details from a single case/scenario markdown section."""
     raw_md = section.get("content_md", "")
     case_key = section.get("case_key", "")
     title = section.get("title", case_key)
@@ -681,7 +732,7 @@ def parse_case_detail(section: dict[str, Any]) -> dict[str, Any]:
 
     # 1. 提取类型 (type)
     type_match = re.search(
-        r"(?im)^\s*(?:[-*]\s*)?(?:类型|用例类型|type)\s*[:：|]\s*(.+)$",
+        r"(?im)^\s*(?:[-*]\s*)?(?:类型|用例类型|场景类型|type)\s*[:：|]\s*(.+)$",
         raw_md,
     )
     case_type = type_match.group(1).strip() if type_match else ""
@@ -693,33 +744,61 @@ def parse_case_detail(section: dict[str, Any]) -> dict[str, Any]:
     )
     verification_goal = goal_match.group(1).strip() if goal_match else ""
 
-    # 3. 提取前置条件 (preconditions)
+    # 3. 提取规则引用编号 (citation_ids)
+    citation_ids = _extract_case_citation_ids(raw_md)
+
+    # 4. 提取前置状态 / 前置条件 (preconditions)
     pre_match = re.search(
-        r"(?im)^###?\s*前置条件[^\n]*\n([\s\S]*?)(?=^###?|\Z)",
+        r"(?im)^###?\s*(?:前置状态|前置条件)[^\n]*\n([\s\S]*?)(?=^###?|\Z)",
         raw_md,
     )
     preconditions = pre_match.group(1).strip() if pre_match else ""
     if not preconditions:
-        pre_inline = re.search(r"(?im)^\s*(?:[-*]\s*)?前置条件\s*[:：|]\s*(.+)$", raw_md)
+        pre_inline = re.search(
+            r"(?im)^\s*(?:[-*]\s*)?(?:前置状态|前置条件)\s*[:：|]\s*(.+)$",
+            raw_md,
+        )
         if pre_inline:
             preconditions = pre_inline.group(1).strip()
 
-    # 4. 提取测试数据 (test_data)
+    # 5. 提取触发动作 / 场景描述 / 验证要点 (trigger_action)
+    trigger_match = re.search(
+        r"(?im)^###?\s*(?:触发动作|场景描述|验证要点)[^\n]*\n([\s\S]*?)(?=^###?|\Z)",
+        raw_md,
+    )
+    trigger_action = trigger_match.group(1).strip() if trigger_match else ""
+    if not trigger_action:
+        trigger_inline = re.search(
+            r"(?im)^\s*(?:[-*]\s*)?(?:触发动作|场景描述|验证要点)\s*[:：|]\s*(.+)$",
+            raw_md,
+        )
+        if trigger_inline:
+            trigger_action = trigger_inline.group(1).strip()
+
+    # 6. 提取测试数据 (test_data，向后兼容历史详细用例)
     data_match = re.search(
         r"(?im)^###?\s*测试数据[^\n]*\n([\s\S]*?)(?=^###?|\Z)",
         raw_md,
     )
     test_data = data_match.group(1).strip() if data_match else ""
 
-    # 5. 提取步骤与预期 (steps)
+    # 7. 提取步骤与预期 (steps，向后兼容历史详细用例) 与 预期业务结果 / 预期结果 (expected_result)
     steps_block_match = re.search(
-        r"(?im)^###?\s*(?:测试步骤|步骤与预期|步骤)[^\n]*\n([\s\S]*?)(?=^###?\s*(?:预期结果|预期断言|断言|待确认项|待确认|待定事项|待定项|待定|pending|备注)|\Z)",
+        r"(?im)^###?\s*(?:测试步骤|步骤与预期|步骤)[^\n]*\n([\s\S]*?)(?=^###?\s*(?:预期业务结果|预期结果|预期断言|断言|待确认项|待确认|待定事项|待定项|待定|pending|备注)|\Z)",
         raw_md,
     )
     expected_block_match = re.search(
-        r"(?im)^###?\s*(?:预期结果|预期断言|断言)[^\n]*\n([\s\S]*?)(?=^###?|\Z)",
+        r"(?im)^###?\s*(?:预期业务结果|预期结果|预期断言|断言)[^\n]*\n([\s\S]*?)(?=^###?|\Z)",
         raw_md,
     )
+    expected_result = expected_block_match.group(1).strip() if expected_block_match else ""
+    if not expected_result:
+        exp_inline = re.search(
+            r"(?im)^\s*(?:[-*]\s*)?(?:预期业务结果|预期结果)\s*[:：|]\s*(.+)$",
+            raw_md,
+        )
+        if exp_inline and not steps_block_match:
+            expected_result = exp_inline.group(1).strip()
 
     steps: list[dict[str, Any]] = []
     if steps_block_match:
@@ -753,7 +832,7 @@ def parse_case_detail(section: dict[str, Any]) -> dict[str, Any]:
             if not st["expected"] and i < len(exp_list):
                 st["expected"] = exp_list[i]
 
-    # 6. 提取待定事项 (pending_items)
+    # 8. 提取待确认项 / 待定事项 (pending_items)
     pending_match = re.search(
         r"(?im)^###?\s*(?:待确认项|待确认|待定事项|待定项|待定|pending)[^\n]*\n([\s\S]*?)(?=^###?|\Z)",
         raw_md,
@@ -762,7 +841,11 @@ def parse_case_detail(section: dict[str, Any]) -> dict[str, Any]:
     if pending_match:
         p_text = pending_match.group(1).strip()
         lines = [re.sub(r"^\s*[-*]\s*", "", ln).strip() for ln in p_text.splitlines() if ln.strip()]
-        pending_items = [ln for ln in lines if ln]
+        pending_items = [
+            ln
+            for ln in lines
+            if ln and ln.strip().strip("。；;").casefold() not in _EMPTY_PENDING_PLACEHOLDERS
+        ]
 
     return {
         "case_key": case_key,
@@ -771,6 +854,9 @@ def parse_case_detail(section: dict[str, Any]) -> dict[str, Any]:
         "type": case_type,
         "verification_goal": verification_goal,
         "preconditions": preconditions,
+        "trigger_action": trigger_action,
+        "expected_result": expected_result,
+        "citation_ids": citation_ids,
         "test_data": test_data,
         "steps": steps,
         "pending_items": pending_items,

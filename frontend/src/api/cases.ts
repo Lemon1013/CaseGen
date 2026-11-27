@@ -14,9 +14,18 @@ export interface TestCaseItem {
   source_task_id: number | null
   source_draft_id: number | null
   source_draft_version: number | null
+  created_by_user_id?: number | null
+  created_by_username?: string | null
+  created_by_display_name?: string | null
   archived_at: string | null
   created_at: string
   updated_at: string
+}
+
+export interface TestCaseSubmitter {
+  user_id?: number | null
+  username: string
+  display_name?: string | null
 }
 
 export interface TestCaseOperationLog {
@@ -40,12 +49,19 @@ export interface TestCaseOperationLog {
   created_at: string
 }
 
+export type CaseSortOrder = 'created_desc' | 'created_asc' | 'updated_desc' | 'case_key_asc'
+
 export function listCases(opts?: {
   requirement_id?: number
   include_archived?: boolean
   keyword?: string
   status?: 'active' | 'archived' | ''
   priority?: 'P0' | 'P1' | 'P2' | ''
+  created_by?: string
+  source_type?: 'task' | 'direct' | ''
+  created_from?: string
+  created_to?: string
+  sort?: CaseSortOrder
 }) {
   const query = new URLSearchParams()
   if (opts?.requirement_id != null) query.set('requirement_id', String(opts.requirement_id))
@@ -53,8 +69,17 @@ export function listCases(opts?: {
   if (opts?.keyword?.trim()) query.set('keyword', opts.keyword.trim())
   if (opts?.status) query.set('status', opts.status)
   if (opts?.priority) query.set('priority', opts.priority)
+  if (opts?.created_by?.trim()) query.set('created_by', opts.created_by.trim())
+  if (opts?.source_type) query.set('source_type', opts.source_type)
+  if (opts?.created_from) query.set('created_from', opts.created_from)
+  if (opts?.created_to) query.set('created_to', opts.created_to)
+  if (opts?.sort) query.set('sort', opts.sort)
   const suffix = query.toString() ? `?${query.toString()}` : ''
   return api<TestCaseItem[]>(`/api/cases${suffix}`)
+}
+
+export function listCaseSubmitters() {
+  return api<TestCaseSubmitter[]>('/api/cases/submitters')
 }
 
 export function getCase(id: number) {

@@ -21,7 +21,9 @@ from app.services.knowledge_providers.circuit import (
     SourceCircuitBreaker,
     knowledge_circuit_breaker,
 )
+from app.services.knowledge_providers.lexiang import LexiangProvider
 from app.services.knowledge_providers.llm_wiki_django import LlmWikiDjangoProvider
+from app.services.knowledge_providers.weknora import WeKnoraProvider
 from app.services.knowledge_providers.registry import (
     PROVIDER_REGISTRY,
     get_provider,
@@ -38,6 +40,7 @@ __all__ = [
     "ExternalKnowledgeProvider",
     "KnowledgeHit",
     "KnowledgeProviderError",
+    "LexiangProvider",
     "LlmWikiDjangoProvider",
     "PROVIDER_REGISTRY",
     "ProjectKnowledgeSearchResult",
@@ -49,6 +52,7 @@ __all__ = [
     "RemoteScope",
     "SourceCircuitBreaker",
     "SourceWarning",
+    "WeKnoraProvider",
     "get_provider",
     "knowledge_circuit_breaker",
     "list_provider_types",

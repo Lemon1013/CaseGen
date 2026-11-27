@@ -457,7 +457,7 @@ def test_generate_lean_fallback_on_primary_llm_error(tmp_app_data, monkeypatch):
     assert calls["n"] == 2
     assert len(systems) == 2
     # lean fallback system is shorter / different from default seed prompt
-    assert "测试专家" in systems[1] or "关联知识编号" in systems[1]
+    assert "精简重试补充" in systems[1] and "测试场景设计专家" in systems[1]
     assert systems[0] in systems[1]
 
     drafts = client.get(f"/api/tasks/{tid}/drafts").json()

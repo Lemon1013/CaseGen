@@ -89,6 +89,9 @@ class TaskOut(BaseModel):
     test_dimensions: List[str] = Field(default_factory=list)
     reference_case_count: int = 0
     test_point_count: int = 0
+    created_by_user_id: Optional[int] = None
+    created_by_username: Optional[str] = None
+    created_by_display_name: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
@@ -265,6 +268,9 @@ class DraftCaseItemOut(BaseModel):
     type: str = ""
     verification_goal: str = ""
     preconditions: str = ""
+    trigger_action: str = ""
+    expected_result: str = ""
+    citation_ids: List[str] = Field(default_factory=list)
     test_data: str = ""
     steps: List[DraftCaseStepOut] = Field(default_factory=list)
     pending_items: List[str] = Field(default_factory=list)
@@ -337,6 +343,9 @@ class TestCaseOut(BaseModel):
     source_task_id: Optional[int] = None
     source_draft_id: Optional[int] = None
     source_draft_version: Optional[int] = None
+    created_by_user_id: Optional[int] = None
+    created_by_username: Optional[str] = None
+    created_by_display_name: Optional[str] = None
     archived_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
@@ -383,6 +392,12 @@ class TestCaseCreate(BaseModel):
     content_md: Optional[str] = None
     content: Optional[str] = None
     priority: Literal["P0", "P1", "P2"] = "P1"
+
+
+class TestCaseSubmitterOut(BaseModel):
+    user_id: Optional[int] = None
+    username: str
+    display_name: Optional[str] = None
 
 
 class TaskEventOut(BaseModel):

@@ -36,9 +36,9 @@ _RETRY_BACKOFF_SEC = 0.05
 
 def _clamp_timeout(raw: Any) -> float:
     try:
-        value = float(raw if raw is not None else 10.0)
+        value = float(raw if raw is not None else 30.0)
     except (TypeError, ValueError):
-        value = 10.0
+        value = 30.0
     return min(120.0, max(1.0, value))
 
 
@@ -137,7 +137,7 @@ class LlmWikiDjangoProvider:
                     key="timeout_sec",
                     label="请求超时 (秒)",
                     field_type="number",
-                    default=10.0,
+                    default=30.0,
                 ),
                 ProviderFieldSpec(
                     key="use_synonyms",

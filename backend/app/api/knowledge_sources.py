@@ -36,7 +36,7 @@ from app.services.projects import require_request_project
 
 router = APIRouter(tags=["knowledge-sources"])
 
-_SECRET_CREDENTIAL_KEYS = ("password", "token", "api_key", "key")
+_SECRET_CREDENTIAL_KEYS = ("password", "token", "api_key", "key", "app_secret")
 
 
 def _require_admin(request: Request) -> None:

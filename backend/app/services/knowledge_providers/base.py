@@ -211,4 +211,11 @@ def mask_credentials(auth_type: str, creds: Any) -> dict[str, Any]:
             "has_credentials": bool(str(parsed.get("api_key") or parsed.get("key") or "")),
             "username": "",
         }
+    if normalized_auth == "oauth2_client_credentials":
+        app_key = str(parsed.get("app_key") or "").strip()
+        has_secret = bool(str(parsed.get("app_secret") or "").strip())
+        return {
+            "has_credentials": has_secret,
+            "username": app_key,
+        }
     return {"has_credentials": False, "username": ""}

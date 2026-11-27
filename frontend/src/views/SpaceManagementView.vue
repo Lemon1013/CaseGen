@@ -59,7 +59,22 @@ const AUTH_TYPE_LABELS: Record<string, string> = {
   django_session: '账号密码登录',
   bearer: 'Bearer Token',
   api_key: 'API Key',
+  oauth2_client_credentials: 'AppKey / AppSecret (OAuth2)',
 }
+
+const DEFAULT_BASE_URLS: Record<string, string> = {
+  llm_wiki_django: 'http://127.0.0.1:8091',
+  weknora: 'http://localhost:8080',
+  lexiang: 'https://lxapi.lexiangla.com',
+}
+
+function defaultBaseUrlFor(providerType: string): string {
+  return DEFAULT_BASE_URLS[providerType] ?? ''
+}
+
+const baseUrlPlaceholder = computed(
+  () => defaultBaseUrlFor(sourceForm.provider_type) || 'https://example.com',
+)
 
 const currentProvider = computed<ProviderTypeInfo | null>(
   () => providerTypes.value.find((item) => item.provider_type === sourceForm.provider_type) || providerTypes.value[0] || null,
@@ -77,6 +92,10 @@ const activeCredentialFields = computed<ProviderFieldSpec[]>(() => {
 
 const supportsRemoteScopes = computed(() =>
   Boolean(currentProvider.value?.capabilities?.supports_remote_scopes),
+)
+
+const externalProjectIdField = computed<ProviderFieldSpec | null>(
+  () => (currentProvider.value?.config_fields || []).find((f) => f.key === 'external_project_id') || null,
 )
 
 const otherConfigFields = computed<ProviderFieldSpec[]>(() => {
@@ -139,7 +158,7 @@ function resetSourceForm(providerType?: string) {
   const defaultAuth = provider?.capabilities?.supported_auth_types?.[0] || 'none'
   sourceForm.name = provider ? provider.display_name : '外部知识库'
   sourceForm.provider_type = targetType
-  sourceForm.base_url = 'http://127.0.0.1:8091'
+  sourceForm.base_url = defaultBaseUrlFor(targetType)
   sourceForm.auth_type = defaultAuth
   sourceForm.credentials = {}
   sourceForm.weight = 1.0
@@ -164,7 +183,11 @@ function selectSourceForEdit(row: KnowledgeSourceOut) {
 
   const creds: Record<string, unknown> = {}
   if (row.auth_username) {
-    creds.username = row.auth_username
+    if (row.auth_type === 'oauth2_client_credentials') {
+      creds.app_key = row.auth_username
+    } else {
+      creds.username = row.auth_username
+    }
   }
   sourceForm.credentials = creds
 
@@ -181,6 +204,9 @@ function onProviderTypeChange(nextType: string) {
   if (!supported.includes(sourceForm.auth_type)) {
     sourceForm.auth_type = supported[0] || 'none'
     sourceForm.credentials = {}
+  }
+  if (!editingSource.value) {
+    sourceForm.base_url = defaultBaseUrlFor(nextType)
   }
   remoteScopes.value = []
   initConfigDefaults(provider, editingSource.value ? sourceForm.config : undefined)
@@ -274,7 +300,7 @@ async function runTestConnection() {
     })
     if (res.ok) {
       remoteScopes.value = res.scopes || []
-      ElMessage.success(res.message || `连接成功，拉取到 ${remoteScopes.value.length} 个远端项目`)
+      ElMessage.success(res.message || `连接成功，拉取到 ${remoteScopes.value.length} 个远端知识库`)
     } else {
       ElMessage.warning(res.message || '连接失败')
     }
@@ -543,7 +569,7 @@ async function remove(row: Project) {
               <div class="ks-item-meta">
                 <span>权重 {{ item.weight }} · 优先级 {{ item.priority }}</span>
                 <span v-if="item.config?.external_project_name || item.config?.external_project_id">
-                  · 远端项目：{{ item.config.external_project_name || item.config.external_project_id }}
+                  · 远端知识库：{{ item.config.external_project_name || item.config.external_project_id }}
                 </span>
               </div>
               <div class="ks-item-actions" @click.stop>
@@ -582,11 +608,11 @@ async function remove(row: Project) {
             </el-form-item>
 
             <el-form-item label="知识源名称" required>
-              <el-input v-model="sourceForm.name" maxlength="120" placeholder="例如：核心业务 LLM Wiki" />
+              <el-input v-model="sourceForm.name" maxlength="120" placeholder="例如：产品文档知识库" />
             </el-form-item>
 
             <el-form-item label="Base URL (服务地址)" required>
-              <el-input v-model="sourceForm.base_url" placeholder="http://127.0.0.1:8091" />
+              <el-input v-model="sourceForm.base_url" :placeholder="baseUrlPlaceholder" />
             </el-form-item>
 
             <el-form-item label="认证方式">
@@ -621,20 +647,21 @@ async function remove(row: Project) {
 
             <div class="ks-test-bar">
               <el-button type="primary" plain :loading="testingConnection" @click="runTestConnection">
-                测试连接并拉取远端项目
+                测试连接并拉取远端知识库
               </el-button>
               <span v-if="editingSource?.has_credentials && sourceForm.auth_type !== 'none'" class="field-help">
                 测试连接将自动复用已保存凭证（如密码留空）
               </span>
             </div>
 
-            <el-form-item v-if="supportsRemoteScopes" label="关联远端项目 (Scope)">
+            <el-form-item v-if="supportsRemoteScopes" label="关联远端知识库 (Scope)">
               <el-select
                 :model-value="(sourceForm.config.external_project_id as string) || ''"
-                placeholder="请先测试连接并选择远端项目，或手动输入 ID"
+                placeholder="请先测试连接并选择远端知识库，或手动输入 ID"
                 filterable
                 allow-create
                 default-first-option
+                fit-input-width
                 clearable
                 style="width: 100%"
                 @change="onScopeChange"
@@ -642,14 +669,22 @@ async function remove(row: Project) {
                 <el-option
                   v-for="scope in scopeOptions"
                   :key="scope.id"
-                  :label="`${scope.name} (${scope.id})`"
+                  :label="scope.name && scope.name !== scope.id ? `${scope.name} (${scope.id})` : scope.id"
                   :value="scope.id"
                 />
               </el-select>
+              <div v-if="externalProjectIdField?.help_text" class="field-help">
+                {{ externalProjectIdField.help_text }}
+              </div>
             </el-form-item>
 
             <div v-if="otherConfigFields.length" class="ks-config-grid">
-              <el-form-item v-for="field in otherConfigFields" :key="field.key" :label="field.label">
+              <el-form-item
+                v-for="field in otherConfigFields"
+                :key="field.key"
+                :label="field.label"
+                :required="Boolean(field.required)"
+              >
                 <el-switch
                   v-if="field.field_type === 'boolean'"
                   v-model="(sourceForm.config[field.key] as boolean)"

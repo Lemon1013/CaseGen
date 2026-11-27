@@ -34,6 +34,13 @@ class ProjectSpaceOut(BaseModel):
     enabled: bool = True
 
 
+class ProjectKnowledgeSourceSummary(BaseModel):
+    id: int
+    name: str
+    provider_type: str
+    external_project_name: Optional[str] = None
+
+
 class ProjectOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -45,6 +52,7 @@ class ProjectOut(BaseModel):
     is_public: bool = True
     default_wiki_space_id: Optional[int] = None
     knowledge_source_count: int = 0
+    knowledge_sources: list[ProjectKnowledgeSourceSummary] = Field(default_factory=list)
     private_spaces: list[ProjectSpaceOut] = Field(default_factory=list)
     shared_spaces: list[ProjectSpaceOut] = Field(default_factory=list)
     created_at: datetime

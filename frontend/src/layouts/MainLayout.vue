@@ -10,7 +10,6 @@ import {
   EditPen,
   DataAnalysis,
   Connection,
-  List,
   ArrowDown,
   ArrowRight,
   UserFilled,
@@ -44,12 +43,17 @@ const projectQuery = computed(() => {
   return { project_id: String(project.id), ...(spaceId ? { space_id: String(spaceId) } : {}) }
 })
 
-const useCaseItems = [
-  { path: '/dashboard', label: '数据看板', icon: DataAnalysis, adminOnly: true },
-  { path: '/', label: '用例生成', icon: Tickets },
-  { path: '/tasks', label: '生成任务', icon: List },
+interface NavItem {
+  path: string
+  label: string
+  icon: typeof Tickets
+  adminOnly?: boolean
+}
+
+const useCaseItems: NavItem[] = [
   { path: '/agent', label: 'Agent 对话', icon: ChatDotRound },
-  { path: '/cases', label: '用例管理', icon: Collection },
+  { path: '/tasks', label: '场景生成', icon: Tickets },
+  { path: '/cases', label: '场景管理', icon: Collection },
 ]
 
 const platformItems = [
@@ -65,6 +69,7 @@ const systemItems = [
   { path: '/prompts', label: '提示词管理', icon: EditPen },
   { path: '/models', label: '模型配置', icon: Cpu, adminOnly: true },
   { path: '/users', label: '用户管理', icon: UserFilled, adminOnly: true },
+  { path: '/dashboard', label: '数据看板', icon: DataAnalysis, adminOnly: true },
 ]
 
 const platformPaths = [...platformItems.map((item) => item.path), '/platform-adapters']
@@ -268,7 +273,7 @@ watch(
 
       <nav class="nav">
         <section class="nav-group">
-          <div class="nav-group-title">用例中心</div>
+          <div class="nav-group-title">场景设计</div>
           <router-link
             v-for="item in visibleUseCaseItems"
             :key="item.path"

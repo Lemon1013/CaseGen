@@ -221,6 +221,7 @@ const {
   retryModelDialogVisible,
   finalizeConflictDialogVisible,
   finalizeConflicts,
+  pendingFinalizePendingCount,
   resetDialogState,
   confirmCheckpoint,
   saveTestPoints,
@@ -240,6 +241,7 @@ const {
   taskId,
   projectId,
   task,
+  drafts,
   events,
   revisions,
   pendingRevisions,
@@ -517,7 +519,9 @@ onUnmounted(() => {
     <div class="page-header">
       <div>
         <div class="back">
-          <el-button link type="primary" @click="router.push('/tasks')">← 返回列表</el-button>
+          <el-button link type="primary" @click="router.push({ path: '/tasks', query: { ...route.query } })">
+            ← 返回场景生成
+          </el-button>
         </div>
         <h1 class="page-title">
           <span class="task-spec-id">TASK // #{{ task?.id ?? taskId }}</span>
@@ -544,7 +548,7 @@ onUnmounted(() => {
       show-icon
       :closable="false"
       title="未关联外部知识引用"
-      description="当前任务未命中外部知识库条目，用例基于需求描述与补充上下文生成。如需知识依据，可联系管理员配置外部知识库或补充需求背景后再重新生成。"
+      description="当前任务未命中外部知识库条目，测试场景基于需求描述与补充上下文生成。如需知识依据，可联系管理员配置外部知识库或补充需求背景后再重新生成。"
       style="margin-bottom: 16px"
     />
 
@@ -613,7 +617,9 @@ onUnmounted(() => {
           <template #header>
             <div class="card-head">
               <span>需求</span>
-              <span class="meta">更新于 {{ formatTime(task?.updated_at || '') }}</span>
+              <span class="meta">
+                提交用户：{{ task?.created_by_display_name || task?.created_by_username || '-' }} · 更新于 {{ formatTime(task?.updated_at || '') }}
+              </span>
             </div>
           </template>
           <div class="req-desc">{{ task?.description || '-' }}</div>
@@ -660,6 +666,7 @@ onUnmounted(() => {
       :task-error-message="task?.error_message"
       v-model:finalize-conflict-visible="finalizeConflictDialogVisible"
       :finalize-conflicts="finalizeConflicts"
+      :pending-items-case-count="pendingFinalizePendingCount"
       :acting="acting"
       @confirm-apply="confirmApply"
       @confirm-retry-model="onSwitchModelAndRetry"

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { listModels, MODELS_UPDATED_EVENT, type ModelConfig } from '../api/models'
 import { listPrompts, type PromptTemplate } from '../api/prompts'
@@ -9,6 +9,7 @@ import { listCases, type TestCaseItem } from '../api/cases'
 import { importRequirementDoc, listRequirements, type RequirementItem } from '../api/requirements'
 import { useProjectStore } from '../projectStore'
 
+const route = useRoute()
 const router = useRouter()
 const projects = useProjectStore()
 const submitting = ref(false)
@@ -24,6 +25,16 @@ const referenceTab = ref('library')
 const questions = ref<string[]>([])
 const showQuestions = ref(false)
 const knowledgeSourceCount = computed(() => projects.current.value?.knowledge_source_count ?? 0)
+const knowledgeSources = computed(() => projects.current.value?.knowledge_sources ?? [])
+
+function formatKnowledgeSourceName(item: { name: string; external_project_name?: string | null }) {
+  const name = item.name?.trim() || '外部知识库'
+  const extName = item.external_project_name?.trim()
+  if (extName && extName !== name) {
+    return `${name}（${extName}）`
+  }
+  return extName || name
+}
 
 type GenerationGranularity = 'compact' | 'standard' | 'detailed'
 
@@ -40,7 +51,7 @@ const granularityOptions: Array<{
     value: 'compact',
     label: '精简',
     badge: '[ 3-5 / TP ]',
-    amount: '拆 3–5 个测试点 · 每点 1 条用例',
+    amount: '拆 3–5 个测试点 · 每点 1 个场景',
     coverage: '只展开最高优先级流程和阻断性异常',
     suitable: '适合快速评审、需求早期',
   },
@@ -48,7 +59,7 @@ const granularityOptions: Array<{
     value: 'standard',
     label: '标准',
     badge: '[ 5-8 / TP ]',
-    amount: '拆 5–8 个测试点 · 每点 2–3 条用例',
+    amount: '拆 5–8 个测试点 · 每点 2–3 个场景',
     coverage: '主要流程、常见异常和关键边界',
     suitable: '适合日常需求、常规回归',
     recommended: true,
@@ -57,7 +68,7 @@ const granularityOptions: Array<{
     value: 'detailed',
     label: '全面',
     badge: '[ 8-12+ / TP ]',
-    amount: '拆 8–12+ 个测试点 · 每点 3–5 条用例',
+    amount: '拆 8–12+ 个测试点 · 每点 3–5 个场景',
     coverage: '状态组合、异常链路和深层边界',
     suitable: '适合核心链路、高风险发布',
   },
@@ -121,14 +132,17 @@ async function searchReferences() {
   loadingReferences.value = true
   try {
     referenceCases.value = await listCases({ keyword: referenceSearch.value, status: 'active' })
-  } catch (e) { ElMessage.error(`加载参考用例失败：${(e as Error).message}`) }
+  } catch (e) { ElMessage.error(`加载参考场景失败：${(e as Error).message}`) }
   finally { loadingReferences.value = false }
 }
 
 async function loadOptions() {
   try {
     const [modelsRows, promptRows, reqRows] = await Promise.all([
-      listModels(), listPrompts('generate'), listRequirements().catch(() => [] as RequirementItem[]),
+      listModels(),
+      listPrompts('generate'),
+      listRequirements().catch(() => [] as RequirementItem[]),
+      projects.refresh().catch(() => undefined),
     ])
     models.value = modelsRows
     prompts.value = promptRows.filter((row) => row.is_active)
@@ -228,10 +242,14 @@ async function optimize() {
   finally { optimizing.value = false }
 }
 
+function goBackToTasks() {
+  router.push({ path: '/tasks', query: { ...route.query } })
+}
+
 async function submit() {
   if (!form.title.trim() || !form.description.trim()) return ElMessage.warning('请填写标题和需求描述')
   if (!form.test_dimensions.length) return ElMessage.warning('至少选择一个测试维度')
-  if (referenceChars.value > 30000) return ElMessage.warning('参考用例快照总长度不能超过 30000 字符')
+  if (referenceChars.value > 30000) return ElMessage.warning('参考场景快照总长度不能超过 30000 字符')
   submitting.value = true
   try {
     const task = await createTask({
@@ -243,7 +261,7 @@ async function submit() {
       test_dimensions: form.test_dimensions, reference_case_ids: selectedReferenceIds.value, reference_text: form.reference_text.trim(),
     })
     await generateTask(task.id, { auto_review: form.auto_review }).catch((e) => ElMessage.warning(`启动生成失败：${(e as Error).message}`))
-    await router.push(`/tasks/${task.id}`)
+    await router.push({ path: `/tasks/${task.id}`, query: { ...route.query } })
   } catch (e) { ElMessage.error(`创建任务失败：${(e as Error).message}`) }
   finally { submitting.value = false }
 }
@@ -275,7 +293,15 @@ onUnmounted(() => {
 
 <template>
   <div class="page workbench-page">
-    <div class="page-header"><div><h1 class="page-title">测试设计工作台</h1><p class="page-subtitle">需求 → 策略 → 参考用例 → 证据与测试点 → 完整用例</p></div><el-button @click="router.push('/tasks')">查看任务</el-button></div>
+    <div class="page-header">
+      <div>
+        <div class="back">
+          <el-button link type="primary" @click="goBackToTasks">← 返回场景生成</el-button>
+        </div>
+        <h1 class="page-title">新建场景设计</h1>
+        <p class="page-subtitle">需求 → 策略 → 参考场景 → 证据与测试点 → 测试场景</p>
+      </div>
+    </div>
     <div class="step-rail">
       <div class="step-item active">
         <div class="step-index">01 // 需求输入与优化</div>
@@ -286,7 +312,7 @@ onUnmounted(() => {
         <small class="step-desc">检索确认后的结构化检查点</small>
       </div>
       <div class="step-item">
-        <div class="step-index">03 // 用例矩阵与覆盖</div>
+        <div class="step-index">03 // 测试场景矩阵与覆盖</div>
         <small class="step-desc">生成、评审、终版和追溯</small>
       </div>
     </div>
@@ -303,8 +329,8 @@ onUnmounted(() => {
                   type="warning"
                   :closable="false"
                   show-icon
-                  title="选择已有需求会覆盖已生成用例"
-                  description="终版时会按 case_key 更新该需求下已存在的用例，并记录操作日志。"
+                  title="选择已有需求会覆盖已生成场景"
+                  description="终版时会按 case_key 更新该需求下已存在的测试场景，并记录操作日志。"
                 />
               </div>
             </el-form-item>
@@ -330,8 +356,8 @@ onUnmounted(() => {
           </el-form>
           <el-alert v-if="showQuestions" class="questions" type="warning" :closable="false" title="待确认问题"><ul><li v-for="item in questions" :key="item">{{ item }}</li><li v-if="!questions.length">暂无</li></ul></el-alert>
         </el-card>
-        <el-card shadow="never" class="block"><template #header>参考用例（可选）</template><p class="hint">仅参考格式、拆分粒度和表达风格，不作为业务事实。</p>
-          <el-tabs v-model="referenceTab"><el-tab-pane label="从用例库选择" name="library"><div class="reference-search"><el-input v-model="referenceSearch" placeholder="搜索用例" @keyup.enter="searchReferences" /><el-button :loading="loadingReferences" @click="searchReferences">搜索</el-button></div><el-checkbox-group v-model="selectedReferenceIds" class="reference-list"><el-checkbox v-for="row in referenceCases" :key="row.id" :value="row.id" class="reference-row"><span>{{ row.case_key }} · {{ row.title }}</span><small>{{ row.priority || 'P1' }} · {{ row.content_md.length }} 字符</small></el-checkbox></el-checkbox-group><el-empty v-if="!referenceCases.length && !loadingReferences" description="暂无可选用例" :image-size="50" /></el-tab-pane><el-tab-pane label="手动输入" name="manual"><el-input v-model="form.reference_text" type="textarea" :rows="8" maxlength="16000" show-word-limit /></el-tab-pane></el-tabs>
+        <el-card shadow="never" class="block"><template #header>参考场景（可选）</template><p class="hint">仅参考格式、拆分粒度和表达风格，不作为业务事实。</p>
+          <el-tabs v-model="referenceTab"><el-tab-pane label="从场景库选择" name="library"><div class="reference-search"><el-input v-model="referenceSearch" placeholder="搜索场景" @keyup.enter="searchReferences" /><el-button :loading="loadingReferences" @click="searchReferences">搜索</el-button></div><el-checkbox-group v-model="selectedReferenceIds" class="reference-list"><el-checkbox v-for="row in referenceCases" :key="row.id" :value="row.id" class="reference-row"><span>{{ row.case_key }} · {{ row.title }}</span><small>{{ row.priority || 'P1' }} · {{ row.content_md.length }} 字符</small></el-checkbox></el-checkbox-group><el-empty v-if="!referenceCases.length && !loadingReferences" description="暂无可选场景" :image-size="50" /></el-tab-pane><el-tab-pane label="手动输入" name="manual"><el-input v-model="form.reference_text" type="textarea" :rows="8" maxlength="16000" show-word-limit /></el-tab-pane></el-tabs>
           <div class="hint reference-total">已选 {{ selectedCases.length }} 条，快照 {{ referenceChars }} / 30000 字符</div>
           <div class="tags"><el-tag v-for="row in selectedCases" :key="row.id" closable @close="selectedReferenceIds = selectedReferenceIds.filter((id) => id !== row.id)">{{ row.case_key }}</el-tag></div>
         </el-card>
@@ -370,7 +396,18 @@ onUnmounted(() => {
           <el-form-item label="通用测试维度"><el-checkbox-group v-model="form.test_dimensions" class="dimensions"><el-checkbox v-for="item in dimensionOptions" :key="item[0]" :value="item[0]">{{ item[1] }}</el-checkbox></el-checkbox-group></el-form-item>
           <el-form-item label="外部知识库">
             <div v-if="knowledgeSourceCount > 0" class="knowledge-status-box knowledge-status-box--ready">
-              <span>当前项目已配置 <strong>{{ knowledgeSourceCount }}</strong> 个外部知识库，检索阶段将自动命中并注入引用。</span>
+              <span>当前项目已配置 <strong>{{ knowledgeSourceCount }}</strong> 个外部知识库，检索阶段将自动命中并注入引用：</span>
+              <div v-if="knowledgeSources.length" class="knowledge-source-tags">
+                <el-tag
+                  v-for="item in knowledgeSources"
+                  :key="item.id"
+                  size="small"
+                  type="success"
+                  effect="light"
+                >
+                  {{ formatKnowledgeSourceName(item) }}
+                </el-tag>
+              </div>
             </div>
             <el-alert
               v-else
@@ -408,13 +445,17 @@ onUnmounted(() => {
           </el-form-item>
           <el-form-item label="生成后自动评审"><el-switch v-model="form.auto_review" /></el-form-item>
         </el-form></el-card>
-        <el-card shadow="never" class="block"><template #header>提交摘要</template><el-descriptions :column="1" border size="small"><el-descriptions-item label="粒度">{{ selectedGranularity.label }}</el-descriptions-item><el-descriptions-item label="维度">{{ dimensionSummary }}</el-descriptions-item><el-descriptions-item label="参考">{{ selectedCases.length }} 条库内 + {{ form.reference_text.trim() ? '手动输入' : '无手动输入' }}</el-descriptions-item><el-descriptions-item label="流程">检索确认 → 测试点确认 → 完整用例</el-descriptions-item></el-descriptions><el-button class="submit" type="primary" size="large" :loading="submitting" @click="submit">创建任务并启动检索流水线 →</el-button></el-card>
+        <el-card shadow="never" class="block"><template #header>提交摘要</template><el-descriptions :column="1" border size="small"><el-descriptions-item label="粒度">{{ selectedGranularity.label }}</el-descriptions-item><el-descriptions-item label="维度">{{ dimensionSummary }}</el-descriptions-item><el-descriptions-item label="参考">{{ selectedCases.length }} 条库内 + {{ form.reference_text.trim() ? '手动输入' : '无手动输入' }}</el-descriptions-item><el-descriptions-item label="流程">检索确认 → 测试点确认 → 测试场景</el-descriptions-item></el-descriptions><el-button class="submit" type="primary" size="large" :loading="submitting" @click="submit">创建场景设计任务并启动检索 →</el-button></el-card>
       </el-col>
     </el-row>
   </div>
 </template>
 
 <style scoped>
+.back {
+  margin-bottom: 4px;
+}
+
 .step-rail {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
@@ -698,6 +739,13 @@ small,
   border-color: rgba(16, 185, 129, 0.35);
   background: #ecfdf5;
   color: #065f46;
+}
+
+.knowledge-source-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
 }
 
 .prompt-option-row {

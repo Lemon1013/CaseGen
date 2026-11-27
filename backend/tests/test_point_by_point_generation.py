@@ -188,7 +188,7 @@ def test_point_by_point_pipeline_execution_and_links(tmp_app_data, monkeypatch):
     assert "TP-001" in calls[0]["content"]
     assert "TP-002" in calls[1]["content"]
     assert "生成粒度" in calls[0]["content"]
-    assert "用例数量规范" in calls[0]["content"]
+    assert "场景数量规范" in calls[0]["content"]
 
     # 5. 验证 SSE stream 状态记录了逐点进度
     snapshot = task_stream.snapshot(task_id)

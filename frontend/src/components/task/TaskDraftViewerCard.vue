@@ -89,13 +89,13 @@ const liveProgressInfo = computed(() => {
       <template #header>
         <div class="card-head draft-card-header">
           <div class="header-title-row">
-            <span class="main-title">用例草稿</span>
+            <span class="main-title">测试场景草稿</span>
             <span v-if="drafts.length" class="draft-count-tag">共 {{ drafts.length }} 个版本</span>
           </div>
           <el-radio-group v-model="draftViewModeModel" size="small" class="view-mode-toggle">
             <el-radio-button value="structured">
               <el-icon style="margin-right: 4px; vertical-align: -1px"><Aim /></el-icon>
-              结构化测试点矩阵
+              结构化场景矩阵
             </el-radio-button>
             <el-radio-button value="markdown">
               <el-icon style="margin-right: 4px; vertical-align: -1px"><Document /></el-icon>
