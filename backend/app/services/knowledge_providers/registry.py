@@ -7,7 +7,9 @@ from app.services.knowledge_providers.base import (
     KnowledgeProviderError,
     ProviderTypeInfo,
 )
+from app.services.knowledge_providers.lexiang import LexiangProvider
 from app.services.knowledge_providers.llm_wiki_django import LlmWikiDjangoProvider
+from app.services.knowledge_providers.weknora import WeKnoraProvider
 
 PROVIDER_REGISTRY: dict[str, ExternalKnowledgeProvider] = {}
 
@@ -36,3 +38,5 @@ def list_provider_types() -> list[ProviderTypeInfo]:
 
 
 register_provider(LlmWikiDjangoProvider())
+register_provider(WeKnoraProvider())
+register_provider(LexiangProvider())

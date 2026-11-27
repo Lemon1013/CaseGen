@@ -49,19 +49,59 @@ function toggleCitation(id: number) {
   else expandedCitations.add(id)
 }
 
+function readMetaString(meta: Record<string, unknown> | undefined, key: string): string {
+  const val = meta?.[key]
+  return typeof val === 'string' ? val.trim() : ''
+}
+
+function providerLabel(providerType: string): string {
+  if (!providerType) return ''
+  if (providerType === 'weknora') return 'WeKnora'
+  if (providerType === 'llm_wiki_django') return 'LLM Wiki'
+  if (providerType === 'lexiang') return '腾讯乐享'
+  return providerType
+}
+
+function citationSourceInfo(item: TaskCitation) {
+  const sourceName = readMetaString(item.external_metadata, 'source_name')
+  const providerType = readMetaString(item.external_metadata, 'provider_type')
+  const providerName = providerLabel(providerType)
+  return { sourceName, providerType, providerName }
+}
+
 function citationBadgeLabel(item: TaskCitation): string {
   if (item.legacy) return '历史引用'
-  if (item.citation_type === 'external') return '外部知识'
+  if (item.citation_type === 'external') {
+    const { sourceName, providerName } = citationSourceInfo(item)
+    if (sourceName && providerName) return `${providerName} · ${sourceName}`
+    if (sourceName) return sourceName
+    if (providerName) return providerName
+    return '外部知识'
+  }
   return '知识引用'
 }
 
-function citationBadgeType(item: TaskCitation): 'warning' | 'primary' {
-  return item.legacy || item.citation_type === 'external' ? 'warning' : 'primary'
+function citationBadgeType(item: TaskCitation): 'success' | 'primary' | 'warning' | 'info' {
+  if (item.legacy) return 'warning'
+  if (item.citation_type === 'external') {
+    const { providerType } = citationSourceInfo(item)
+    if (providerType === 'weknora') return 'success'
+    if (providerType === 'llm_wiki_django') return 'primary'
+    if (providerType === 'lexiang') return 'info'
+    return 'warning'
+  }
+  return 'primary'
 }
 
 function citationMetaType(item: TaskCitation): string {
   if (item.legacy) return '历史引用'
-  if (item.citation_type === 'external') return '外部知识'
+  if (item.citation_type === 'external') {
+    const { sourceName, providerName } = citationSourceInfo(item)
+    if (sourceName && providerName) return `来源：${sourceName}（${providerName}）`
+    if (sourceName) return `来源：${sourceName}`
+    if (providerName) return `来源：${providerName}`
+    return '外部知识'
+  }
   return item.citation_type || '知识'
 }
 

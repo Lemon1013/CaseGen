@@ -160,6 +160,26 @@ def load_confirmed_retrieval_context(
     )
 
 
+def _build_external_metadata(hit: Any) -> dict[str, Any]:
+    meta: dict[str, Any] = {
+        "page_no": hit.page_no,
+        "chunk_id": hit.chunk_id,
+        "source_name": hit.source_name,
+        "provider_type": hit.provider_type,
+    }
+    raw = hit.raw if isinstance(hit.raw, dict) else {}
+    raw_url = str(raw.get("url") or "").strip()
+    if raw_url.startswith(("http://", "https://")):
+        meta["source_url"] = raw_url
+    raw_file_type = raw.get("file_type")
+    if isinstance(raw_file_type, str) and raw_file_type.strip():
+        meta["file_type"] = raw_file_type.strip()
+    raw_file_pages = raw.get("file_pages")
+    if isinstance(raw_file_pages, list) and raw_file_pages:
+        meta["file_pages"] = raw_file_pages
+    return meta
+
+
 def run_retrieval_stage(
     session: Session,
     task: GenerationTask,
@@ -233,12 +253,7 @@ def run_retrieval_stage(
             "snippet": hit.snippet,
             "evidence_snippet": hit.evidence_snippet,
             "highlight_terms": hit.highlight_terms,
-            "external_metadata": {
-                "page_no": hit.page_no,
-                "chunk_id": hit.chunk_id,
-                "source_name": hit.source_name,
-                "provider_type": hit.provider_type,
-            },
+            "external_metadata": _build_external_metadata(hit),
         }
         for hit in search_res.hits
     ]

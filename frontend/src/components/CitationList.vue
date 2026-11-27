@@ -49,9 +49,30 @@ const activeIndex = ref(0)
 const activeCitation = ref<CitationItem | null>(null)
 const externalContent = ref('')
 const externalContentNotice = ref('')
+const showFullContent = ref(false)
 let fetchSeq = 0
 
 const total = computed(() => props.count || props.citations.length)
+
+function readMetaString(meta: Record<string, unknown> | undefined, key: string): string {
+  const val = meta?.[key]
+  return typeof val === 'string' ? val.trim() : ''
+}
+
+function providerLabel(providerType: string): string {
+  if (!providerType) return ''
+  if (providerType === 'weknora') return 'WeKnora'
+  if (providerType === 'llm_wiki_django') return 'LLM Wiki'
+  if (providerType === 'lexiang') return '腾讯乐享'
+  return providerType
+}
+
+function citationSourceInfo(c: CitationItem | null | undefined) {
+  const sourceName = readMetaString(c?.external_metadata, 'source_name')
+  const providerType = readMetaString(c?.external_metadata, 'provider_type')
+  const providerName = providerLabel(providerType)
+  return { sourceName, providerType, providerName }
+}
 
 function isExternal(c: CitationItem | null | undefined) {
   return c?.citation_type === 'external'
@@ -63,42 +84,134 @@ function typeLabel(c: CitationItem) {
   return '知识引用'
 }
 
-function typeTagType(c: CitationItem): 'success' | 'primary' | 'warning' {
+function sourceBadgeLabel(c: CitationItem): string {
+  if (c.legacy) return '历史引用'
+  if (isExternal(c)) {
+    const { sourceName, providerName } = citationSourceInfo(c)
+    if (sourceName) return sourceName
+    if (providerName) return providerName
+  }
+  return typeLabel(c)
+}
+
+function sourceDisplayText(c: CitationItem): string {
+  const { sourceName, providerName } = citationSourceInfo(c)
+  if (sourceName && providerName) return `${sourceName}（${providerName}）`
+  if (sourceName) return sourceName
+  if (providerName) return providerName
+  return '—'
+}
+
+function typeTagType(c: CitationItem): 'success' | 'primary' | 'warning' | 'info' {
   if (c.legacy) return 'warning'
-  if (isExternal(c)) return 'warning'
+  if (isExternal(c)) {
+    const { providerType } = citationSourceInfo(c)
+    if (providerType === 'weknora') return 'success'
+    if (providerType === 'llm_wiki_django') return 'primary'
+    if (providerType === 'lexiang') return 'info'
+    return 'warning'
+  }
   return 'primary'
 }
 
-async function openCitation(c: CitationItem, idx: number) {
-  const seq = ++fetchSeq
+function openCitation(c: CitationItem, idx: number) {
+  ++fetchSeq
   activeIndex.value = idx
   activeCitation.value = c
   drawerVisible.value = true
   externalContent.value = ''
   externalContentNotice.value = ''
+  showFullContent.value = false
   loading.value = false
+}
 
-  if (!isExternal(c)) {
+const isWeKnoraCitation = computed(
+  () => citationSourceInfo(activeCitation.value).providerType === 'weknora',
+)
+
+const isLexiangCitation = computed(
+  () => citationSourceInfo(activeCitation.value).providerType === 'lexiang',
+)
+
+const activeSourceUrl = computed(() => {
+  const url = readMetaString(activeCitation.value?.external_metadata, 'source_url')
+  return /^https?:\/\//i.test(url) ? url : ''
+})
+
+const activeFilePages = computed<number[]>(() => {
+  const raw = activeCitation.value?.external_metadata?.file_pages
+  if (!Array.isArray(raw)) return []
+  return raw
+    .map((item) => (typeof item === 'number' ? item : Number(item)))
+    .filter((num) => Number.isInteger(num) && num > 0)
+})
+
+const activeFilePagesText = computed(() =>
+  activeFilePages.value.length ? `第 ${activeFilePages.value.join(', ')} 页` : '',
+)
+
+const canLoadFullContent = computed(() => {
+  const c = activeCitation.value
+  if (!c || !isExternal(c) || c.legacy || isLexiangCitation.value) return false
+  const pid = props.projectId ?? projects.state.currentId
+  return Boolean(pid && c.knowledge_source_id != null && c.file_path)
+})
+
+const contentSectionTitle = computed(() => {
+  const c = activeCitation.value
+  if (!c) return '引用内容'
+  if (c.legacy) return '历史摘录'
+  if (isExternal(c)) {
+    if (showFullContent.value && externalContent.value) {
+      return isWeKnoraCitation.value ? '完整上下文' : '外部知识完整正文'
+    }
+    return '命中片段'
+  }
+  return '引用内容'
+})
+
+const toggleFullContentLabel = computed(() => {
+  if (showFullContent.value) return '收起，返回命中片段'
+  return isWeKnoraCitation.value ? '查看完整上下文' : '查看完整原文'
+})
+
+async function toggleFullContent() {
+  const c = activeCitation.value
+  if (!c || !canLoadFullContent.value) return
+
+  if (showFullContent.value) {
+    showFullContent.value = false
+    return
+  }
+
+  if (externalContent.value) {
+    externalContentNotice.value = ''
+    showFullContent.value = true
     return
   }
 
   const pid = props.projectId ?? projects.state.currentId
-  if (!pid || c.knowledge_source_id == null || !c.file_path) {
-    externalContentNotice.value = '该外部引用未包含远端文件标识，以下展示检索摘要。'
-    return
-  }
+  if (!pid || c.knowledge_source_id == null || !c.file_path) return
 
+  const seq = ++fetchSeq
   loading.value = true
+  externalContentNotice.value = ''
   try {
     const fileRes = await readKnowledgeSourceFile(pid, c.knowledge_source_id, c.file_path)
     if (seq !== fetchSeq) return
-    externalContent.value = fileRes.content || ''
-    if (!externalContent.value) {
-      externalContentNotice.value = '远端文件内容为空，以下展示检索摘要。'
+    const content = fileRes.content || ''
+    if (!content) {
+      externalContentNotice.value = isWeKnoraCitation.value
+        ? '未获取到更多上下文内容，以下继续展示命中片段。'
+        : '远端文件内容为空，以下继续展示命中片段。'
+      return
     }
+    externalContent.value = content
+    showFullContent.value = true
   } catch (e) {
     if (seq !== fetchSeq) return
-    externalContentNotice.value = `暂无法拉取远端文件完整正文，以下回退展示检索摘要（${(e as Error).message}）`
+    const targetText = isWeKnoraCitation.value ? '完整上下文' : '完整原文'
+    externalContentNotice.value = `暂无法加载${targetText}，以下继续展示命中片段（${(e as Error).message}）`
   } finally {
     if (seq === fetchSeq) loading.value = false
   }
@@ -111,7 +224,7 @@ function scoreText(score?: number) {
 
 const bodyText = computed(() => {
   if (!activeCitation.value) return ''
-  if (isExternal(activeCitation.value) && externalContent.value) {
+  if (showFullContent.value && isExternal(activeCitation.value) && externalContent.value) {
     return externalContent.value
   }
   return (
@@ -144,7 +257,7 @@ const bodyText = computed(() => {
         <div class="item-top">
           <span class="ref-badge">[{{ idx + 1 }}]</span>
           <el-tag size="small" :type="typeTagType(c)" effect="plain" class="type-tag">
-            {{ typeLabel(c) }}
+            {{ sourceBadgeLabel(c) }}
           </el-tag>
           <el-tag
             v-if="c.anchor_clause"
@@ -175,7 +288,7 @@ const bodyText = computed(() => {
         </div>
         <div class="item-action">
           <el-icon :size="14"><View /></el-icon>
-          <span>{{ c.legacy ? '点击查看历史摘录' : isExternal(c) ? '点击查看外部知识正文' : '点击查看引用详情' }}</span>
+          <span>{{ c.legacy ? '点击查看历史摘录' : isExternal(c) ? '点击查看命中片段' : '点击查看引用详情' }}</span>
         </div>
       </button>
     </div>
@@ -211,6 +324,10 @@ const bodyText = computed(() => {
                 {{ typeLabel(activeCitation) }}
               </el-tag>
             </span>
+          </div>
+          <div v-if="isExternal(activeCitation)" class="meta-row">
+            <span class="meta-label">知识来源</span>
+            <span class="meta-value">{{ sourceDisplayText(activeCitation) }}</span>
           </div>
           <el-alert
             v-if="activeCitation.legacy"
@@ -257,23 +374,42 @@ const bodyText = computed(() => {
             <span class="meta-label">章节路径</span>
             <span class="meta-value">{{ activeCitation.heading_path || activeCitation.headingPath || '—' }}</span>
           </div>
-          <div
-            v-if="isExternal(activeCitation) && (activeCitation.evidence_snippet || activeCitation.evidenceSnippet)"
-            class="meta-row"
-          >
-            <span class="meta-label">证据摘录</span>
-            <span class="meta-value snippet-preview">
-              {{ activeCitation.evidence_snippet || activeCitation.evidenceSnippet }}
-            </span>
+          <div v-if="activeFilePagesText" class="meta-row">
+            <span class="meta-label">页码</span>
+            <span class="meta-value">{{ activeFilePagesText }}</span>
           </div>
         </div>
 
         <div class="content-box">
           <div class="section-label">
-            {{ isExternal(activeCitation) ? (externalContent ? '外部知识完整正文' : '外部知识摘要') : '引用内容' }}
+            {{ contentSectionTitle }}
           </div>
           <MarkdownView v-if="bodyText" :content="bodyText" />
           <el-empty v-else-if="!loading" description="无正文内容" :image-size="64" />
+          <div v-if="canLoadFullContent || activeSourceUrl" class="content-actions">
+            <span v-if="activeSourceUrl && activeFilePagesText" class="source-pages-hint">
+              {{ activeFilePagesText }}
+            </span>
+            <a
+              v-if="activeSourceUrl"
+              :href="activeSourceUrl"
+              target="_blank"
+              rel="noopener noreferrer"
+              class="el-button el-button--primary el-button--small is-plain source-link-btn"
+            >
+              打开原文档
+            </a>
+            <el-button
+              v-if="canLoadFullContent"
+              size="small"
+              :type="showFullContent ? 'default' : 'primary'"
+              plain
+              :loading="loading"
+              @click="toggleFullContent"
+            >
+              {{ toggleFullContentLabel }}
+            </el-button>
+          </div>
         </div>
       </div>
     </el-drawer>
@@ -471,5 +607,24 @@ const bodyText = computed(() => {
   border-radius: 10px;
   padding: 12px 14px;
   background: #fff;
+}
+
+.content-actions {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--cg-border, #ebeef5);
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.source-pages-hint {
+  font-size: 12px;
+  color: var(--cg-text-muted, #64748b);
+}
+
+.source-link-btn {
+  text-decoration: none;
 }
 </style>
