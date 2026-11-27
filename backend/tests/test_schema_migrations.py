@@ -235,3 +235,69 @@ def test_migration_0005_adds_coverage_metadata_json_to_legacy_checkpoints(tmp_ap
             "SELECT task_id, status, coverage_metadata_json FROM task_test_point_checkpoints"
         ).fetchone()
         assert row == (1, "confirmed", "{}")
+
+
+def test_migration_0006_adds_submitter_columns_to_legacy_tables(tmp_app_data):
+    init_db()
+    db_path = tmp_app_data / "meta" / "app.db"
+    reset_engine()
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute('DROP TABLE "generation_tasks"')
+        conn.execute(
+            """
+            CREATE TABLE generation_tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                requirement_id INTEGER NOT NULL,
+                project_id INTEGER,
+                wiki_space_id INTEGER,
+                status TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute('DROP TABLE "test_cases"')
+        conn.execute(
+            """
+            CREATE TABLE test_cases (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                requirement_id INTEGER NOT NULL,
+                case_key TEXT NOT NULL,
+                title TEXT NOT NULL DEFAULT '',
+                content_md TEXT NOT NULL DEFAULT '',
+                priority TEXT NOT NULL DEFAULT 'P1',
+                status TEXT NOT NULL DEFAULT 'active',
+                revision INTEGER NOT NULL DEFAULT 1,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO generation_tasks (requirement_id, status) VALUES (1, 'draft')"
+        )
+        conn.execute(
+            "INSERT INTO test_cases (requirement_id, case_key, title, content_md) "
+            "VALUES (1, 'TC-001', 'Legacy', 'Body')"
+        )
+        conn.execute(
+            "DELETE FROM schema_migrations WHERE version = '0006_submitter_user_columns'"
+        )
+        conn.commit()
+
+    init_db()
+
+    applied = get_applied_migrations(get_engine())
+    assert "0006_submitter_user_columns" in applied
+    with sqlite3.connect(db_path) as conn:
+        for table in ("generation_tasks", "test_cases"):
+            cols = {
+                row[1]
+                for row in conn.execute(f'PRAGMA table_info("{table}")').fetchall()
+            }
+            assert "created_by_user_id" in cols
+            assert "created_by_username" in cols
+        assert conn.execute(
+            "SELECT created_by_user_id, created_by_username FROM test_cases"
+        ).fetchone() == (None, None)

@@ -11,9 +11,10 @@ and the global middleware only populates `request.state.user` when
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Iterable, Optional, Union
 
 from fastapi import HTTPException, Request
+from sqlmodel import Session, col, select
 
 from app import config
 from app.models.entities import User
@@ -117,3 +118,47 @@ def require_admin_purge(request: Request) -> None:
             detail="Administrator purge is unavailable while authentication is disabled",
         )
     require_admin(request, detail="Administrator access required")
+
+
+def request_user_identity(request: Optional[Request]) -> tuple[Optional[int], Optional[str]]:
+    """Return ``(user_id, username)`` from the current request, or ``(None, None)``."""
+    if request is None:
+        return None, None
+    user = current_user(request)
+    if user is None:
+        return None, None
+    raw_id = getattr(user, "id", None)
+    user_id = int(raw_id) if isinstance(raw_id, int) and not isinstance(raw_id, bool) and raw_id > 0 else None
+    username = str(getattr(user, "username", None) or "").strip()[:128] or None
+    return user_id, username
+
+
+def load_user_profiles(
+    session: Session,
+    user_ids: Iterable[Optional[int]],
+) -> dict[int, tuple[str, str]]:
+    """Batch-load ``{user_id: (username, display_name)}`` for submitter attribution."""
+    ids = list({int(uid) for uid in user_ids if uid is not None and int(uid) > 0})
+    if not ids:
+        return {}
+    rows = session.exec(select(User).where(col(User.id).in_(ids))).all()
+    return {
+        int(row.id): (str(row.username or ""), str(row.display_name or ""))
+        for row in rows
+        if row.id is not None
+    }
+
+
+def resolve_submitter_info(
+    user_id: Optional[int],
+    username: Optional[str],
+    profiles: dict[int, tuple[str, str]],
+) -> tuple[Optional[str], Optional[str]]:
+    """Resolve ``(username, display_name)`` using a preloaded profile map."""
+    clean_username = str(username or "").strip() or None
+    if user_id is not None and int(user_id) in profiles:
+        profile_username, profile_display = profiles[int(user_id)]
+        resolved_username = clean_username or (profile_username.strip() or None)
+        resolved_display = profile_display.strip() or None
+        return resolved_username, resolved_display
+    return clean_username, None

@@ -43,10 +43,16 @@ const projectQuery = computed(() => {
   return { project_id: String(project.id), ...(spaceId ? { space_id: String(spaceId) } : {}) }
 })
 
-const useCaseItems = [
-  { path: '/dashboard', label: '数据看板', icon: DataAnalysis, adminOnly: true },
-  { path: '/tasks', label: '场景生成', icon: Tickets },
+interface NavItem {
+  path: string
+  label: string
+  icon: typeof Tickets
+  adminOnly?: boolean
+}
+
+const useCaseItems: NavItem[] = [
   { path: '/agent', label: 'Agent 对话', icon: ChatDotRound },
+  { path: '/tasks', label: '场景生成', icon: Tickets },
   { path: '/cases', label: '场景管理', icon: Collection },
 ]
 
@@ -63,6 +69,7 @@ const systemItems = [
   { path: '/prompts', label: '提示词管理', icon: EditPen },
   { path: '/models', label: '模型配置', icon: Cpu, adminOnly: true },
   { path: '/users', label: '用户管理', icon: UserFilled, adminOnly: true },
+  { path: '/dashboard', label: '数据看板', icon: DataAnalysis, adminOnly: true },
 ]
 
 const platformPaths = [...platformItems.map((item) => item.path), '/platform-adapters']

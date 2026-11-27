@@ -737,6 +737,8 @@ def save_cases(
 
     user = current_user(request)
     operator = user.username if user is not None else None
+    raw_uid = getattr(user, "id", None) if user is not None else None
+    operator_user_id = int(raw_uid) if isinstance(raw_uid, int) and not isinstance(raw_uid, bool) and raw_uid > 0 else None
     try:
         result = agent_draft.save_message_cases_to_requirement(
             session,
@@ -748,6 +750,7 @@ def save_cases(
             requirement_description=body.requirement_description,
             conflict_strategy=body.conflict_strategy,
             operator=operator,
+            operator_user_id=operator_user_id,
         )
     except agent_draft.AgentDraftError as exc:
         session.rollback()

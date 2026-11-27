@@ -14,6 +14,9 @@ venv/
 frontend/dist/
 node_modules/
 .run/
+.claude/
+.codex/
+tools/scenario_benchmark/.qa/
 # Offline wheel cache for Windows deploy (regenerable via pip download)
 deploy/win10/backend_wheels/
 CaseGen-*.zip

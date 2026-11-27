@@ -344,6 +344,8 @@ class GenerationTask(SQLModel, table=True):
     # the compatibility POST /finalize contract continue to work.
     finalized_draft_id: Optional[int] = Field(default=None, foreign_key="case_drafts.id", index=True)
     finalized_at: Optional[datetime] = None
+    created_by_user_id: Optional[int] = Field(default=None, index=True)
+    created_by_username: Optional[str] = Field(default=None, index=True)
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow, sa_column_kwargs={"onupdate": _utcnow})
 
@@ -622,6 +624,8 @@ class TestCase(SQLModel, table=True):
     source_task_id: Optional[int] = Field(default=None, index=True)
     source_draft_id: Optional[int] = Field(default=None, index=True)
     source_case_key: Optional[str] = Field(default=None, index=True)
+    created_by_user_id: Optional[int] = Field(default=None, index=True)
+    created_by_username: Optional[str] = Field(default=None, index=True)
     archived_at: Optional[datetime] = None
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow, sa_column_kwargs={"onupdate": _utcnow})

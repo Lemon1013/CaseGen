@@ -46,6 +46,9 @@ export interface TaskItem {
   test_dimensions: string[]
   reference_case_count: number
   test_point_count: number
+  created_by_user_id?: number | null
+  created_by_username?: string | null
+  created_by_display_name?: string | null
   created_at: string
   updated_at: string
 }

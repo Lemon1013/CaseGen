@@ -344,6 +344,7 @@ def import_cases_from_draft(
     *,
     overwrite_existing: bool = False,
     operator: str | None = None,
+    operator_user_id: int | None = None,
 ) -> list[TestCase]:
     """Idempotently import a selected draft and return affected/current rows.
 
@@ -415,6 +416,13 @@ def import_cases_from_draft(
                     test_point_id=int(point.id),
                     test_case_id=int(case.id),
                 ))
+    effective_log_operator = operator
+    submitter_username = (
+        str(operator).strip()[:128]
+        if operator and str(operator).strip() and str(operator).strip() != "system"
+        else None
+    )
+
     imported: list[TestCase] = []
     for action in actions:
         section = action["section"]
@@ -451,6 +459,10 @@ def import_cases_from_draft(
             existing.source_task_id = task.id
             existing.source_draft_id = draft.id
             existing.source_case_key = key
+            if existing.created_by_username is None and submitter_username:
+                existing.created_by_username = submitter_username
+            if existing.created_by_user_id is None and operator_user_id is not None:
+                existing.created_by_user_id = operator_user_id
             session.add(existing)
             session.flush()
             append_case_log(
@@ -460,7 +472,7 @@ def import_cases_from_draft(
                 before=before,
                 after=existing.content_md,
                 reason="终版更新已有用例",
-                operator=operator,
+                operator=effective_log_operator,
                 source_task_id=task.id,
                 source_draft_id=draft.id,
                 source_case_key=key,
@@ -480,6 +492,8 @@ def import_cases_from_draft(
             priority=section.get("priority") or "P1",
             source_task_id=task.id,
             source_draft_id=draft.id,
+            created_by_user_id=operator_user_id,
+            created_by_username=submitter_username,
             status="active",
             revision=1,
         )
@@ -491,6 +505,7 @@ def import_cases_from_draft(
             "import",
             before=None,
             after=case.content_md,
+            operator=effective_log_operator,
             source_task_id=task.id,
             source_draft_id=draft.id,
             source_case_key=key,
@@ -508,6 +523,7 @@ def import_cases_to_requirement(
     *,
     conflict_strategy: Literal["error", "overwrite", "skip"] = "error",
     operator: Optional[str] = None,
+    operator_user_id: Optional[int] = None,
     reason: Optional[str] = None,
 ) -> dict[str, Any]:
     """Import parsed case sections directly into a requirement without a shell task.
@@ -583,6 +599,10 @@ def import_cases_to_requirement(
             existing.priority = section["priority"]
             existing.revision = int(existing.revision or 0) + 1
             existing.updated_at = utcnow()
+            if existing.created_by_username is None and operator:
+                existing.created_by_username = operator
+            if existing.created_by_user_id is None and operator_user_id is not None:
+                existing.created_by_user_id = operator_user_id
             session.add(existing)
             session.flush()
             append_case_log(
@@ -610,6 +630,8 @@ def import_cases_to_requirement(
             priority=section["priority"],
             source_task_id=None,
             source_draft_id=None,
+            created_by_user_id=operator_user_id,
+            created_by_username=operator or None,
             status="active",
             revision=1,
         )

@@ -10,7 +10,7 @@ class ExternalWikiConfigUpdate(BaseModel):
     external_project_id: str = Field(default="", max_length=200)
     external_project_name: str = Field(default="", max_length=200)
     top_k: int = Field(default=6, ge=1, le=50)
-    timeout_sec: float = Field(default=3.0, ge=0.5, le=60.0)
+    timeout_sec: float = Field(default=30.0, ge=0.5, le=120.0)
     weight: float = Field(default=1.0, ge=0.0, le=10.0)
     use_synonyms: bool = True
     enabled: bool = True
@@ -36,7 +36,7 @@ class ExternalWikiConfigOut(BaseModel):
 
 class ExternalWikiTestRequest(BaseModel):
     base_url: str = Field(default="http://127.0.0.1:8091", max_length=500)
-    timeout_sec: float = Field(default=3.0, ge=0.5, le=60.0)
+    timeout_sec: float = Field(default=30.0, ge=0.5, le=120.0)
 
 
 class ExternalWikiTestResponse(BaseModel):

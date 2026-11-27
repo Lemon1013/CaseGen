@@ -617,7 +617,9 @@ onUnmounted(() => {
           <template #header>
             <div class="card-head">
               <span>需求</span>
-              <span class="meta">更新于 {{ formatTime(task?.updated_at || '') }}</span>
+              <span class="meta">
+                提交用户：{{ task?.created_by_display_name || task?.created_by_username || '-' }} · 更新于 {{ formatTime(task?.updated_at || '') }}
+              </span>
             </div>
           </template>
           <div class="req-desc">{{ task?.description || '-' }}</div>
