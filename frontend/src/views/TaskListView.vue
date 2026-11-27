@@ -74,6 +74,10 @@ function openDetail(row: TaskItem) {
   router.push({ path: `/tasks/${row.id}`, query: { ...route.query } })
 }
 
+function goCreateTask() {
+  router.push({ path: '/tasks/new', query: { ...route.query } })
+}
+
 async function handleDelete(row: TaskItem) {
   try {
     await ElMessageBox.confirm(
@@ -103,11 +107,13 @@ onMounted(load)
   <div class="page">
     <div class="page-header">
       <div>
-        <h1 class="page-title">生成任务</h1>
-        <p class="page-subtitle">跟踪生成进度、草稿版本与最新评审分数</p>
+        <h1 class="page-title">场景生成</h1>
+        <p class="page-subtitle">管理测试场景设计任务，或发起新的需求分析与场景生成</p>
       </div>
       <div class="page-actions">
-        <el-button type="primary" :icon="Plus" @click="router.push('/')">新建任务</el-button>
+        <el-button type="primary" size="large" :icon="Plus" class="create-scene-btn" @click="goCreateTask">
+          新建场景设计
+        </el-button>
         <el-button :icon="Refresh" @click="load">刷新</el-button>
       </div>
     </div>
@@ -116,10 +122,14 @@ onMounted(load)
       v-loading="loading"
       :data="tasks"
       stripe
-      empty-text="暂无任务，去用例生成创建第一条"
       class="task-table"
       @row-click="openDetail"
     >
+      <template #empty>
+        <el-empty description="暂无场景设计任务，点击下方按钮发起第一次需求分析与场景生成" :image-size="72">
+          <el-button type="primary" :icon="Plus" @click="goCreateTask">新建场景设计</el-button>
+        </el-empty>
+      </template>
       <el-table-column prop="id" label="ID" width="70" />
       <el-table-column prop="title" label="标题" min-width="180" show-overflow-tooltip />
       <el-table-column label="状态" width="120">
@@ -206,6 +216,13 @@ onMounted(load)
 </template>
 
 <style scoped>
+.create-scene-btn {
+  font-weight: 600;
+  padding-left: 18px;
+  padding-right: 18px;
+  box-shadow: 0 2px 6px rgba(16, 185, 129, 0.25);
+}
+
 .task-table :deep(.el-table__row) {
   cursor: pointer;
 }

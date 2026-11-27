@@ -14,6 +14,7 @@ import {
   shouldPollTaskStatus,
   stopTask,
   updateTaskModel,
+  type CaseDraft,
   type FinalizeConflict,
   type PromptRevision,
   type RetrievalCheckpoint,
@@ -29,6 +30,7 @@ export interface UseTaskActionsOptions {
   taskId: ComputedRef<number>
   projectId: ComputedRef<number | null>
   task: Ref<TaskItem | null>
+  drafts: Ref<CaseDraft[]>
   events: Ref<TaskEvent[]>
   revisions: Ref<PromptRevision[]>
   pendingRevisions: ComputedRef<PromptRevision[]>
@@ -51,6 +53,7 @@ export function useTaskActions(options: UseTaskActionsOptions) {
   const finalizeConflictDialogVisible = ref(false)
   const finalizeConflicts = ref<FinalizeConflict[]>([])
   const pendingFinalizeDraftId = ref<number | null>(null)
+  const pendingFinalizePendingCount = ref(0)
 
   function resetDialogState() {
     applyDialogVisible.value = false
@@ -59,6 +62,25 @@ export function useTaskActions(options: UseTaskActionsOptions) {
     finalizeConflictDialogVisible.value = false
     finalizeConflicts.value = []
     pendingFinalizeDraftId.value = null
+    pendingFinalizePendingCount.value = 0
+  }
+
+  function countPendingItemsCases(draftId: number | null): number {
+    const targetDraft =
+      (draftId != null ? options.drafts.value.find((item) => item.id === draftId) : null)
+      || options.drafts.value[0]
+      || null
+    if (!targetDraft?.points_with_cases?.length) return 0
+    const pendingKeys = new Set<string>()
+    for (const group of targetDraft.points_with_cases) {
+      const cases = group.cases || []
+      cases.forEach((item, idx) => {
+        if (item.pending_items?.length) {
+          pendingKeys.add(item.case_key || `${group.stable_key}-${idx}`)
+        }
+      })
+    }
+    return pendingKeys.size
   }
 
   async function confirmCheckpoint(payload: RetrievalConfirmPayload) {
@@ -120,7 +142,7 @@ export function useTaskActions(options: UseTaskActionsOptions) {
       })
       if (!options.applyTaskUpdate(updated)) return
       await options.refreshLight(true)
-      ElMessage.success('测试点已确认，开始生成完整用例')
+      ElMessage.success('测试点已确认，开始生成测试场景')
     } catch (err) {
       if (currentTask.id === options.taskId.value) {
         ElMessage.error(`确认测试点失败：${(err as Error).message}`)
@@ -213,14 +235,19 @@ export function useTaskActions(options: UseTaskActionsOptions) {
       acting.value = false
     }
     if (currentTask.id !== options.taskId.value) return
+    const pendingCount = countPendingItemsCases(selectedDraftId)
     if (conflicts.length > 0) {
       pendingFinalizeDraftId.value = selectedDraftId
+      pendingFinalizePendingCount.value = pendingCount
       finalizeConflicts.value = conflicts
       finalizeConflictDialogVisible.value = true
       return
     }
+    const confirmMessage = pendingCount > 0
+      ? `当前草稿包含 ${pendingCount} 条含待确认项的场景，确认入库后将保留待确认标记。确认将当前草稿标记为终版并入库？`
+      : '确认将当前草稿标记为终版并入库？'
     try {
-      await ElMessageBox.confirm('确认将当前草稿标记为终版？', '终版确认', { type: 'warning' })
+      await ElMessageBox.confirm(confirmMessage, '终版确认', { type: 'warning' })
     } catch {
       return
     }
@@ -310,6 +337,7 @@ export function useTaskActions(options: UseTaskActionsOptions) {
     retryModelDialogVisible,
     finalizeConflictDialogVisible,
     finalizeConflicts,
+    pendingFinalizePendingCount,
     resetDialogState,
     confirmCheckpoint,
     saveTestPoints,

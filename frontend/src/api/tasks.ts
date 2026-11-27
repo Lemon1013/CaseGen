@@ -80,6 +80,9 @@ export interface DraftCaseItem {
   type: string
   verification_goal: string
   preconditions: string
+  trigger_action?: string
+  expected_result?: string
+  citation_ids?: string[]
   test_data: string
   steps: DraftCaseStep[]
   pending_items: string[]

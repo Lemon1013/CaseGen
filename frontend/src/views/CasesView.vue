@@ -141,7 +141,7 @@ async function load() {
     requirements.value = reqRows
     selectedIds.value = new Set([...selectedIds.value].filter((id) => caseRows.some((item) => item.id === id)))
   } catch (err) {
-    ElMessage.error(`加载用例失败：${(err as Error).message}`)
+    ElMessage.error(`加载测试场景失败：${(err as Error).message}`)
   } finally {
     loading.value = false
   }
@@ -166,7 +166,7 @@ async function openDetail(row: TestCaseItem) {
   try {
     detailCase.value = await getCase(row.id)
   } catch (err) {
-    ElMessage.error(`加载用例详情失败：${(err as Error).message}`)
+    ElMessage.error(`加载场景详情失败：${(err as Error).message}`)
   } finally {
     detailLoading.value = false
   }
@@ -197,7 +197,7 @@ function openEditor(row: TestCaseItem) {
 async function saveEditor() {
   if (!editing.value) return
   if (!editContent.value.trim()) {
-    ElMessage.warning('用例内容不能为空')
+    ElMessage.warning('场景内容不能为空')
     return
   }
   saving.value = true
@@ -212,7 +212,7 @@ async function saveEditor() {
     if (index >= 0) cases.value[index] = updated
     if (detailCase.value?.id === updated.id) detailCase.value = updated
     editing.value = null
-    ElMessage.success('已保存当前用例，操作日志已记录')
+    ElMessage.success('已保存当前场景，操作日志已记录')
   } catch (err) {
     ElMessage.error(`保存失败：${(err as Error).message}`)
     await load()
@@ -224,7 +224,7 @@ async function saveEditor() {
 async function toggleArchive(row: TestCaseItem) {
   try {
     await ElMessageBox.confirm(
-      row.status === 'archived' ? '恢复这条用例？' : '归档这条用例？',
+      row.status === 'archived' ? '恢复这条测试场景？' : '归档这条测试场景？',
       row.status === 'archived' ? '恢复确认' : '归档确认',
       { type: 'warning' },
     )
@@ -262,7 +262,7 @@ async function downloadExport(url: string) {
 
 async function exportSelected() {
   if (!selected.value.length) {
-    ElMessage.warning('请先勾选要导出的用例')
+    ElMessage.warning('请先勾选要导出的测试场景')
     return
   }
   try {
@@ -301,8 +301,8 @@ onMounted(load)
   <div class="page cases-page">
     <div class="page-header">
       <div>
-        <h1 class="page-title">用例管理</h1>
-        <p class="page-subtitle">按需求查看已入库用例，编辑当前内容并导出 Markdown</p>
+        <h1 class="page-title">场景管理</h1>
+        <p class="page-subtitle">按需求查看已入库测试场景，编辑当前内容并导出 Markdown</p>
       </div>
       <div class="page-actions">
         <el-input
@@ -341,7 +341,7 @@ onMounted(load)
       class="requirement-filter-alert"
     >
       <template #title>
-        <span>当前仅显示需求「{{ requirementTitle(filterRequirementId) }}」（#{{ filterRequirementId }}）下的用例</span>
+        <span>当前仅显示需求「{{ requirementTitle(filterRequirementId) }}」（#{{ filterRequirementId }}）下的测试场景</span>
         <el-button size="small" type="primary" link class="clear-filter-btn" @click="clearRequirementFilter">
           查看全部需求
         </el-button>
@@ -353,8 +353,8 @@ onMounted(load)
       type="info"
       show-icon
       :closable="false"
-      title="暂无已入库用例"
-      description="在任务详情定稿或从 Agent 对话选择消息入库后，用例会按 ## TC-xxx 拆分进入这里。"
+      title="暂无已入库测试场景"
+      description="在任务详情定稿或从 Agent 对话选择消息入库后，测试场景会按 ## TC-xxx 拆分进入这里。"
       style="margin-bottom: 16px"
     />
 
@@ -372,7 +372,7 @@ onMounted(load)
               <ArrowDown v-else />
             </el-icon>
             <strong>{{ requirementTitle(requirementId) }}</strong>
-            <span class="group-count">{{ rows.length }} 条用例</span>
+            <span class="group-count">{{ rows.length }} 个场景</span>
           </button>
           <div class="group-actions">
             <span v-if="isGroupCollapsed(requirementId)" class="collapsed-hint">点击展开</span>
@@ -481,18 +481,18 @@ onMounted(load)
         </el-descriptions>
 
         <div class="detail-actions">
-          <el-button type="primary" @click="editFromDetail">编辑当前用例</el-button>
+          <el-button type="primary" @click="editFromDetail">编辑当前场景</el-button>
           <el-button :icon="Clock" @click="logsFromDetail">查看操作日志</el-button>
         </div>
 
-        <el-divider content-position="left">用例内容</el-divider>
+        <el-divider content-position="left">场景内容</el-divider>
         <div class="detail-content">
           <MarkdownView :content="detailCase.content_md" />
         </div>
       </template>
     </el-drawer>
 
-    <el-dialog v-model="editorVisible" title="编辑当前用例" width="760px" destroy-on-close>
+    <el-dialog v-model="editorVisible" title="编辑当前场景" width="760px" destroy-on-close>
       <el-form label-width="72px" @submit.prevent>
         <el-form-item label="标题"><el-input v-model="editTitle" /></el-form-item>
         <el-form-item label="优先级">

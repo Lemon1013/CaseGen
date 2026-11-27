@@ -19,6 +19,7 @@ const props = defineProps<{
   taskErrorMessage?: string | null
   finalizeConflictVisible: boolean
   finalizeConflicts: FinalizeConflict[]
+  pendingItemsCaseCount?: number
   acting: boolean
 }>()
 
@@ -158,20 +159,27 @@ function handleConfirmRetryModel() {
 
     <el-dialog
       v-model="finalizeConflictVisibleModel"
-      title="更新已有用例确认"
+      title="更新已有场景确认"
       width="680px"
       destroy-on-close
     >
       <div class="dialog-body">
         <el-alert
+          v-if="(pendingItemsCaseCount ?? 0) > 0"
           type="warning"
           show-icon
           :closable="false"
-          :title="`本次终版会更新 ${finalizeConflicts.length} 条该需求下已存在的用例`"
-          description="更新会按 case_key 覆盖已有用例内容并记录操作日志，确认后不可撤销。"
+          :title="`当前草稿包含 ${pendingItemsCaseCount} 条含待确认项的场景，确认入库后将保留待确认标记`"
+        />
+        <el-alert
+          type="warning"
+          show-icon
+          :closable="false"
+          :title="`本次终版会更新 ${finalizeConflicts.length} 条该需求下已存在的测试场景`"
+          description="更新会按 case_key 覆盖已有场景内容并记录操作日志，确认后不可撤销。"
         />
         <el-table :data="finalizeConflicts" stripe size="small" max-height="320">
-          <el-table-column prop="case_key" label="用例编号" width="120" />
+          <el-table-column prop="case_key" label="场景编号" width="120" />
           <el-table-column prop="existing_title" label="已有标题" min-width="170" show-overflow-tooltip />
           <el-table-column label="已有状态" width="90">
             <template #default="{ row }">

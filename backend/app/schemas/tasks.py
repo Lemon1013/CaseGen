@@ -265,6 +265,9 @@ class DraftCaseItemOut(BaseModel):
     type: str = ""
     verification_goal: str = ""
     preconditions: str = ""
+    trigger_action: str = ""
+    expected_result: str = ""
+    citation_ids: List[str] = Field(default_factory=list)
     test_data: str = ""
     steps: List[DraftCaseStepOut] = Field(default_factory=list)
     pending_items: List[str] = Field(default_factory=list)

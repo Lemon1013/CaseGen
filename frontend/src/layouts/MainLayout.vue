@@ -10,7 +10,6 @@ import {
   EditPen,
   DataAnalysis,
   Connection,
-  List,
   ArrowDown,
   ArrowRight,
   UserFilled,
@@ -46,10 +45,9 @@ const projectQuery = computed(() => {
 
 const useCaseItems = [
   { path: '/dashboard', label: '数据看板', icon: DataAnalysis, adminOnly: true },
-  { path: '/', label: '用例生成', icon: Tickets },
-  { path: '/tasks', label: '生成任务', icon: List },
+  { path: '/tasks', label: '场景生成', icon: Tickets },
   { path: '/agent', label: 'Agent 对话', icon: ChatDotRound },
-  { path: '/cases', label: '用例管理', icon: Collection },
+  { path: '/cases', label: '场景管理', icon: Collection },
 ]
 
 const platformItems = [
@@ -268,7 +266,7 @@ watch(
 
       <nav class="nav">
         <section class="nav-group">
-          <div class="nav-group-title">用例中心</div>
+          <div class="nav-group-title">场景设计</div>
           <router-link
             v-for="item in visibleUseCaseItems"
             :key="item.path"

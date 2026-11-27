@@ -31,8 +31,7 @@ const router = createRouter({
         {
           path: '',
           name: 'workbench',
-          component: () => import('../views/WorkbenchView.vue'),
-          meta: { title: '用例生成', description: '填写需求，创建任务并生成测试用例草稿' },
+          redirect: (to) => ({ path: '/tasks', query: to.query }),
         },
         {
           path: 'dashboard',
@@ -50,13 +49,19 @@ const router = createRouter({
           path: 'tasks',
           name: 'tasks',
           component: () => import('../views/TaskListView.vue'),
-          meta: { title: '生成任务', description: '浏览生成任务、执行状态与最新评审分数' },
+          meta: { title: '场景生成', description: '管理测试场景设计任务，或发起新的需求分析与场景生成' },
+        },
+        {
+          path: 'tasks/new',
+          name: 'task-new',
+          component: () => import('../views/WorkbenchView.vue'),
+          meta: { title: '新建场景设计', description: '填写需求并配置策略，启动测试场景生成流水线' },
         },
         {
           path: 'tasks/:id',
           name: 'task-detail',
           component: () => import('../views/TaskDetailView.vue'),
-          meta: { title: '生成任务详情', description: '查看生成草稿、评审结果与执行时间线' },
+          meta: { title: '场景生成任务详情', description: '查看测试场景草稿、评审结果与执行时间线' },
         },
         {
           path: 'agent',
@@ -68,7 +73,7 @@ const router = createRouter({
           path: 'cases',
           name: 'cases',
           component: () => import('../views/CasesView.vue'),
-          meta: { title: '用例管理', description: '按需求管理已入库用例，编辑当前内容并导出 Markdown' },
+          meta: { title: '场景管理', description: '按需求管理已入库测试场景，编辑当前内容并导出 Markdown' },
         },
         {
           path: 'data-pools',
@@ -158,10 +163,10 @@ router.beforeEach(async (to) => {
     return { name: 'login', query: to.fullPath === '/' ? undefined : { redirect: to.fullPath } }
   }
   if (to.meta.adminOnly && !auth.isAdmin) {
-    return { name: 'workbench' }
+    return { name: 'tasks' }
   }
   if ((to.name === 'login' || to.name === 'setup' || to.name === 'register') && auth.isAuthenticated) {
-    return { name: 'workbench' }
+    return { name: 'tasks' }
   }
   return true
 })

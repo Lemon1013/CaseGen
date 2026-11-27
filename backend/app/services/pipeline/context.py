@@ -750,6 +750,32 @@ def _append_supplemental_context(messages: list[dict[str, str]], supplemental_te
         )
 
 
+def _task_citation_label_map(session: Session, task_id: int) -> dict[int, str]:
+    """Build task-wide citation labels matching review.py ordering (TaskCitation.id ASC)."""
+    all_rows = session.exec(
+        select(TaskCitation)
+        .where(TaskCitation.task_id == task_id)
+        .order_by(col(TaskCitation.id).asc())
+    ).all()
+    label_map: dict[int, str] = {}
+    wiki_index = 0
+    source_index = 0
+    external_index = 0
+    for row in all_rows:
+        if row.id is None:
+            continue
+        if row.citation_type == "source":
+            source_index += 1
+            label_map[int(row.id)] = f"[S{source_index}]"
+        elif row.citation_type == "external":
+            external_index += 1
+            label_map[int(row.id)] = f"[E{external_index}]"
+        else:
+            wiki_index += 1
+            label_map[int(row.id)] = f"[{wiki_index}]"
+    return label_map
+
+
 def _citations_for_point(
     session: Session,
     task_id: int,
@@ -758,7 +784,7 @@ def _citations_for_point(
     fallback_citation_ids: Iterable[int] | None = None,
     max_chars: int | None = None,
 ) -> str:
-    """Collect evidence text bound to a test point, with optional confirmed-citation fallback."""
+    """Collect evidence text bound to a test point using task-global citation labels."""
     c_ids: list[int] = []
     if point.id is not None:
         c_ids = point_citation_ids(session, int(point.id))
@@ -766,6 +792,7 @@ def _citations_for_point(
         c_ids = list(dict.fromkeys(int(cid) for cid in fallback_citation_ids))
     if not c_ids:
         return ""
+    label_map = _task_citation_label_map(session, task_id)
     rows = session.exec(
         select(TaskCitation)
         .where(TaskCitation.task_id == task_id)
@@ -775,20 +802,19 @@ def _citations_for_point(
     if not rows:
         return ""
     parts: list[str] = []
-    external_index = 0
     per_item_limit: int | None = None
     if max_chars is not None and max_chars > 0:
         per_item_limit = max(120, max_chars // len(rows))
     used = 0
     for r in rows:
         title = r.title or "引用"
-        if r.citation_type == "external":
-            external_index += 1
-            label = f"[E{external_index}]"
+        label = label_map.get(int(r.id)) if r.id is not None else None
+        if r.citation_type in ("external", "source"):
             body = (r.content_excerpt or r.snippet or "").strip()
         else:
-            label = f"[{r.citation_type}]"
             body = (r.snippet or r.content_excerpt or "").strip()
+        if not label:
+            label = f"[{r.citation_type}]"
         header = f"{label} {title} ({r.path})\n"
         if max_chars is not None:
             remaining = max_chars - used - len(header) - (2 if parts else 0)
@@ -903,41 +929,43 @@ def _build_point_generate_messages(
         user_parts.append(citations_text.strip())
 
     granularity_rules = {
-        "compact": "生成粒度为【精简/compact】：本测试点仅需生成 1 条核心测试用例（聚焦核心主流程或最关键阻断）。",
-        "standard": "生成粒度为【标准/standard】：本测试点请生成 2~3 条测试用例（覆盖正向主流程、关键边界值或典型异常场景）。",
-        "detailed": "生成粒度为【详细/detailed】：本测试点请生成 3~5 条充分详尽的测试用例（全面覆盖正向路径、边界值、异常分支、逆向流程及状态冲突等）。",
+        "compact": "生成粒度为【精简/compact】：本测试点仅需生成 1 条核心测试场景（聚焦核心主流程或最关键阻断）。",
+        "standard": "生成粒度为【标准/standard】：本测试点请生成 2~3 条测试场景（覆盖正向主流程、关键边界条件或典型异常场景）。",
+        "detailed": "生成粒度为【详细/detailed】：本测试点请生成 3~5 条充分详尽的测试场景（全面覆盖正向路径、边界条件、异常分支、逆向流程及状态冲突等）。",
     }
     granularity_instruction = granularity_rules.get(
         granularity,
-        "生成粒度为【标准/standard】：本测试点请生成 2~3 条测试用例（覆盖正向主流程与关键异常场景）。",
+        "生成粒度为【标准/standard】：本测试点请生成 2~3 条测试场景（覆盖正向主流程与关键异常场景）。",
     )
 
     pt_num_part = re.sub(r"^TP-?", "", point.stable_key, flags=re.IGNORECASE) or f"{point_index:03d}"
     user_parts.append("")
     user_parts.append("# 硬性输出规范（必须严格遵守）")
     user_parts.append(
-        f"【用例数量规范】：{granularity_instruction}\n"
-        f"请仅针对上述测试点【{point.stable_key} · {point.title}】生成对应的测试用例 Markdown。\n"
-        f"【全局唯一编号要求】：为避免不同测试点之间产生重复编号冲突，本测试点下的用例必须统一采用 `## TC-{pt_num_part}-01`、`## TC-{pt_num_part}-02` ... 编号格式（如 `## TC-{pt_num_part}-01 用例标题`）。严禁所有测试点都从 TC-001 重新编号！\n"
-        "【证据引证红线】：严格只能引用本提示词上方【绑定的业务规则与引用证据】中明确列出的引文编号（如 `[S#]`、`[n]`、`[E#]`、`[REQ]`），严禁虚构任何不存在的编号（如 `[S30]` 等），正文中严禁保留未实例化的占位符 `[S#]`；引用法规细则时必须精准定位至最具体的最小执行条款（如第 8.7 款，严禁以第 8.1 款等章节总则替代）。\n"
-        "【断言客观性与严禁占位符】：测试步骤与预期必须给出可客观核验的系统状态（订单回报、撮合排队、行情字段等）。预期结果中【严禁输出任何 `<...>` 尖括号模板占位符】（如 `<恢复交易后的处理方式>` 等）；若证据未提供具体报文代码或状态枚举，请用确定性语言客观描述业务状态，并将未明确的字段统一沉淀到“### 待确认项”中。\n"
-        "【授权性规则分层设计】：若引用的规则包含“本所可以”、“有权采取”等授权性规则，必须按“监控识别预警 ➔ 待组织/人工处置指令 ➔ 接收正式决定 ➔ 系统网关执行”分步设计，不得断言为系统必然全自动执行。\n"
-        "【一例一目标】：单条用例只验证一个主要处置动作，避免把“取消交易”与“暂缓交收”用“或”合并验证。\n"
-        "每条用例必须严格包含以下元数据（顶格无额外缩进）：\n"
-        f"- 关联测试点：{point.stable_key}\n"
+        f"【场景数量规范】：{granularity_instruction}\n"
+        f"请仅针对上述测试点【{point.stable_key} · {point.title}】生成对应的测试场景 Markdown。\n"
+        f"【全局唯一编号要求】：为避免不同测试点之间产生重复编号冲突，本测试点下的场景必须统一采用 `## TC-{pt_num_part}-01`、`## TC-{pt_num_part}-02` ... 编号格式（如 `## TC-{pt_num_part}-01 场景标题`）。严禁所有测试点都从 TC-001 重新编号！\n"
+        "【不涉及具体测试数据边界】：必须保留规则本身规定的时段（如 `9:15-9:25`）、阈值、比较符号（`>= / <`）和状态流转；严禁编造具体测试实例数据（账号、证券代码、具体申报价格/数量值、PBU 编号）或字段级/报文级断言。\n"
+        "【证据引证红线】：严格只能引用本提示词上方【绑定的业务规则与引用证据】中明确列出的任务级引文编号（如 `[E1]`、`[E2]`、`[S1]`、`[1]`、`[REQ]`），严禁重新从 `[E1]` 编号或虚构任何不存在的编号，正文中严禁保留未实例化的占位符 `[E#]` / `[S#]`；引用法规细则时必须精准定位至最具体的最小执行条款。\n"
+        "【预期业务结果可判定与严禁占位符】：预期业务结果必须给出可判定的业务变化（申报接收/拒绝/撤单结果、撮合进入时机、资金/持仓可用与冻结变化等），【严禁输出任何 `<...>` 尖括号模板占位符】；若证据存在冲突或规则缺口，请统一沉淀到“### 待确认项”中。\n"
+        "【授权性规则分层设计】：若引用的规则包含“本所可以”、“有权采取”等授权性规则，必须按“监控识别预警 ➔ 待组织/人工处置指令 ➔ 接收正式决定 ➔ 系统执行处置”分层设计，不得断言为系统必然全自动执行。\n"
+        "【一例一目标】：单条场景只验证一个核心规则或独立处置措施，避免把“取消交易”与“暂缓交收”用“或”合并验证。\n"
+        "每条场景必须严格包含以下元数据（顶格无额外缩进）：\n"
         f"- 优先级：{point.priority}\n"
         f"- 类型：{point.dimension}\n"
+        f"- 关联测试点：{point.stable_key}\n"
+        "- 规则引用：[E1], [E2]（仅填上方实际存在的任务级编号）\n"
         f"- 验证目标：{point.verification_goal}\n"
-        "用例主体必须包含规范的各小节：\n"
-        "### 前置条件\n"
-        "### 测试数据（若有）\n"
-        "### 测试步骤\n"
-        "1. 操作说明\n"
-        "   预期结果：断言说明（必须可客观核验，严禁输出 `<...>` 占位符）\n"
-        "2. ...\n"
+        "场景主体必须包含以下轻量核心小节（不要输出“测试数据”和“测试步骤”小节）：\n"
+        "### 前置状态\n"
+        "- 决定业务结果的业务状态、交易时段与边界条件\n"
+        "### 触发动作\n"
+        "- 用户或系统触发动作；先后顺序影响结果时按顺序保留必要时序\n"
+        "### 预期业务结果\n"
+        "- 可判定的业务变化，不写字段/报文级断言，严禁 `<...>` 占位符\n"
         "### 待确认项\n"
-        "- 影响执行但证据未明确的事项；没有写“无”\n\n"
-        "只能输出测试用例 Markdown，不得包含任何问候、开场白或解释文字。"
+        "- 选填：资料冲突或规则缺口时写；无则可省略或写“无”\n\n"
+        "只能输出测试场景 Markdown，不得包含任何问候、开场白或解释文字。"
     )
 
     messages = [
@@ -1024,7 +1052,7 @@ def _link_draft_to_test_points(
                 matched_point_ids.add(int(point_by_key[norm_k].id))
 
         if not matched_point_ids:
-            key_match = re.match(r"^TC-([A-Za-z0-9]+)-\d+$", case_key, re.IGNORECASE)
+            key_match = re.match(r"^(?:TC|TS)-([A-Za-z0-9]+)-\d+$", case_key, re.IGNORECASE)
             if key_match:
                 cand = f"TP-{key_match.group(1)}".upper()
                 if cand in point_by_key and point_by_key[cand].id is not None:
